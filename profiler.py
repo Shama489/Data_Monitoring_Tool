@@ -1,3 +1,5 @@
+import math
+
 import pandas as pd
 import numpy as np
 import plotly.express as px
@@ -185,3 +187,195 @@ def generate_recommendations(df, report):
                     "issue":"Duplicate rows found",
                     "solution":"Use drop_duplicates"})
     return rec
+
+
+def classify_drift_severity(score):
+    score = float(score)
+    if score < 25:
+        return "low"
+    if score < 50:
+        return "medium"
+    if score < 80:
+        return "high"
+    return "critical"
+
+
+def _coerce_numeric(series):
+    return pd.to_numeric(series, errors="coerce").dropna()
+
+
+def _compute_ks_statistic(baseline, current):
+    baseline_values = np.asarray(_coerce_numeric(baseline), dtype=float)
+    current_values = np.asarray(_coerce_numeric(current), dtype=float)
+
+    if baseline_values.size == 0 or current_values.size == 0:
+        return 0.0
+
+    baseline_sorted = np.sort(baseline_values)
+    current_sorted = np.sort(current_values)
+    values = np.unique(np.concatenate([baseline_sorted, current_sorted]))
+
+    if values.size == 0:
+        return 0.0
+
+    baseline_cdf = np.searchsorted(baseline_sorted, values, side="right") / baseline_sorted.size
+    current_cdf = np.searchsorted(current_sorted, values, side="right") / current_sorted.size
+    return float(np.max(np.abs(baseline_cdf - current_cdf)))
+
+
+def _compute_psi(baseline_values, current_values):
+    baseline_series = pd.Series(baseline_values).dropna()
+    current_series = pd.Series(current_values).dropna()
+
+    if baseline_series.empty or current_series.empty:
+        return 0.0
+
+    # Numeric PSI uses quantile bins from the baseline distribution.
+    if pd.api.types.is_numeric_dtype(baseline_series):
+        baseline_numeric = pd.to_numeric(baseline_series, errors="coerce").dropna()
+        current_numeric = pd.to_numeric(current_series, errors="coerce").dropna()
+        if baseline_numeric.empty or current_numeric.empty:
+            return 0.0
+
+        quantiles = np.linspace(0, 1, 11)
+        bins = np.quantile(baseline_numeric, quantiles)
+        bins = np.unique(np.concatenate(([float("-inf")], bins, [float("inf")])) )
+        baseline_hist, _ = np.histogram(baseline_numeric, bins=bins)
+        current_hist, _ = np.histogram(current_numeric, bins=bins)
+        baseline_pct = baseline_hist / max(baseline_hist.sum(), 1)
+        current_pct = current_hist / max(current_hist.sum(), 1)
+        epsilon = 1e-6
+        return float(sum(
+            (curr - base) * math.log((curr + epsilon) / (base + epsilon))
+            for base, curr in zip(baseline_pct, current_pct)
+            if base > 0 and curr > 0
+        ))
+
+    baseline_counts = baseline_series.astype(str).value_counts(normalize=True)
+    current_counts = current_series.astype(str).value_counts(normalize=True)
+    categories = sorted(set(baseline_counts.index) | set(current_counts.index))
+    baseline_pct = [float(baseline_counts.get(cat, 0.0)) for cat in categories]
+    current_pct = [float(current_counts.get(cat, 0.0)) for cat in categories]
+    epsilon = 1e-6
+    return float(sum(
+        (curr - base) * math.log((curr + epsilon) / (base + epsilon))
+        for base, curr in zip(baseline_pct, current_pct)
+        if base > 0 and curr > 0
+    ))
+
+
+def _compare_numeric_feature(column_name, baseline_df, current_df):
+    baseline_series = _coerce_numeric(baseline_df[column_name])
+    current_series = _coerce_numeric(current_df[column_name])
+
+    ks_statistic = _compute_ks_statistic(baseline_series, current_series)
+    psi_value = _compute_psi(baseline_series, current_series)
+    drift_score = min(100.0, max(0.0, (ks_statistic * 70.0) + (min(abs(psi_value), 1.5) / 1.5) * 30.0))
+
+    return {
+        "column": column_name,
+        "data_type": "numeric",
+        "method": "KS Test + PSI",
+        "ks_statistic": round(float(ks_statistic), 4),
+        "psi": round(float(psi_value), 4),
+        "drift_score": round(float(drift_score), 2),
+        "severity": classify_drift_severity(drift_score),
+        "baseline_summary": {
+            "mean": round(float(baseline_series.mean()), 4) if not baseline_series.empty else None,
+            "std": round(float(baseline_series.std(ddof=0)), 4) if baseline_series.size > 1 else None,
+            "min": round(float(baseline_series.min()), 4) if not baseline_series.empty else None,
+            "max": round(float(baseline_series.max()), 4) if not baseline_series.empty else None,
+        },
+        "current_summary": {
+            "mean": round(float(current_series.mean()), 4) if not current_series.empty else None,
+            "std": round(float(current_series.std(ddof=0)), 4) if current_series.size > 1 else None,
+            "min": round(float(current_series.min()), 4) if not current_series.empty else None,
+            "max": round(float(current_series.max()), 4) if not current_series.empty else None,
+        },
+    }
+
+
+def _compare_categorical_feature(column_name, baseline_df, current_df):
+    baseline_series = baseline_df[column_name].fillna("missing").astype(str)
+    current_series = current_df[column_name].fillna("missing").astype(str)
+
+    psi_value = _compute_psi(baseline_series, current_series)
+    baseline_pct = baseline_series.value_counts(normalize=True)
+    current_pct = current_series.value_counts(normalize=True)
+    category_shift = float((current_pct.reindex(baseline_pct.index, fill_value=0.0) - baseline_pct).abs().sum())
+    drift_score = min(100.0, max(0.0, abs(psi_value) * 100.0 * 0.8 + category_shift * 100.0 * 0.2))
+
+    return {
+        "column": column_name,
+        "data_type": "categorical",
+        "method": "PSI",
+        "psi": round(float(psi_value), 4),
+        "drift_score": round(float(drift_score), 2),
+        "severity": classify_drift_severity(drift_score),
+        "baseline_distribution": baseline_pct.head(10).to_dict(),
+        "current_distribution": current_pct.head(10).to_dict(),
+        "category_shift": round(float(category_shift), 4),
+    }
+
+
+def analyze_dataset_drift(baseline_df, current_df):
+    baseline_df = baseline_df.copy()
+    current_df = current_df.copy()
+
+    if baseline_df.empty or current_df.empty:
+        raise ValueError("Both the baseline and current datasets must contain at least one row.")
+
+    common_columns = [col for col in baseline_df.columns if col in current_df.columns]
+    if not common_columns:
+        raise ValueError("The baseline and current datasets do not share any columns for comparison.")
+
+    feature_metrics = {}
+    for column_name in common_columns:
+        if pd.api.types.is_numeric_dtype(baseline_df[column_name]) or pd.api.types.is_numeric_dtype(current_df[column_name]):
+            feature_metrics[column_name] = _compare_numeric_feature(column_name, baseline_df, current_df)
+        else:
+            feature_metrics[column_name] = _compare_categorical_feature(column_name, baseline_df, current_df)
+
+    overall_score = round(
+        float(sum(metric["drift_score"] for metric in feature_metrics.values()) / len(feature_metrics)),
+        2,
+    ) if feature_metrics else 0.0
+
+    return {
+        "baseline_rows": int(len(baseline_df)),
+        "current_rows": int(len(current_df)),
+        "baseline_columns": list(baseline_df.columns),
+        "current_columns": list(current_df.columns),
+        "shared_columns": common_columns,
+        "overall_drift_score": overall_score,
+        "overall_severity": classify_drift_severity(overall_score),
+        "drift_detected": any(metric["drift_score"] >= 25 for metric in feature_metrics.values()),
+        "feature_metrics": feature_metrics,
+    }
+
+
+def plot_drift_distribution(feature_name, baseline_df, current_df):
+    column_reference = baseline_df[feature_name]
+    column_current = current_df[feature_name]
+
+    if pd.api.types.is_numeric_dtype(column_reference) and pd.api.types.is_numeric_dtype(column_current):
+        baseline_hist = pd.Series(column_reference).dropna()
+        current_hist = pd.Series(column_current).dropna()
+        fig = go.Figure()
+        fig.add_trace(go.Histogram(x=baseline_hist, name="Baseline", opacity=0.7))
+        fig.add_trace(go.Histogram(x=current_hist, name="Current", opacity=0.7))
+        fig.update_layout(
+            title=f"Distribution comparison for {feature_name}",
+            barmode="overlay",
+            template="plotly_dark",
+        )
+        return fig
+
+    baseline_counts = pd.Series(column_reference.fillna("missing").astype(str)).value_counts(normalize=True)
+    current_counts = pd.Series(column_current.fillna("missing").astype(str)).value_counts(normalize=True)
+    combined = pd.concat([baseline_counts, current_counts], axis=1, keys=["Baseline", "Current"]).fillna(0)
+    fig = px.bar(combined, barmode="group", title=f"Category drift for {feature_name}")
+    return apply_modern_theme(fig)
+
+
+"""`main.py` and app-level usage are intentionally minimal so the drift logic can be consumed by the API and notebook workflows without introducing a heavy UI dependency."""
