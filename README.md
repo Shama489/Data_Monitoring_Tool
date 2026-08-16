@@ -48,5 +48,24 @@ The **Data Monitoring Tool** is an **interactive Streamlit-based dashboard** tha
 - **Monitoring dataset quality** in research or production environments  
 - **Identifying anomalies and outliers** to ensure data integrity
 
+---
+
+## Data Drift Monitoring
+
+The tool now includes a baseline-vs-current drift workflow for the high-priority monitoring steps:
+
+1. **Baseline Dataset**: keep a reference sample for comparison.  
+2. **Current Dataset**: compare the latest incoming data against the baseline.  
+3. **Distribution Comparison**: compare numeric and categorical feature distributions.  
+4. **Drift Detection**: use KS test and PSI-based drift detection.  
+5. **Drift Score**: compute a per-feature score from 0 to 100.  
+6. **Severity**: classify each feature as low, medium, high, or critical.  
+7. **Visualization**: generate distribution charts for drift inspection.  
+
+API usage:
+
+- `POST /api/drift/analyze` with `baseline` and `current` JSON arrays or dictionaries.  
+- `POST /api/drift/analyze-csv` with `baseline_csv` and `current_csv` content.
+
 
 <img width="1920" height="965" alt="Screenshot 2026-03-26 192137" src="https://github.com/user-attachments/assets/88d54c28-8602-45f2-9e7c-251667701fca" />
