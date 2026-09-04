@@ -2,10 +2,13 @@ import pandas as pd
 
 from profiler import (
     analyze_dataset_drift,
+    analyze_trends,
     calculate_data_quality_score,
     check_data_quality,
     classify_drift_severity,
+    forecast_data_health,
     generate_ai_quality_summary,
+    train_and_explain_model,
 )
 
 
@@ -96,3 +99,41 @@ def test_generate_ai_quality_summary_uses_llm_when_available(monkeypatch):
     assert ai_summary["summary"] == "AI-driven summary"
     assert ai_summary["risk_level"] == "medium"
     assert ai_summary["key_findings"] == ["LLM found data issues"]
+
+
+def test_trends_and_health_forecasts_are_generated():
+    dates = pd.date_range("2025-01-01", periods=12, freq="W")
+    df = pd.DataFrame(
+        {
+            "event_date": dates,
+            "amount": range(12),
+            "status": ["ok", "bad"] * 6,
+        }
+    )
+
+    trends = analyze_trends(df, "event_date", "amount")
+    health = forecast_data_health(df, "event_date", periods=2)
+
+    assert trends["weekly"]
+    assert trends["monthly"]
+    assert trends["seasonal_patterns"]
+    assert set(health) == {"volume", "missing_values", "quality_score"}
+    assert all(len(item["forecast"]) == 2 for item in health.values())
+
+
+def test_model_explanations_return_ranked_feature_importance():
+    df = pd.DataFrame(
+        {
+            "age": [20, 21, 30, 31, 40, 41],
+            "segment": ["A", "A", "B", "B", "C", "C"],
+            "target": [0, 0, 1, 1, 1, 1],
+        }
+    )
+
+    explanation = train_and_explain_model(df, "target")
+
+    assert explanation["target"] == "target"
+    assert explanation["feature_importance"]
+    importances = [item["importance"] for item in explanation["feature_importance"]]
+    assert importances == sorted(importances, reverse=True)
+    assert "shap_available" in explanation

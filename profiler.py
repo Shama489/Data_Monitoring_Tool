@@ -6,7 +6,17 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
-from sklearn.ensemble import IsolationForest
+from sklearn.ensemble import IsolationForest, RandomForestClassifier, RandomForestRegressor
+
+try:
+    from statsmodels.tsa.arima.model import ARIMA
+except ImportError:  # pragma: no cover
+    ARIMA = None
+
+try:
+    import shap
+except ImportError:  # pragma: no cover
+    shap = None
 
 try:
     from openai import OpenAI
@@ -493,6 +503,169 @@ def plot_drift_distribution(feature_name, baseline_df, current_df):
     combined = pd.concat([baseline_counts, current_counts], axis=1, keys=["Baseline", "Current"]).fillna(0)
     fig = px.bar(combined, barmode="group", title=f"Category drift for {feature_name}")
     return apply_modern_theme(fig)
+
+
+def _prepare_time_series(df, date_column, value_column=None, frequency="W"):
+    if date_column not in df.columns:
+        raise ValueError(f"Date column '{date_column}' was not found in the dataset.")
+
+    dates = pd.to_datetime(df[date_column], errors="coerce")
+    valid = df.loc[dates.notna()].copy()
+    valid[date_column] = dates.loc[valid.index]
+    if valid.empty:
+        raise ValueError("The date column does not contain valid dates.")
+
+    grouped = valid.set_index(date_column)
+    if value_column is None:
+        series = grouped.resample(frequency).size().astype(float)
+    else:
+        if value_column not in df.columns:
+            raise ValueError(f"Value column '{value_column}' was not found in the dataset.")
+        values = pd.to_numeric(grouped[value_column], errors="coerce")
+        series = values.resample(frequency).sum(min_count=1).fillna(0.0)
+
+    return series.asfreq(frequency, fill_value=0.0).astype(float)
+
+
+def analyze_trends(df, date_column, value_column=None):
+    """Return weekly, monthly, and calendar-seasonality summaries."""
+    weekly = _prepare_time_series(df, date_column, value_column, "W")
+    monthly = _prepare_time_series(df, date_column, value_column, "ME")
+    dates = pd.to_datetime(df[date_column], errors="coerce")
+    valid = df.loc[dates.notna()].copy()
+    valid[date_column] = dates.loc[valid.index]
+
+    if value_column is None:
+        valid["metric"] = 1.0
+    else:
+        valid["metric"] = pd.to_numeric(valid[value_column], errors="coerce").fillna(0.0)
+
+    seasonal = valid.assign(
+        month=valid[date_column].dt.month,
+        weekday=valid[date_column].dt.day_name(),
+    ).groupby(["month", "weekday"], sort=True)["metric"].agg(["count", "mean"]).reset_index()
+
+    return {
+        "date_column": date_column,
+        "value_column": value_column,
+        "weekly": [{"date": index.isoformat(), "value": round(float(value), 4)} for index, value in weekly.items()],
+        "monthly": [{"date": index.isoformat(), "value": round(float(value), 4)} for index, value in monthly.items()],
+        "seasonal_patterns": seasonal.to_dict(orient="records"),
+    }
+
+
+def forecast_metric(df, date_column, value_column=None, periods=4, frequency="W", method="auto"):
+    """Forecast future row volume or a numeric metric using ARIMA or a linear fallback."""
+    if periods < 1 or periods > 365:
+        raise ValueError("periods must be between 1 and 365.")
+    series = _prepare_time_series(df, date_column, value_column, frequency)
+    if len(series) < 3:
+        raise ValueError("At least three time periods are required for forecasting.")
+
+    requested_method = method.lower()
+    if requested_method not in {"auto", "arima", "linear"}:
+        raise ValueError("method must be one of: auto, arima, linear.")
+
+    forecast_method = "linear"
+    forecast_values = None
+    if requested_method in {"auto", "arima"} and ARIMA is not None and len(series) >= 8:
+        try:
+            fitted = ARIMA(series, order=(1, 1, 1)).fit()
+            forecast_values = np.asarray(fitted.forecast(steps=periods), dtype=float)
+            forecast_method = "ARIMA"
+        except Exception:
+            if requested_method == "arima":
+                raise
+
+    if forecast_values is None:
+        x_values = np.arange(len(series), dtype=float)
+        slope, intercept = np.polyfit(x_values, series.to_numpy(), 1)
+        forecast_values = intercept + slope * np.arange(len(series), len(series) + periods)
+
+    future_index = pd.date_range(
+        start=series.index[-1] + pd.tseries.frequencies.to_offset(frequency),
+        periods=periods,
+        freq=frequency,
+    )
+    return {
+        "metric": value_column or "row_volume",
+        "frequency": frequency,
+        "method": forecast_method,
+        "history": [{"date": index.isoformat(), "value": round(float(value), 4)} for index, value in series.items()],
+        "forecast": [
+            {"date": index.isoformat(), "value": round(float(max(value, 0.0)), 4)}
+            for index, value in zip(future_index, forecast_values)
+        ],
+    }
+
+
+def forecast_data_health(df, date_column, periods=4, frequency="W"):
+    """Forecast volume, missing values, and quality score as separate time series."""
+    date_values = pd.to_datetime(df[date_column], errors="coerce")
+    working = df.loc[date_values.notna()].copy()
+    working[date_column] = date_values.loc[working.index]
+    working["missing_values"] = working.isna().sum(axis=1)
+    working["quality_score"] = 100.0 - (working["missing_values"] / max(df.shape[1], 1)) * 60.0
+    return {
+        "volume": forecast_metric(working, date_column, None, periods, frequency),
+        "missing_values": forecast_metric(working, date_column, "missing_values", periods, frequency),
+        "quality_score": forecast_metric(working, date_column, "quality_score", periods, frequency),
+    }
+
+
+def train_and_explain_model(df, target_column, task="classification"):
+    """Train a small baseline Random Forest and return feature importance plus SHAP explanations."""
+    if target_column not in df.columns:
+        raise ValueError(f"Target column '{target_column}' was not found in the dataset.")
+    if task not in {"classification", "regression"}:
+        raise ValueError("task must be classification or regression.")
+
+    working = df.dropna(subset=[target_column]).copy()
+    if len(working) < 4:
+        raise ValueError("At least four labeled rows are required for model explanations.")
+    target = working.pop(target_column)
+    for column_name in working.columns:
+        if pd.api.types.is_datetime64_any_dtype(working[column_name]):
+            working[column_name] = working[column_name].astype("int64") / 10**9
+    features = pd.get_dummies(working, dummy_na=True).replace([np.inf, -np.inf], np.nan).fillna(0)
+    if features.shape[1] == 0:
+        raise ValueError("At least one usable feature is required.")
+
+    if task == "classification":
+        model = RandomForestClassifier(n_estimators=100, random_state=42)
+    else:
+        model = RandomForestRegressor(n_estimators=100, random_state=42)
+    model.fit(features, target)
+
+    importances = sorted(
+        [{"feature": name, "importance": round(float(value), 6)} for name, value in zip(features.columns, model.feature_importances_)],
+        key=lambda item: item["importance"],
+        reverse=True,
+    )
+    result = {
+        "task": task,
+        "target": target_column,
+        "rows": int(len(features)),
+        "features": int(features.shape[1]),
+        "feature_importance": importances,
+        "shap_available": shap is not None,
+        "shap_values": None,
+    }
+    if shap is not None:
+        try:
+            explanation = shap.TreeExplainer(model)(features)
+            values = explanation.values
+            if values.ndim == 3:
+                values = np.mean(np.abs(values), axis=2)
+            else:
+                values = np.abs(values)
+            result["shap_values"] = [
+                {"feature": name, "mean_abs_shap": round(float(value), 6)}
+                for name, value in sorted(zip(features.columns, values.mean(axis=0)), key=lambda item: item[1], reverse=True)
+            ]
+        except Exception:
+            result["shap_available"] = False
+    return result
 
 
 """`main.py` and app-level usage are intentionally minimal so the drift logic can be consumed by the API and notebook workflows without introducing a heavy UI dependency."""
