@@ -3,7 +3,12 @@ from typing import Any
 import pandas as pd
 from fastapi import FastAPI
 
-from profiler import analyze_dataset_drift
+from profiler import (
+    analyze_dataset_drift,
+    calculate_data_quality_score,
+    check_data_quality,
+    generate_ai_quality_summary,
+)
 
 app = FastAPI(title="Data Monitoring Tool")
 
@@ -16,6 +21,55 @@ def home():
 @app.get("/api/health")
 def health_check():
     return {"status": "ok", "service": "data-monitoring-tool"}
+
+
+@app.post("/api/data-quality/analyze")
+def analyze_data_quality_endpoint(payload: dict[str, Any]):
+    dataset = payload.get("data") or payload.get("dataset") or payload.get("records")
+    if dataset is None:
+        return {"error": "Dataset payload is required."}
+
+    try:
+        df = pd.DataFrame(dataset)
+    except Exception:
+        return {"error": "Dataset payload must be list-of-records or column-oriented JSON."}
+
+    if df.empty:
+        return {"error": "Dataset must not be empty."}
+
+    report = check_data_quality(df)
+    quality_score = calculate_data_quality_score(df)
+    ai_summary = generate_ai_quality_summary(df, report, quality_score)
+    return {
+        "report": report,
+        "quality_score": quality_score,
+        "ai_summary": ai_summary,
+        "message": "Data quality analysis completed successfully.",
+    }
+
+
+@app.post("/api/data-quality/analyze-csv")
+def analyze_data_quality_csv_endpoint(payload: dict[str, Any]):
+    csv_content = payload.get("csv") or payload.get("dataset_csv")
+    if csv_content is None:
+        return {"error": "CSV payload is required."}
+
+    try:
+        df = pd.read_csv(pd.io.common.StringIO(csv_content))
+    except Exception:
+        return {"error": "Invalid CSV content."}
+
+    if df.empty:
+        return {"error": "CSV dataset must not be empty."}
+
+    report = check_data_quality(df)
+    quality_score = calculate_data_quality_score(df)
+    ai_summary = generate_ai_quality_summary(df, report, quality_score)
+    return {
+        "report": report,
+        "quality_score": quality_score,
+        "ai_summary": ai_summary,
+    }
 
 
 @app.post("/api/drift/analyze")

@@ -1,10 +1,17 @@
 import math
+import json
+import os
 
 import pandas as pd
 import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 from sklearn.ensemble import IsolationForest
+
+try:
+    from openai import OpenAI
+except ImportError:  # pragma: no cover
+    OpenAI = None
 
 # 🎨 MODERN GRAPH THEME 
 def apply_modern_theme(fig, height=420):
@@ -40,7 +47,117 @@ def calculate_data_quality_score(df):
         score -= (nulls / total_cells) * 60
         score -= (duplicates / len(df)) * 40
 
-    return {"overall_score": max(score, 0)}
+    return {"overall_score": round(float(max(score, 0)), 2)}
+
+
+def _call_openai_quality_summary(metrics):
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key or OpenAI is None:
+        raise RuntimeError("OpenAI API key is not configured")
+
+    client = OpenAI(api_key=api_key)
+    prompt = (
+        "You are a data quality expert. Analyze the dataset metrics below and return only valid JSON "
+        "with keys: summary, risk_level, key_findings, recommended_actions. "
+        f"Dataset metrics: {json.dumps(metrics, ensure_ascii=False, default=str)}"
+    )
+
+    response = client.responses.create(
+        model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+        input=prompt,
+        temperature=0.2,
+    )
+
+    content = getattr(response, "output_text", None)
+    if not content:
+        raise RuntimeError("OpenAI response did not include output text")
+
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError:
+        parsed = json.loads(content.strip("```json\n").strip("```"))
+
+    if not isinstance(parsed, dict):
+        raise ValueError("OpenAI returned an unexpected format")
+
+    return parsed
+
+
+def generate_ai_quality_summary(df, report=None, quality_score=None, use_llm=False):
+    if report is None:
+        report = check_data_quality(df)
+    if quality_score is None:
+        quality_score = calculate_data_quality_score(df)
+
+    total_rows = max(len(df), 1)
+    total_cells = max(df.size, 1)
+    null_rate = (report.get("total_nulls", 0) / total_cells) * 100
+    duplicate_rate = (report.get("duplicates", 0) / total_rows) * 100
+    overall_score = float(quality_score.get("overall_score", 0.0))
+
+    metrics = {
+        "overall_score": round(overall_score, 2),
+        "total_rows": int(len(df)),
+        "total_columns": int(df.shape[1]),
+        "total_nulls": int(report.get("total_nulls", 0)),
+        "duplicates": int(report.get("duplicates", 0)),
+        "null_rate_percent": round(float(null_rate), 2),
+        "duplicate_rate_percent": round(float(duplicate_rate), 2),
+        "all_null_columns": report.get("all_null_columns", []),
+    }
+
+    if use_llm:
+        try:
+            ai_result = _call_openai_quality_summary(metrics)
+            required_fields = {"summary", "risk_level", "key_findings", "recommended_actions"}
+            if required_fields.issubset(ai_result.keys()):
+                return ai_result
+        except Exception:
+            pass
+
+    if overall_score >= 85:
+        risk_level = "low"
+    elif overall_score >= 60:
+        risk_level = "medium"
+    elif overall_score >= 30:
+        risk_level = "high"
+    else:
+        risk_level = "critical"
+
+    findings = []
+    if report.get("total_nulls", 0) > 0:
+        findings.append(f"{report['total_nulls']} missing values were found across {len(report.get('null_per_column', {}))} columns.")
+    if report.get("duplicates", 0) > 0:
+        findings.append(f"{report['duplicates']} duplicate rows were detected, which can distort downstream analytics.")
+    if report.get("all_null_columns"):
+        findings.append("Some columns are entirely empty and may need removal or imputation.")
+    if not findings:
+        findings.append("The dataset looks structurally clean with no obvious missing-value or duplicate anomalies.")
+
+    recommended_actions = []
+    if report.get("total_nulls", 0) > 0:
+        recommended_actions.append("Impute missing values or drop rows/columns that are not business critical.")
+    if report.get("duplicates", 0) > 0:
+        recommended_actions.append("Remove repeated records with drop_duplicates before model training or reporting.")
+    if report.get("all_null_columns"):
+        recommended_actions.append("Review empty columns and remove them if they do not provide usable signal.")
+    if null_rate < 5 and duplicate_rate < 2 and overall_score >= 85:
+        recommended_actions.append("Keep the current quality baseline and monitor for drift as new data arrives.")
+    else:
+        recommended_actions.append("Run a validation pass on schema, range checks, and business rules before production use.")
+
+    summary = (
+        f"The dataset quality score is {overall_score:.1f}/100 with a {risk_level} risk profile. "
+        f"Missing values account for {null_rate:.1f}% of cells and duplicates account for {duplicate_rate:.1f}% of rows. "
+        "AI-assisted review recommends targeted cleanup before using the dataset in reporting or ML workflows."
+    )
+
+    return {
+        "summary": summary,
+        "risk_level": risk_level,
+        "key_findings": findings,
+        "recommended_actions": recommended_actions,
+    }
 
 # QUALITY VISUALS
 def plot_null_distribution(df):
@@ -260,7 +377,7 @@ def _compute_psi(baseline_values, current_values):
     return float(sum(
         (curr - base) * math.log((curr + epsilon) / (base + epsilon))
         for base, curr in zip(baseline_pct, current_pct)
-        if base > 0 and curr > 0
+        if base > 0 or curr > 0
     ))
 
 
