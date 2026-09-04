@@ -5,9 +5,12 @@ from fastapi import FastAPI
 
 from profiler import (
     analyze_dataset_drift,
+    analyze_trends,
     calculate_data_quality_score,
     check_data_quality,
+    forecast_data_health,
     generate_ai_quality_summary,
+    train_and_explain_model,
 )
 
 app = FastAPI(title="Data Monitoring Tool")
@@ -112,3 +115,46 @@ def analyze_drift_csv_endpoint(payload: dict[str, Any]):
 
     report = analyze_dataset_drift(baseline_df, current_df)
     return {"report": report}
+
+
+@app.post("/api/analytics/trends")
+def analyze_trends_endpoint(payload: dict[str, Any]):
+    dataset = payload.get("data") or payload.get("dataset") or payload.get("records")
+    date_column = payload.get("date_column")
+    if dataset is None or not date_column:
+        return {"error": "Dataset and date_column are required."}
+    try:
+        return {"report": analyze_trends(pd.DataFrame(dataset), date_column, payload.get("value_column"))}
+    except (TypeError, ValueError) as error:
+        return {"error": str(error)}
+
+
+@app.post("/api/analytics/forecast")
+def forecast_endpoint(payload: dict[str, Any]):
+    dataset = payload.get("data") or payload.get("dataset") or payload.get("records")
+    date_column = payload.get("date_column")
+    if dataset is None or not date_column:
+        return {"error": "Dataset and date_column are required."}
+    try:
+        df = pd.DataFrame(dataset)
+        periods = int(payload.get("periods", 4))
+        if payload.get("metric") == "data_health":
+            report = forecast_data_health(df, date_column, periods, payload.get("frequency", "W"))
+        else:
+            report = forecast_metric(df, date_column, payload.get("value_column"), periods, payload.get("frequency", "W"), payload.get("method", "auto"))
+        return {"report": report}
+    except (TypeError, ValueError) as error:
+        return {"error": str(error)}
+
+
+@app.post("/api/analytics/explain")
+def explain_model_endpoint(payload: dict[str, Any]):
+    dataset = payload.get("data") or payload.get("dataset") or payload.get("records")
+    target_column = payload.get("target_column")
+    if dataset is None or not target_column:
+        return {"error": "Dataset and target_column are required."}
+    try:
+        report = train_and_explain_model(pd.DataFrame(dataset), target_column, payload.get("task", "classification"))
+        return {"report": report}
+    except (TypeError, ValueError) as error:
+        return {"error": str(error)}
