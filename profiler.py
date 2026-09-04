@@ -377,7 +377,7 @@ def _compute_psi(baseline_values, current_values):
     return float(sum(
         (curr - base) * math.log((curr + epsilon) / (base + epsilon))
         for base, curr in zip(baseline_pct, current_pct)
-        if base > 0 and curr > 0
+        if base > 0 or curr > 0
     ))
 
 

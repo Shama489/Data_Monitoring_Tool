@@ -42,6 +42,18 @@ def test_drift_detection_returns_feature_metrics_and_severity():
     assert classify_drift_severity(95) == "critical"
 
 
+def test_drift_detection_flags_new_categories():
+    baseline = pd.DataFrame({"segment": ["A", "A", "B", "B"]})
+    current = pd.DataFrame({"segment": ["C", "C", "C", "C"]})
+
+    report = analyze_dataset_drift(baseline, current)
+
+    metric = report["feature_metrics"]["segment"]
+    assert metric["psi"] > 0
+    assert metric["drift_score"] >= 25
+    assert report["drift_detected"] is True
+
+
 def test_data_quality_and_ai_summary_are_generated():
     df = pd.DataFrame(
         {
