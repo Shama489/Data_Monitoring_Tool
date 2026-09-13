@@ -1,6 +1,7 @@
 import math
 import json
 import os
+import warnings
 
 import pandas as pd
 import numpy as np
@@ -10,8 +11,10 @@ from sklearn.ensemble import IsolationForest, RandomForestClassifier, RandomFore
 
 try:
     from statsmodels.tsa.arima.model import ARIMA
+    from statsmodels.tools.sm_exceptions import ConvergenceWarning
 except ImportError:  # pragma: no cover
     ARIMA = None
+    ConvergenceWarning = Warning
 
 try:
     import shap
@@ -569,13 +572,25 @@ def forecast_metric(df, date_column, value_column=None, periods=4, frequency="W"
     forecast_method = "linear"
     forecast_values = None
     if requested_method in {"auto", "arima"} and ARIMA is not None and len(series) >= 8:
-        try:
-            fitted = ARIMA(series, order=(1, 1, 1)).fit()
-            forecast_values = np.asarray(fitted.forecast(steps=periods), dtype=float)
-            forecast_method = "ARIMA"
-        except Exception:
-            if requested_method == "arima":
-                raise
+        candidate_orders = [(1, 1, 1), (0, 1, 1), (1, 0, 1), (1, 1, 0)]
+        if requested_method == "arima":
+            candidate_orders = [(1, 1, 1)]
+
+        for order in candidate_orders:
+            try:
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore", category=ConvergenceWarning)
+                    fitted = ARIMA(series, order=order).fit()
+                prediction = np.asarray(fitted.forecast(steps=periods), dtype=float)
+                if np.all(np.isfinite(prediction)):
+                    forecast_values = prediction
+                    forecast_method = "ARIMA"
+                    break
+            except Exception:
+                continue
+
+        if requested_method == "arima" and forecast_values is None:
+            raise RuntimeError("ARIMA forecasting failed for the supplied data.")
 
     if forecast_values is None:
         x_values = np.arange(len(series), dtype=float)

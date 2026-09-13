@@ -1,4 +1,7 @@
+import warnings
+
 import pandas as pd
+from statsmodels.tools.sm_exceptions import ConvergenceWarning
 
 from profiler import (
     analyze_dataset_drift,
@@ -7,6 +10,7 @@ from profiler import (
     check_data_quality,
     classify_drift_severity,
     forecast_data_health,
+    forecast_metric,
     generate_ai_quality_summary,
     train_and_explain_model,
 )
@@ -119,6 +123,18 @@ def test_trends_and_health_forecasts_are_generated():
     assert trends["seasonal_patterns"]
     assert set(health) == {"volume", "missing_values", "quality_score"}
     assert all(len(item["forecast"]) == 2 for item in health.values())
+
+
+def test_forecast_metric_ignores_nonfatal_arima_convergence_warnings():
+    dates = pd.date_range("2025-01-01", periods=12, freq="W")
+    df = pd.DataFrame({"event_date": dates, "amount": range(12)})
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        report = forecast_metric(df, "event_date", "amount", periods=2, method="auto")
+
+    assert report["forecast"]
+    assert not any(issubclass(w.category, ConvergenceWarning) for w in caught)
 
 
 def test_model_explanations_return_ranked_feature_importance():
