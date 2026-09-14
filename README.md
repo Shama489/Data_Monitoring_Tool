@@ -52,6 +52,58 @@ The **Data Monitoring Tool** is an **interactive Streamlit-based dashboard** tha
 
 ---
 
+# Dashboard Features
+
+### 15. Custom Dashboards
+
+Users can:
+
+- Create widgets
+- Save layouts
+- Pin important metrics
+
+### 16. Dark Mode
+
+- Provide a low-glare interface for extended monitoring sessions
+- Improve readability across charts, tables, and metric panels
+
+### 17. Multi-language Support
+
+- Localize dashboard labels, tooltips, and summaries
+- Support global users in different regional contexts
+
+### 18. Mobile Responsive Dashboard
+
+- Adapt layouts for phones and tablets
+- Keep key KPIs, charts, and filters accessible on smaller screens
+- Ensure a smooth monitoring experience across devices
+
+# 📑 Reporting Features
+
+### 27. Scheduled Reports
+
+Generate reports:
+
+- Daily
+- Weekly
+- Monthly
+
+### 28. Download Reports
+
+- PDF
+- Excel
+- PowerPoint
+
+### 29. Executive Dashboard
+
+Display:
+
+- KPIs
+- Trends
+- Data health score
+
+---
+
 ## Data Drift Monitoring
 
 The tool now includes a baseline-vs-current drift workflow for the high-priority monitoring steps:
