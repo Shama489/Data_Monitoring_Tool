@@ -9,9 +9,11 @@ from profiler import (
     calculate_data_quality_score,
     check_data_quality,
     forecast_data_health,
+    forecast_metric,
     generate_ai_quality_summary,
     train_and_explain_model,
 )
+from notifications import NotificationError, send_notifications
 
 app = FastAPI(title="Data Monitoring Tool")
 
@@ -24,6 +26,15 @@ def home():
 @app.get("/api/health")
 def health_check():
     return {"status": "ok", "service": "data-monitoring-tool"}
+
+
+@app.post("/api/notifications/send")
+def send_notifications_endpoint(payload: dict[str, Any]):
+    """Send one monitoring alert to email, SMS, WhatsApp, Slack, or Teams."""
+    try:
+        return send_notifications(payload)
+    except NotificationError as error:
+        return {"success": False, "error": str(error)}
 
 
 @app.post("/api/data-quality/analyze")
