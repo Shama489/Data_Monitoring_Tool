@@ -127,5 +127,27 @@ API usage:
 
 The project now includes AI-style quality assessment capabilities that summarize dataset health, highlight top issues, and recommend follow-up actions based on missing values, duplicates, and risk level.
 
+## Monitoring Notifications
+
+Send a monitoring alert through email, SMS, WhatsApp, Slack, or Microsoft Teams:
+
+```json
+POST /api/notifications/send
+{
+	"subject": "Data drift alert",
+	"message": "Customer age drift exceeded the threshold.",
+	"dry_run": false,
+	"channels": [
+		{"channel": "email", "recipient": "alerts@example.com"},
+		{"channel": "sms", "recipient": "+15550000000"},
+		{"channel": "whatsapp", "recipient": "+15550000000"},
+		{"channel": "slack", "recipient": "https://hooks.slack.com/services/..."},
+		{"channel": "teams", "recipient": "https://outlook.office.com/webhook/..."}
+	]
+}
+```
+
+Use `dry_run: true` to validate the payload without contacting providers. Configure secrets with environment variables: `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `ALERT_FROM_EMAIL`, `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_SMS_FROM`, `TWILIO_WHATSAPP_FROM`, `SLACK_WEBHOOK_URL`, and `TEAMS_WEBHOOK_URL`. Slack and Teams recipients may be omitted when their webhook URL is configured.
+
 
 <img width="1920" height="965" alt="Screenshot 2026-03-26 192137" src="https://github.com/user-attachments/assets/88d54c28-8602-45f2-9e7c-251667701fca" />
