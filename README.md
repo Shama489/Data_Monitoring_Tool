@@ -1,6 +1,17 @@
-# 🚀 Data Monitoring Tool
+# Data Monitoring Tool
 
-The **Data Monitoring Tool** is an **interactive Streamlit-based dashboard** that provides **comprehensive insights and quality checks** for datasets. It supports multiple formats including **CSV, Excel, JSON, Parquet, TSV, TXT, and Pickle**, making it ideal for **data analysts, data scientists, and ML engineers** who want to quickly profile, visualize, and validate their data before analysis or modeling.
+The **Data Monitoring Tool** provides dataset profiling, quality checks, drift analysis, forecasting, model explanations, and notification delivery through a FastAPI service. The profiling functions can also support a separate dashboard client.
+
+## Run the API
+
+Activate the project virtual environment and start the service:
+
+```powershell
+.\venv\Scripts\Activate.ps1
+uvicorn main:app --reload
+```
+
+The API is available at `http://127.0.0.1:8000`, with interactive documentation at `/docs`.
 
 ---
 
