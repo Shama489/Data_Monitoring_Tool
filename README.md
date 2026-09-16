@@ -21,6 +21,7 @@ The API is available at `http://127.0.0.1:8000`, with interactive documentation 
 - **Data Preview**: Explore the first few rows of the dataset with an interactive table.  
 - **Data Quality Analysis**: Detect null values, duplicates, and generate automated recommendations for cleaning the dataset.  
 - **Data Quality API Integration**: Expose ready-to-use FastAPI endpoints for dataset quality checks from external apps and services.  
+- **Enterprise Source Monitoring**: Analyze multiple local files, SQL databases, MongoDB collections, and cloud objects in one request.
 - **AI-Powered Features**: Generate AI-style summaries, risk assessments, and recommended actions from the observed data quality issues.  
 - **Statistical Insights**: Generate descriptive statistics for numeric and categorical columns.  
 - **Correlation & Relationships**: Visualize correlations between columns using heatmaps and tables.  
@@ -51,6 +52,7 @@ The API is available at `http://127.0.0.1:8000`, with interactive documentation 
 - **Pandas & NumPy** – Data manipulation and analysis  
 - **Scikit-learn** – Machine learning modeling and anomaly detection  
 - **Plotly** – Interactive visualizations
+- **SQLAlchemy** – PostgreSQL and MySQL database connectivity
 
 ---
 
@@ -133,6 +135,29 @@ API usage:
 - `POST /api/data-quality/analyze-csv` with `csv` content for quality analysis.  
 - `POST /api/drift/analyze` with `baseline` and `current` JSON arrays or dictionaries.  
 - `POST /api/drift/analyze-csv` with `baseline_csv` and `current_csv` content.
+
+## Enterprise Source Monitoring
+
+`POST /api/sources/analyze` accepts a list of sources and returns a compact quality summary for each one. A request can mix local files and database or cloud sources:
+
+```json
+{
+	"sources": [
+		{"type": "csv", "path": "data/events.csv"},
+		{"type": "excel", "path": "data/events.xlsx", "sheet_name": "Events"},
+		{"type": "json", "path": "data/events.json"},
+		{"type": "sql", "url": "postgresql+psycopg2://user:password@host/db", "query": "SELECT * FROM events LIMIT 1000"},
+		{"type": "mongodb", "uri": "mongodb://localhost:27017", "database": "monitoring", "collection": "events"},
+		{"type": "s3", "bucket": "monitoring-data", "key": "events.csv"},
+		{"type": "dropbox", "path": "/monitoring/events.csv"},
+		{"type": "google_drive", "file_id": "drive-file-id", "file_type": "csv"}
+	]
+}
+```
+
+Supported source types are `csv`, `excel`, `json`, `parquet`, `tsv`, `sql`, `postgresql`, `mysql`, `mongodb`, `s3`, `dropbox`, and `google_drive`. SQL sources only accept `SELECT` queries. Configure cloud credentials through the provider SDK environment variables, including `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`, `DROPBOX_ACCESS_TOKEN`, and `GOOGLE_APPLICATION_CREDENTIALS`.
+
+Provider SDKs are optional at import time. Install the entries in `requirements.txt` when the corresponding source types are needed.
 
 ## AI-Powered Features
 
