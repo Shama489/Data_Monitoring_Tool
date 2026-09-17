@@ -115,6 +115,33 @@ Display:
 - Trends
 - Data health score
 
+# Advanced Machine Learning
+
+### 30. Fraud Detection
+
+- Detect suspicious transaction patterns and anomalous behaviors using supervised and unsupervised models.
+- Flag high-risk records for review before they affect downstream reporting or financial decisions.
+
+### 31. Data Classification
+
+- Categorize records into business-defined classes using probabilistic and tree-based classifiers.
+- Measure precision, recall, and confidence to support operational decision-making.
+
+### 32. Clustering Analysis
+
+- Group similar records into clusters for segmentation, pattern discovery, and customer or event profiling.
+- Identify hidden structure in large datasets without requiring labeled training targets.
+
+### 33. Recommendation Engine
+
+- Recommend relevant products, actions, or next steps based on patterns in historical behavior.
+- Combine similarity-based and ranking-based techniques to improve personalization and efficiency.
+
+### 34. Predictive Maintenance for Data Pipelines
+
+- Monitor pipeline health, data freshness, and failure signals to anticipate maintenance needs.
+- Reduce downtime by forecasting regression risk and recommending proactive intervention.
+
 ---
 
 ## Data Drift Monitoring
