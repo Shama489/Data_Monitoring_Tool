@@ -1,8 +1,10 @@
 import warnings
 
 import pandas as pd
+import pytest
 from statsmodels.tools.sm_exceptions import ConvergenceWarning
 
+from backend import get_table_data
 from profiler import (
     analyze_dataset_drift,
     analyze_trends,
@@ -153,3 +155,25 @@ def test_model_explanations_return_ranked_feature_importance():
     importances = [item["importance"] for item in explanation["feature_importance"]]
     assert importances == sorted(importances, reverse=True)
     assert "shap_available" in explanation
+
+
+def test_get_table_data_rejects_invalid_table_names():
+    with pytest.raises(ValueError, match="table name"):
+        get_table_data("users; DROP TABLE accounts;")
+
+
+def test_generate_ai_quality_summary_warns_when_llm_fails(monkeypatch):
+    df = pd.DataFrame({"age": [20, None, 30], "score": [10, 12, None]})
+    report = check_data_quality(df)
+    quality_score = calculate_data_quality_score(df)
+
+    def fake_failure(_metrics):
+        raise RuntimeError("llm unavailable")
+
+    monkeypatch.setattr("profiler._call_openai_quality_summary", fake_failure)
+
+    with pytest.warns(RuntimeWarning, match="falling back"):
+        summary = generate_ai_quality_summary(df, report, quality_score, use_llm=True)
+
+    assert "summary" in summary
+    assert "risk_level" in summary

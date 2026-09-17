@@ -14,6 +14,7 @@ from profiler import (
     train_and_explain_model,
 )
 from notifications import NotificationError, send_notifications
+from data_sources import DataSourceError, load_source, summarize_source
 
 app = FastAPI(title="Data Monitoring Tool")
 
@@ -30,6 +31,31 @@ def home():
 @app.get("/api/health")
 def health_check():
     return {"status": "ok", "service": "data-monitoring-tool"}
+
+
+@app.post("/api/sources/analyze")
+def analyze_sources_endpoint(payload: dict[str, Any]):
+    sources = payload.get("sources")
+    if not isinstance(sources, list) or not sources:
+        _bad_request("sources must be a non-empty list")
+
+    reports = []
+    failures = []
+    for index, source in enumerate(sources):
+        if not isinstance(source, dict):
+            failures.append({"index": index, "error": "Each source must be an object"})
+            continue
+        try:
+            frame = load_source(source)
+            if frame.empty:
+                raise DataSourceError("Source dataset must not be empty")
+            reports.append(summarize_source(source, frame))
+        except (DataSourceError, TypeError, ValueError) as error:
+            failures.append({"index": index, "type": source.get("type"), "error": str(error)})
+
+    if not reports and failures:
+        _bad_request(failures[0]["error"])
+    return {"sources": reports, "failed": failures, "success": not failures}
 
 
 @app.post("/api/notifications/send")
