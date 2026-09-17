@@ -125,8 +125,12 @@ def generate_ai_quality_summary(df, report=None, quality_score=None, use_llm=Fal
             required_fields = {"summary", "risk_level", "key_findings", "recommended_actions"}
             if required_fields.issubset(ai_result.keys()):
                 return ai_result
-        except Exception:
-            pass
+        except Exception as exc:
+            warnings.warn(
+                f"OpenAI quality summary failed; falling back to built-in summary. Details: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
     if overall_score >= 85:
         risk_level = "low"
