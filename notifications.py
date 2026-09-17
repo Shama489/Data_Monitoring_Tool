@@ -127,6 +127,6 @@ def send_notifications(alert: dict[str, Any]) -> dict[str, Any]:
             continue
         try:
             results.append(send_notification(channel, recipient, message, subject, dry_run))
-        except NotificationError as error:
+        except (NotificationError, ValueError, TypeError) as error:
             failures.append({"channel": channel, "error": str(error)})
     return {"sent": results, "failed": failures, "success": not failures}
