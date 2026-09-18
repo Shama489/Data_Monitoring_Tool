@@ -177,3 +177,47 @@ def test_generate_ai_quality_summary_warns_when_llm_fails(monkeypatch):
 
     assert "summary" in summary
     assert "risk_level" in summary
+
+
+def test_data_quality_report_includes_schema_freshness_and_rule_validation():
+    df = pd.DataFrame(
+        {
+            "name": ["Alice", "Alice", "Bob", "Charlie"],
+            "age": [30, 30, -1, 45],
+            "email": ["alice@example.com", "alice@example.com", "bob@x", "bad-email"],
+            "created_at": [
+                pd.Timestamp("2025-01-01T00:00:00"),
+                pd.Timestamp("2025-01-01T00:00:00"),
+                pd.Timestamp("2025-01-01T00:00:00"),
+                pd.Timestamp("2025-01-01T00:00:00"),
+            ],
+        }
+    )
+
+    report = check_data_quality(
+        df,
+        expected_columns=["name", "age", "email", "created_at"],
+        timestamp_column="created_at",
+        max_age_hours=1,
+        rules={"age": ">= 0", "email": "contains @"},
+    )
+
+    assert report["schema_validation"]["status"] in {"ok", "warning"}
+    assert report["duplicate_detection"]["exact_duplicates"] >= 1
+    assert report["duplicate_detection"]["near_duplicate_pairs"] >= 0
+    assert report["data_freshness"]["is_fresh"] is False
+    assert report["business_rule_validation"]["violations"] >= 2
+
+
+def test_near_duplicate_detection_flags_similar_rows():
+    df = pd.DataFrame(
+        {
+            "name": ["Alice Johnson", "Alice Jhonson", "Bob Smith", "Carol Jones"],
+            "email": ["alice@x.com", "alice@x.com", "bob@x.com", "carol@x.com"],
+            "age": [30, 30, 25, 40],
+        }
+    )
+
+    report = check_data_quality(df, similarity_threshold=0.8)
+
+    assert report["duplicate_detection"]["near_duplicate_pairs"] >= 1

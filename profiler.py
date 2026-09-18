@@ -40,15 +40,101 @@ def apply_modern_theme(fig, height=420):
     return fig
 
 # DATA QUALITY
-def check_data_quality(df):
-    return {
+def check_data_quality(
+    df,
+    expected_columns=None,
+    timestamp_column=None,
+    max_age_hours=None,
+    similarity_threshold=0.8,
+    rules=None,
+):
+    exact_duplicates = int(df.duplicated().sum())
+
+    duplicate_details = {"exact_duplicates": exact_duplicates, "near_duplicate_pairs": 0, "similarity_threshold": similarity_threshold}
+    if df.shape[0] >= 2 and similarity_threshold is not None:
+        near_duplicate_count = 0
+        for i in range(len(df)):
+            left = df.iloc[i].fillna("").astype(str)
+            for j in range(i + 1, len(df)):
+                right = df.iloc[j].fillna("").astype(str)
+                scores = []
+                for left_value, right_value in zip(left, right):
+                    left_text = str(left_value).strip().lower()
+                    right_text = str(right_value).strip().lower()
+                    if left_text == right_text:
+                        scores.append(1.0)
+                    elif left_text and right_text:
+                        from difflib import SequenceMatcher
+                        scores.append(SequenceMatcher(None, left_text, right_text).ratio())
+                    else:
+                        scores.append(0.0)
+                if scores and (sum(scores) / len(scores)) >= similarity_threshold:
+                    near_duplicate_count += 1
+        duplicate_details["near_duplicate_pairs"] = near_duplicate_count
+
+    schema_report = {"expected_columns": list(expected_columns) if expected_columns else None, "actual_columns": list(df.columns), "missing_columns": [], "extra_columns": [], "type_issues": [], "status": "ok"}
+    if expected_columns is not None:
+        expected = [str(col) for col in expected_columns]
+        actual = [str(col) for col in df.columns]
+        schema_report["missing_columns"] = [col for col in expected if col not in actual]
+        schema_report["extra_columns"] = [col for col in actual if col not in expected]
+        if schema_report["missing_columns"] or schema_report["extra_columns"]:
+            schema_report["status"] = "warning"
+
+    freshness_report = {"timestamp_column": timestamp_column, "max_age_hours": max_age_hours, "latest_timestamp": None, "age_hours": None, "is_fresh": True}
+    if timestamp_column is not None and timestamp_column in df.columns and max_age_hours is not None:
+        try:
+            timestamps = pd.to_datetime(df[timestamp_column], errors="coerce").dropna()
+            if not timestamps.empty:
+                latest_timestamp = timestamps.max()
+                freshness_report["latest_timestamp"] = latest_timestamp.isoformat()
+                freshness_report["age_hours"] = round(float((pd.Timestamp.now() - latest_timestamp).total_seconds() / 3600), 2)
+                freshness_report["is_fresh"] = freshness_report["age_hours"] <= float(max_age_hours)
+        except Exception:
+            freshness_report["is_fresh"] = False
+
+    business_rules = rules or {}
+    violations = 0
+    rule_details = {}
+    for column_name, rule in business_rules.items():
+        if column_name not in df.columns:
+            rule_details[column_name] = {"rule": rule, "violations": 0, "status": "missing_column"}
+            continue
+
+        series = df[column_name]
+        column_violations = 0
+        for value in series:
+            if pd.isna(value):
+                continue
+            text = str(value).strip()
+            if rule == ">= 0":
+                try:
+                    if pd.to_numeric(value, errors="coerce") < 0:
+                        column_violations += 1
+                except Exception:
+                    column_violations += 1
+            elif rule == "contains @":
+                if "@" not in text:
+                    column_violations += 1
+            else:
+                rule_details[column_name] = {"rule": rule, "violations": column_violations, "status": "unsupported_rule"}
+                continue
+        violations += column_violations
+        rule_details[column_name] = {"rule": rule, "violations": column_violations, "status": "ok" if column_violations == 0 else "violated"}
+
+    report = {
         "rows": df.shape[0],
         "columns": df.shape[1],
         "null_per_column": df.isnull().sum().to_dict(),
         "total_nulls": int(df.isnull().sum().sum()),
-        "duplicates": int(df.duplicated().sum()),
-        "all_null_columns": df.columns[df.isnull().all()].tolist()
+        "duplicates": exact_duplicates,
+        "all_null_columns": df.columns[df.isnull().all()].tolist(),
+        "schema_validation": schema_report,
+        "duplicate_detection": duplicate_details,
+        "data_freshness": freshness_report,
+        "business_rule_validation": {"rules": rule_details, "violations": violations},
     }
+    return report
 
 def calculate_data_quality_score(df):
     total_cells = df.size
