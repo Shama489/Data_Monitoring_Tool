@@ -142,7 +142,29 @@ Display:
 - Monitor pipeline health, data freshness, and failure signals to anticipate maintenance needs.
 - Reduce downtime by forecasting regression risk and recommending proactive intervention.
 
-# 🚀 Cutting-Edge Features (Very Impressive)
+# � Data Quality Features
+
+### 1. Schema Validation
+
+- Detect added, removed, or renamed columns.
+- Validate data types automatically.
+
+### 2. Near-duplicate Detection
+
+- Identify exact duplicates and near-duplicate records using similarity matching.
+- Highlight repeated or highly similar entries that may distort downstream insights.
+
+### 3. Data Freshness Monitoring
+
+- Detect when data has not been updated within an expected time window.
+- Surface stale datasets before they affect reporting or decision-making.
+
+### 4. Business Rule Validation
+
+- Validate custom rules such as age not being negative, salary not being less than zero, or email addresses containing a valid domain.
+- Flag records that fail business requirements before analytics or ML workflows proceed.
+
+# �🚀 Cutting-Edge Features (Very Impressive)
 
 ### 35. Chatbot Assistant
 
