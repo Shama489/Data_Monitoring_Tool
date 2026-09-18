@@ -1,88 +1,207 @@
-# db.py
-import os
-import re
+from typing import Any
 
 import pandas as pd
-from sqlalchemy import create_engine, text
+from fastapi import FastAPI, HTTPException
 
-# DATABASE CONFIG 
-DB_USER = os.getenv("DB_USER", "postgres")
-DB_PASSWORD = os.getenv("DB_PASSWORD", "password")
-DB_HOST = os.getenv("DB_HOST", "localhost")
-DB_PORT = os.getenv("DB_PORT", "5432")
-DB_NAME = os.getenv("DB_NAME", "monitoring_db")
-
-# SQLAlchemy 2.x correct URL format
-DATABASE_URL = (
-    f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}"
-    f"@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+from profiler import (
+    analyze_dataset_drift,
+    analyze_trends,
+    calculate_data_quality_score,
+    check_data_quality,
+    forecast_data_health,
+    forecast_metric,
+    generate_ai_quality_summary,
+    train_and_explain_model,
 )
+from notifications import NotificationError, send_notifications
+from data_sources import DataSourceError, load_source, summarize_source
 
-# ENGINE SETUP
-engine = create_engine(
-    DATABASE_URL,
-    pool_pre_ping=True,
-    pool_size=5,
-    max_overflow=10,
-    future=True
-)
+app = FastAPI(title="Data Monitoring Tool")
 
-# TEST CONNECTION
-def test_connection() -> bool:
+
+def _bad_request(message: str) -> None:
+    raise HTTPException(status_code=400, detail=message)
+
+
+@app.get("/")
+def home():
+    return {"message": "Data Monitoring Tool Running"}
+
+
+@app.get("/api/health")
+def health_check():
+    return {"status": "ok", "service": "data-monitoring-tool"}
+
+
+@app.post("/api/sources/analyze")
+def analyze_sources_endpoint(payload: dict[str, Any]):
+    sources = payload.get("sources")
+    if not isinstance(sources, list) or not sources:
+        _bad_request("sources must be a non-empty list")
+
+    reports = []
+    failures = []
+    for index, source in enumerate(sources):
+        if not isinstance(source, dict):
+            failures.append({"index": index, "error": "Each source must be an object"})
+            continue
+        try:
+            frame = load_source(source)
+            if frame.empty:
+                raise DataSourceError("Source dataset must not be empty")
+            reports.append(summarize_source(source, frame))
+        except (DataSourceError, TypeError, ValueError) as error:
+            failures.append({"index": index, "type": source.get("type"), "error": str(error)})
+
+    if not reports and failures:
+        _bad_request(failures[0]["error"])
+    return {"sources": reports, "failed": failures, "success": not failures}
+
+
+@app.post("/api/notifications/send")
+def send_notifications_endpoint(payload: dict[str, Any]):
+    """Send one monitoring alert to email, SMS, WhatsApp, Slack, or Teams."""
     try:
-        with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
-        return True
-    except Exception as e:
-        print(f"❌ Connection failed: {e}")
-        return False
+        return send_notifications(payload)
+    except NotificationError as error:
+        _bad_request(str(error))
 
 
-# SAFE QUERY EXECUTION
-def get_data(query: str, params: dict | None = None) -> pd.DataFrame:
+@app.post("/api/data-quality/analyze")
+def analyze_data_quality_endpoint(payload: dict[str, Any]):
+    dataset = payload.get("data") or payload.get("dataset") or payload.get("records")
+    if dataset is None:
+        _bad_request("Dataset payload is required.")
+
     try:
-        with engine.connect() as conn:
-            df = pd.read_sql(text(query), conn, params=params)
-        return df
-    except Exception as e:
-        print(f"❌ Database Error: {e}")
-        return pd.DataFrame()
+        df = pd.DataFrame(dataset)
+    except Exception:
+        _bad_request("Dataset payload must be list-of-records or column-oriented JSON.")
 
-# GET TABLE NAMES
-def get_tables() -> pd.DataFrame:
-    query = """
-        SELECT table_name
-        FROM information_schema.tables
-        WHERE table_schema = 'public'
-        ORDER BY table_name
-    """
-    return get_data(query)
+    if df.empty:
+        _bad_request("Dataset must not be empty.")
 
-
-def _validate_table_name(table_name: str) -> str:
-    if not isinstance(table_name, str):
-        raise ValueError("table name must be a string")
-
-    candidate = table_name.strip()
-    if not candidate:
-        raise ValueError("table name cannot be empty")
-
-    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", candidate):
-        raise ValueError(f"Invalid table name: {table_name!r}")
-
-    return candidate
+    report = check_data_quality(df)
+    quality_score = calculate_data_quality_score(df)
+    ai_summary = generate_ai_quality_summary(df, report, quality_score)
+    return {
+        "report": report,
+        "quality_score": quality_score,
+        "ai_summary": ai_summary,
+        "message": "Data quality analysis completed successfully.",
+    }
 
 
-# GET SAMPLE DATA
-def get_table_data(table_name: str, limit: int = 100) -> pd.DataFrame:
-    safe_name = _validate_table_name(table_name)
-    tables = get_tables()
+@app.post("/api/data-quality/analyze-csv")
+def analyze_data_quality_csv_endpoint(payload: dict[str, Any]):
+    csv_content = payload.get("csv") or payload.get("dataset_csv")
+    if csv_content is None:
+        _bad_request("CSV payload is required.")
 
-    if tables.empty or "table_name" not in tables.columns:
-        raise ValueError("Could not resolve valid table names from the database")
+    try:
+        df = pd.read_csv(pd.io.common.StringIO(csv_content))
+    except Exception:
+        _bad_request("Invalid CSV content.")
 
-    if safe_name not in tables["table_name"].tolist():
-        raise ValueError(f"Invalid table name: {safe_name}")
+    if df.empty:
+        _bad_request("CSV dataset must not be empty.")
 
-    query = text(f"SELECT * FROM {safe_name} LIMIT :limit")
-    return get_data(query, {"limit": limit})
+    report = check_data_quality(df)
+    quality_score = calculate_data_quality_score(df)
+    ai_summary = generate_ai_quality_summary(df, report, quality_score)
+    return {
+        "report": report,
+        "quality_score": quality_score,
+        "ai_summary": ai_summary,
+    }
+
+
+@app.post("/api/drift/analyze")
+def analyze_drift_endpoint(payload: dict[str, Any]):
+    baseline_data = payload.get("baseline") or payload.get("baseline_dataset")
+    current_data = payload.get("current") or payload.get("current_dataset")
+
+    if baseline_data is None or current_data is None:
+        _bad_request("Both baseline and current datasets are required.")
+
+    try:
+        baseline_df = pd.DataFrame(baseline_data)
+        current_df = pd.DataFrame(current_data)
+    except Exception:
+        _bad_request("Dataset payloads must be list-of-records or column-oriented JSON.")
+
+    if baseline_df.empty or current_df.empty:
+        _bad_request("Baseline and current datasets must not be empty.")
+
+    report = analyze_dataset_drift(baseline_df, current_df)
+    return {
+        "report": report,
+        "message": "Drift analysis completed successfully.",
+    }
+
+
+@app.post("/api/drift/analyze-csv")
+def analyze_drift_csv_endpoint(payload: dict[str, Any]):
+    baseline_csv = payload.get("baseline_csv")
+    current_csv = payload.get("current_csv")
+
+    if baseline_csv is None or current_csv is None:
+        _bad_request("CSV payloads are required for both datasets.")
+
+    try:
+        baseline_df = pd.read_csv(pd.io.common.StringIO(baseline_csv))
+        current_df = pd.read_csv(pd.io.common.StringIO(current_csv))
+    except Exception:
+        _bad_request("Invalid CSV content for one or both datasets.")
+
+    if baseline_df.empty or current_df.empty:
+        _bad_request("Baseline and current CSV datasets must not be empty.")
+
+    try:
+        report = analyze_dataset_drift(baseline_df, current_df)
+    except (TypeError, ValueError) as error:
+        _bad_request(str(error))
+    return {"report": report}
+
+
+@app.post("/api/analytics/trends")
+def analyze_trends_endpoint(payload: dict[str, Any]):
+    dataset = payload.get("data") or payload.get("dataset") or payload.get("records")
+    date_column = payload.get("date_column")
+    if dataset is None or not date_column:
+        _bad_request("Dataset and date_column are required.")
+    try:
+        return {"report": analyze_trends(pd.DataFrame(dataset), date_column, payload.get("value_column"))}
+    except (TypeError, ValueError) as error:
+        _bad_request(str(error))
+
+
+@app.post("/api/analytics/forecast")
+def forecast_endpoint(payload: dict[str, Any]):
+    dataset = payload.get("data") or payload.get("dataset") or payload.get("records")
+    date_column = payload.get("date_column")
+    if dataset is None or not date_column:
+        _bad_request("Dataset and date_column are required.")
+    try:
+        df = pd.DataFrame(dataset)
+        periods = int(payload.get("periods", 4))
+        if payload.get("metric") == "data_health":
+            report = forecast_data_health(df, date_column, periods, payload.get("frequency", "W"))
+        else:
+            report = forecast_metric(df, date_column, payload.get("value_column"), periods, payload.get("frequency", "W"), payload.get("method", "auto"))
+        return {"report": report}
+    except (TypeError, ValueError) as error:
+        _bad_request(str(error))
+
+
+@app.post("/api/analytics/explain")
+def explain_model_endpoint(payload: dict[str, Any]):
+    dataset = payload.get("data") or payload.get("dataset") or payload.get("records")
+    target_column = payload.get("target_column")
+    if dataset is None or not target_column:
+        _bad_request("Dataset and target_column are required.")
+    try:
+        report = train_and_explain_model(pd.DataFrame(dataset), target_column, payload.get("task", "classification"))
+        return {"report": report}
+    except (TypeError, ValueError) as error:
+        _bad_request(str(error))
