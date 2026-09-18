@@ -34,3 +34,17 @@ def test_notifications_report_invalid_channel_without_stopping_other_channels():
     assert result["success"] is False
     assert result["sent"][0]["channel"] == "email"
     assert result["failed"][0]["channel"] == "pagerduty"
+
+
+def test_notifications_catches_unexpected_provider_errors(monkeypatch):
+    def raise_runtime_error(_channel, _recipient, _message, _subject, _dry_run):
+        raise ValueError("provider timeout")
+
+    monkeypatch.setattr("notifications.send_notification", raise_runtime_error)
+
+    result = send_notifications({"message": "Alert", "channels": ["email"]})
+
+    assert result["success"] is False
+    assert result["sent"] == []
+    assert result["failed"][0]["channel"] == "email"
+    assert "provider timeout" in result["failed"][0]["error"]
