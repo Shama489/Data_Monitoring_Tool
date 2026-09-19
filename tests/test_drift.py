@@ -127,6 +127,18 @@ def test_trends_and_health_forecasts_are_generated():
     assert all(len(item["forecast"]) == 2 for item in health.values())
 
 
+def test_trend_analysis_includes_direction_growth_and_moving_average():
+    dates = pd.date_range("2025-01-01", periods=8, freq="W")
+    df = pd.DataFrame({"event_date": dates, "amount": range(8)})
+
+    report = analyze_trends(df, "event_date", "amount")
+
+    assert report["trend_direction"] == "increasing"
+    assert report["growth_rate_percent"] > 0
+    assert report["moving_average"]
+    assert "volatility" in report
+
+
 def test_forecast_metric_ignores_nonfatal_arima_convergence_warnings():
     dates = pd.date_range("2025-01-01", periods=12, freq="W")
     df = pd.DataFrame({"event_date": dates, "amount": range(12)})
@@ -137,6 +149,17 @@ def test_forecast_metric_ignores_nonfatal_arima_convergence_warnings():
 
     assert report["forecast"]
     assert not any(issubclass(w.category, ConvergenceWarning) for w in caught)
+
+
+def test_forecast_metric_supports_advanced_method_names():
+    dates = pd.date_range("2025-01-01", periods=12, freq="W")
+    df = pd.DataFrame({"event_date": dates, "amount": range(12)})
+
+    report = forecast_metric(df, "event_date", "amount", periods=2, method="prophet")
+
+    assert report["forecast"]
+    assert report["requested_method"] == "prophet"
+    assert report["method"] in {"Prophet", "linear", "ARIMA"}
 
 
 def test_model_explanations_return_ranked_feature_importance():
@@ -155,6 +178,8 @@ def test_model_explanations_return_ranked_feature_importance():
     importances = [item["importance"] for item in explanation["feature_importance"]]
     assert importances == sorted(importances, reverse=True)
     assert "shap_available" in explanation
+    assert "explanation_summary" in explanation
+    assert explanation["explanation_summary"]["top_features"]
 
 
 def test_get_table_data_rejects_invalid_table_names():

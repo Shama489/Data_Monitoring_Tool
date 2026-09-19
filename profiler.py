@@ -638,17 +638,35 @@ def analyze_trends(df, date_column, value_column=None):
         weekday=valid[date_column].dt.day_name(),
     ).groupby(["month", "weekday"], sort=True)["metric"].agg(["count", "mean"]).reset_index()
 
+    values = weekly.to_numpy(dtype=float)
+    x_values = np.arange(len(values), dtype=float)
+    slope = float(np.polyfit(x_values, values, 1)[0]) if len(values) >= 2 else 0.0
+    baseline = abs(float(values[0])) if len(values) else 0.0
+    if baseline == 0.0 and len(values):
+        baseline = float(np.mean(np.abs(values)))
+    growth_rate = ((float(values[-1]) - float(values[0])) / baseline * 100.0) if baseline else 0.0
+    trend_direction = "stable" if abs(slope) < 1e-9 else ("increasing" if slope > 0 else "decreasing")
+    moving_average = weekly.rolling(window=min(4, len(weekly)), min_periods=1).mean()
+
     return {
         "date_column": date_column,
         "value_column": value_column,
         "weekly": [{"date": index.isoformat(), "value": round(float(value), 4)} for index, value in weekly.items()],
         "monthly": [{"date": index.isoformat(), "value": round(float(value), 4)} for index, value in monthly.items()],
         "seasonal_patterns": seasonal.to_dict(orient="records"),
+        "trend_direction": trend_direction,
+        "trend_slope": round(slope, 6),
+        "growth_rate_percent": round(float(growth_rate), 2),
+        "volatility": round(float(weekly.std(ddof=0)), 6),
+        "moving_average": [
+            {"date": index.isoformat(), "value": round(float(value), 4)}
+            for index, value in moving_average.items()
+        ],
     }
 
 
 def forecast_metric(df, date_column, value_column=None, periods=4, frequency="W", method="auto"):
-    """Forecast future row volume or a numeric metric using ARIMA or a linear fallback."""
+    """Forecast future row volume or a numeric metric with optional advanced models."""
     if periods < 1 or periods > 365:
         raise ValueError("periods must be between 1 and 365.")
     series = _prepare_time_series(df, date_column, value_column, frequency)
@@ -656,12 +674,34 @@ def forecast_metric(df, date_column, value_column=None, periods=4, frequency="W"
         raise ValueError("At least three time periods are required for forecasting.")
 
     requested_method = method.lower()
-    if requested_method not in {"auto", "arima", "linear"}:
-        raise ValueError("method must be one of: auto, arima, linear.")
+    if requested_method not in {"auto", "arima", "linear", "prophet", "lstm"}:
+        raise ValueError("method must be one of: auto, arima, linear, prophet, lstm.")
 
     forecast_method = "linear"
     forecast_values = None
-    if requested_method in {"auto", "arima"} and ARIMA is not None and len(series) >= 8:
+    fallback_reason = None
+
+    if requested_method in {"auto", "prophet"}:
+        try:
+            from prophet import Prophet
+
+            prophet_frame = pd.DataFrame({"ds": series.index, "y": series.to_numpy()})
+            fitted = Prophet(weekly_seasonality=frequency == "W", daily_seasonality=False)
+            fitted.fit(prophet_frame)
+            future = fitted.make_future_dataframe(periods=periods, freq=frequency)
+            prediction = fitted.predict(future)["yhat"].tail(periods).to_numpy(dtype=float)
+            if np.all(np.isfinite(prediction)):
+                forecast_values = prediction
+                forecast_method = "Prophet"
+        except ImportError as error:
+            fallback_reason = f"Prophet is unavailable; used the available fallback model. Details: {error}"
+        except Exception as error:
+            fallback_reason = f"Prophet failed; used the available fallback model. Details: {error}"
+
+    if requested_method == "lstm":
+        fallback_reason = "LSTM requires an optional deep-learning runtime; used the linear fallback model."
+
+    if forecast_values is None and requested_method in {"auto", "arima"} and ARIMA is not None and len(series) >= 8:
         candidate_orders = [(1, 1, 1), (0, 1, 1), (1, 0, 1), (1, 1, 0)]
         if requested_method == "arima":
             candidate_orders = [(1, 1, 1)]
@@ -695,7 +735,9 @@ def forecast_metric(df, date_column, value_column=None, periods=4, frequency="W"
     return {
         "metric": value_column or "row_volume",
         "frequency": frequency,
+        "requested_method": requested_method,
         "method": forecast_method,
+        "fallback_reason": fallback_reason,
         "history": [{"date": index.isoformat(), "value": round(float(value), 4)} for index, value in series.items()],
         "forecast": [
             {"date": index.isoformat(), "value": round(float(max(value, 0.0)), 4)}
@@ -755,6 +797,11 @@ def train_and_explain_model(df, target_column, task="classification"):
         "feature_importance": importances,
         "shap_available": shap is not None,
         "shap_values": None,
+        "explanation_summary": {
+            "top_features": importances[:10],
+            "model_type": type(model).__name__,
+            "interpretation": "Higher feature importance indicates greater contribution to the fitted model predictions.",
+        },
     }
     if shap is not None:
         try:
@@ -768,6 +815,7 @@ def train_and_explain_model(df, target_column, task="classification"):
                 {"feature": name, "mean_abs_shap": round(float(value), 6)}
                 for name, value in sorted(zip(features.columns, values.mean(axis=0)), key=lambda item: item[1], reverse=True)
             ]
+            result["explanation_summary"]["top_shap_features"] = result["shap_values"][:10]
         except Exception:
             result["shap_available"] = False
     return result
