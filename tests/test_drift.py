@@ -127,6 +127,18 @@ def test_trends_and_health_forecasts_are_generated():
     assert all(len(item["forecast"]) == 2 for item in health.values())
 
 
+def test_trend_analysis_includes_direction_growth_and_moving_average():
+    dates = pd.date_range("2025-01-01", periods=8, freq="W")
+    df = pd.DataFrame({"event_date": dates, "amount": range(8)})
+
+    report = analyze_trends(df, "event_date", "amount")
+
+    assert report["trend_direction"] == "increasing"
+    assert report["growth_rate_percent"] > 0
+    assert report["moving_average"]
+    assert "volatility" in report
+
+
 def test_forecast_metric_ignores_nonfatal_arima_convergence_warnings():
     dates = pd.date_range("2025-01-01", periods=12, freq="W")
     df = pd.DataFrame({"event_date": dates, "amount": range(12)})
@@ -137,6 +149,17 @@ def test_forecast_metric_ignores_nonfatal_arima_convergence_warnings():
 
     assert report["forecast"]
     assert not any(issubclass(w.category, ConvergenceWarning) for w in caught)
+
+
+def test_forecast_metric_supports_advanced_method_names():
+    dates = pd.date_range("2025-01-01", periods=12, freq="W")
+    df = pd.DataFrame({"event_date": dates, "amount": range(12)})
+
+    report = forecast_metric(df, "event_date", "amount", periods=2, method="prophet")
+
+    assert report["forecast"]
+    assert report["requested_method"] == "prophet"
+    assert report["method"] in {"Prophet", "linear", "ARIMA"}
 
 
 def test_model_explanations_return_ranked_feature_importance():
@@ -155,6 +178,8 @@ def test_model_explanations_return_ranked_feature_importance():
     importances = [item["importance"] for item in explanation["feature_importance"]]
     assert importances == sorted(importances, reverse=True)
     assert "shap_available" in explanation
+    assert "explanation_summary" in explanation
+    assert explanation["explanation_summary"]["top_features"]
 
 
 def test_get_table_data_rejects_invalid_table_names():
@@ -177,3 +202,47 @@ def test_generate_ai_quality_summary_warns_when_llm_fails(monkeypatch):
 
     assert "summary" in summary
     assert "risk_level" in summary
+
+
+def test_data_quality_report_includes_schema_freshness_and_rule_validation():
+    df = pd.DataFrame(
+        {
+            "name": ["Alice", "Alice", "Bob", "Charlie"],
+            "age": [30, 30, -1, 45],
+            "email": ["alice@example.com", "alice@example.com", "bob@x", "bad-email"],
+            "created_at": [
+                pd.Timestamp("2025-01-01T00:00:00"),
+                pd.Timestamp("2025-01-01T00:00:00"),
+                pd.Timestamp("2025-01-01T00:00:00"),
+                pd.Timestamp("2025-01-01T00:00:00"),
+            ],
+        }
+    )
+
+    report = check_data_quality(
+        df,
+        expected_columns=["name", "age", "email", "created_at"],
+        timestamp_column="created_at",
+        max_age_hours=1,
+        rules={"age": ">= 0", "email": "contains @"},
+    )
+
+    assert report["schema_validation"]["status"] in {"ok", "warning"}
+    assert report["duplicate_detection"]["exact_duplicates"] >= 1
+    assert report["duplicate_detection"]["near_duplicate_pairs"] >= 0
+    assert report["data_freshness"]["is_fresh"] is False
+    assert report["business_rule_validation"]["violations"] >= 2
+
+
+def test_near_duplicate_detection_flags_similar_rows():
+    df = pd.DataFrame(
+        {
+            "name": ["Alice Johnson", "Alice Jhonson", "Bob Smith", "Carol Jones"],
+            "email": ["alice@x.com", "alice@x.com", "bob@x.com", "carol@x.com"],
+            "age": [30, 30, 25, 40],
+        }
+    )
+
+    report = check_data_quality(df, similarity_threshold=0.8)
+
+    assert report["duplicate_detection"]["near_duplicate_pairs"] >= 1

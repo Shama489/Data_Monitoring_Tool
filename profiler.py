@@ -40,15 +40,101 @@ def apply_modern_theme(fig, height=420):
     return fig
 
 # DATA QUALITY
-def check_data_quality(df):
-    return {
+def check_data_quality(
+    df,
+    expected_columns=None,
+    timestamp_column=None,
+    max_age_hours=None,
+    similarity_threshold=0.8,
+    rules=None,
+):
+    exact_duplicates = int(df.duplicated().sum())
+
+    duplicate_details = {"exact_duplicates": exact_duplicates, "near_duplicate_pairs": 0, "similarity_threshold": similarity_threshold}
+    if df.shape[0] >= 2 and similarity_threshold is not None:
+        near_duplicate_count = 0
+        for i in range(len(df)):
+            left = df.iloc[i].fillna("").astype(str)
+            for j in range(i + 1, len(df)):
+                right = df.iloc[j].fillna("").astype(str)
+                scores = []
+                for left_value, right_value in zip(left, right):
+                    left_text = str(left_value).strip().lower()
+                    right_text = str(right_value).strip().lower()
+                    if left_text == right_text:
+                        scores.append(1.0)
+                    elif left_text and right_text:
+                        from difflib import SequenceMatcher
+                        scores.append(SequenceMatcher(None, left_text, right_text).ratio())
+                    else:
+                        scores.append(0.0)
+                if scores and (sum(scores) / len(scores)) >= similarity_threshold:
+                    near_duplicate_count += 1
+        duplicate_details["near_duplicate_pairs"] = near_duplicate_count
+
+    schema_report = {"expected_columns": list(expected_columns) if expected_columns else None, "actual_columns": list(df.columns), "missing_columns": [], "extra_columns": [], "type_issues": [], "status": "ok"}
+    if expected_columns is not None:
+        expected = [str(col) for col in expected_columns]
+        actual = [str(col) for col in df.columns]
+        schema_report["missing_columns"] = [col for col in expected if col not in actual]
+        schema_report["extra_columns"] = [col for col in actual if col not in expected]
+        if schema_report["missing_columns"] or schema_report["extra_columns"]:
+            schema_report["status"] = "warning"
+
+    freshness_report = {"timestamp_column": timestamp_column, "max_age_hours": max_age_hours, "latest_timestamp": None, "age_hours": None, "is_fresh": True}
+    if timestamp_column is not None and timestamp_column in df.columns and max_age_hours is not None:
+        try:
+            timestamps = pd.to_datetime(df[timestamp_column], errors="coerce").dropna()
+            if not timestamps.empty:
+                latest_timestamp = timestamps.max()
+                freshness_report["latest_timestamp"] = latest_timestamp.isoformat()
+                freshness_report["age_hours"] = round(float((pd.Timestamp.now() - latest_timestamp).total_seconds() / 3600), 2)
+                freshness_report["is_fresh"] = freshness_report["age_hours"] <= float(max_age_hours)
+        except Exception:
+            freshness_report["is_fresh"] = False
+
+    business_rules = rules or {}
+    violations = 0
+    rule_details = {}
+    for column_name, rule in business_rules.items():
+        if column_name not in df.columns:
+            rule_details[column_name] = {"rule": rule, "violations": 0, "status": "missing_column"}
+            continue
+
+        series = df[column_name]
+        column_violations = 0
+        for value in series:
+            if pd.isna(value):
+                continue
+            text = str(value).strip()
+            if rule == ">= 0":
+                try:
+                    if pd.to_numeric(value, errors="coerce") < 0:
+                        column_violations += 1
+                except Exception:
+                    column_violations += 1
+            elif rule == "contains @":
+                if "@" not in text:
+                    column_violations += 1
+            else:
+                rule_details[column_name] = {"rule": rule, "violations": column_violations, "status": "unsupported_rule"}
+                continue
+        violations += column_violations
+        rule_details[column_name] = {"rule": rule, "violations": column_violations, "status": "ok" if column_violations == 0 else "violated"}
+
+    report = {
         "rows": df.shape[0],
         "columns": df.shape[1],
         "null_per_column": df.isnull().sum().to_dict(),
         "total_nulls": int(df.isnull().sum().sum()),
-        "duplicates": int(df.duplicated().sum()),
-        "all_null_columns": df.columns[df.isnull().all()].tolist()
+        "duplicates": exact_duplicates,
+        "all_null_columns": df.columns[df.isnull().all()].tolist(),
+        "schema_validation": schema_report,
+        "duplicate_detection": duplicate_details,
+        "data_freshness": freshness_report,
+        "business_rule_validation": {"rules": rule_details, "violations": violations},
     }
+    return report
 
 def calculate_data_quality_score(df):
     total_cells = df.size
@@ -552,17 +638,35 @@ def analyze_trends(df, date_column, value_column=None):
         weekday=valid[date_column].dt.day_name(),
     ).groupby(["month", "weekday"], sort=True)["metric"].agg(["count", "mean"]).reset_index()
 
+    values = weekly.to_numpy(dtype=float)
+    x_values = np.arange(len(values), dtype=float)
+    slope = float(np.polyfit(x_values, values, 1)[0]) if len(values) >= 2 else 0.0
+    baseline = abs(float(values[0])) if len(values) else 0.0
+    if baseline == 0.0 and len(values):
+        baseline = float(np.mean(np.abs(values)))
+    growth_rate = ((float(values[-1]) - float(values[0])) / baseline * 100.0) if baseline else 0.0
+    trend_direction = "stable" if abs(slope) < 1e-9 else ("increasing" if slope > 0 else "decreasing")
+    moving_average = weekly.rolling(window=min(4, len(weekly)), min_periods=1).mean()
+
     return {
         "date_column": date_column,
         "value_column": value_column,
         "weekly": [{"date": index.isoformat(), "value": round(float(value), 4)} for index, value in weekly.items()],
         "monthly": [{"date": index.isoformat(), "value": round(float(value), 4)} for index, value in monthly.items()],
         "seasonal_patterns": seasonal.to_dict(orient="records"),
+        "trend_direction": trend_direction,
+        "trend_slope": round(slope, 6),
+        "growth_rate_percent": round(float(growth_rate), 2),
+        "volatility": round(float(weekly.std(ddof=0)), 6),
+        "moving_average": [
+            {"date": index.isoformat(), "value": round(float(value), 4)}
+            for index, value in moving_average.items()
+        ],
     }
 
 
 def forecast_metric(df, date_column, value_column=None, periods=4, frequency="W", method="auto"):
-    """Forecast future row volume or a numeric metric using ARIMA or a linear fallback."""
+    """Forecast future row volume or a numeric metric with optional advanced models."""
     if periods < 1 or periods > 365:
         raise ValueError("periods must be between 1 and 365.")
     series = _prepare_time_series(df, date_column, value_column, frequency)
@@ -570,12 +674,34 @@ def forecast_metric(df, date_column, value_column=None, periods=4, frequency="W"
         raise ValueError("At least three time periods are required for forecasting.")
 
     requested_method = method.lower()
-    if requested_method not in {"auto", "arima", "linear"}:
-        raise ValueError("method must be one of: auto, arima, linear.")
+    if requested_method not in {"auto", "arima", "linear", "prophet", "lstm"}:
+        raise ValueError("method must be one of: auto, arima, linear, prophet, lstm.")
 
     forecast_method = "linear"
     forecast_values = None
-    if requested_method in {"auto", "arima"} and ARIMA is not None and len(series) >= 8:
+    fallback_reason = None
+
+    if requested_method in {"auto", "prophet"}:
+        try:
+            from prophet import Prophet
+
+            prophet_frame = pd.DataFrame({"ds": series.index, "y": series.to_numpy()})
+            fitted = Prophet(weekly_seasonality=frequency == "W", daily_seasonality=False)
+            fitted.fit(prophet_frame)
+            future = fitted.make_future_dataframe(periods=periods, freq=frequency)
+            prediction = fitted.predict(future)["yhat"].tail(periods).to_numpy(dtype=float)
+            if np.all(np.isfinite(prediction)):
+                forecast_values = prediction
+                forecast_method = "Prophet"
+        except ImportError as error:
+            fallback_reason = f"Prophet is unavailable; used the available fallback model. Details: {error}"
+        except Exception as error:
+            fallback_reason = f"Prophet failed; used the available fallback model. Details: {error}"
+
+    if requested_method == "lstm":
+        fallback_reason = "LSTM requires an optional deep-learning runtime; used the linear fallback model."
+
+    if forecast_values is None and requested_method in {"auto", "arima"} and ARIMA is not None and len(series) >= 8:
         candidate_orders = [(1, 1, 1), (0, 1, 1), (1, 0, 1), (1, 1, 0)]
         if requested_method == "arima":
             candidate_orders = [(1, 1, 1)]
@@ -609,7 +735,9 @@ def forecast_metric(df, date_column, value_column=None, periods=4, frequency="W"
     return {
         "metric": value_column or "row_volume",
         "frequency": frequency,
+        "requested_method": requested_method,
         "method": forecast_method,
+        "fallback_reason": fallback_reason,
         "history": [{"date": index.isoformat(), "value": round(float(value), 4)} for index, value in series.items()],
         "forecast": [
             {"date": index.isoformat(), "value": round(float(max(value, 0.0)), 4)}
@@ -669,6 +797,11 @@ def train_and_explain_model(df, target_column, task="classification"):
         "feature_importance": importances,
         "shap_available": shap is not None,
         "shap_values": None,
+        "explanation_summary": {
+            "top_features": importances[:10],
+            "model_type": type(model).__name__,
+            "interpretation": "Higher feature importance indicates greater contribution to the fitted model predictions.",
+        },
     }
     if shap is not None:
         try:
@@ -682,6 +815,7 @@ def train_and_explain_model(df, target_column, task="classification"):
                 {"feature": name, "mean_abs_shap": round(float(value), 6)}
                 for name, value in sorted(zip(features.columns, values.mean(axis=0)), key=lambda item: item[1], reverse=True)
             ]
+            result["explanation_summary"]["top_shap_features"] = result["shap_values"][:10]
         except Exception:
             result["shap_available"] = False
     return result
