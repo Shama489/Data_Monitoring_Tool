@@ -43,6 +43,7 @@ def apply_modern_theme(fig, height=420):
 def check_data_quality(
     df,
     expected_columns=None,
+    expected_dtypes=None,
     timestamp_column=None,
     max_age_hours=None,
     similarity_threshold=0.8,
@@ -72,14 +73,52 @@ def check_data_quality(
                     near_duplicate_count += 1
         duplicate_details["near_duplicate_pairs"] = near_duplicate_count
 
-    schema_report = {"expected_columns": list(expected_columns) if expected_columns else None, "actual_columns": list(df.columns), "missing_columns": [], "extra_columns": [], "type_issues": [], "status": "ok"}
-    if expected_columns is not None:
-        expected = [str(col) for col in expected_columns]
-        actual = [str(col) for col in df.columns]
-        schema_report["missing_columns"] = [col for col in expected if col not in actual]
-        schema_report["extra_columns"] = [col for col in actual if col not in expected]
-        if schema_report["missing_columns"] or schema_report["extra_columns"]:
-            schema_report["status"] = "warning"
+    expected_columns = list(expected_columns or [])
+    expected_dtypes = expected_dtypes or {}
+    actual_columns = [str(column) for column in df.columns]
+    missing_columns = [str(column) for column in expected_columns if str(column) not in actual_columns]
+    extra_columns = [column for column in actual_columns if column not in {str(item) for item in expected_columns}]
+    type_issues = []
+    for column_name, expected_type in expected_dtypes.items():
+        if column_name in df.columns:
+            actual_type = str(df[column_name].dtype)
+            expected_type = str(expected_type)
+            aliases = {"string": "object", "str": "object", "integer": "int64", "float": "float64"}
+            if aliases.get(expected_type.lower(), expected_type) != actual_type:
+                type_issues.append({"column": column_name, "expected": expected_type, "actual": actual_type})
+
+    renamed_columns = []
+    if missing_columns and extra_columns:
+        from difflib import SequenceMatcher
+
+        for expected_column in missing_columns:
+            candidates = []
+            expected_type = expected_dtypes.get(expected_column)
+            expected_type = aliases.get(str(expected_type).lower(), str(expected_type)) if expected_type else None
+            for actual_column in extra_columns:
+                actual_type = str(df[actual_column].dtype)
+                if expected_type and expected_type != actual_type:
+                    continue
+                confidence = round(SequenceMatcher(None, expected_column.lower(), actual_column.lower()).ratio(), 2)
+                if confidence >= 0.6:
+                    candidates.append((confidence, actual_column))
+            if candidates:
+                confidence, actual_column = max(candidates)
+                renamed_columns.append({"expected": expected_column, "actual": actual_column, "confidence": confidence})
+
+    schema_report = {
+        "expected_columns": expected_columns or None,
+        "expected_dtypes": expected_dtypes or None,
+        "actual_columns": actual_columns,
+        "actual_dtypes": {column: str(dtype) for column, dtype in df.dtypes.items()},
+        "missing_columns": missing_columns,
+        "extra_columns": extra_columns,
+        "renamed_columns": renamed_columns,
+        "type_issues": type_issues,
+        "status": "ok",
+    }
+    if missing_columns or extra_columns or renamed_columns or type_issues:
+        schema_report["status"] = "warning"
 
     freshness_report = {"timestamp_column": timestamp_column, "max_age_hours": max_age_hours, "latest_timestamp": None, "age_hours": None, "is_fresh": True}
     if timestamp_column is not None and timestamp_column in df.columns and max_age_hours is not None:

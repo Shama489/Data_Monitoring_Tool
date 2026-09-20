@@ -246,3 +246,31 @@ def test_near_duplicate_detection_flags_similar_rows():
     report = check_data_quality(df, similarity_threshold=0.8)
 
     assert report["duplicate_detection"]["near_duplicate_pairs"] >= 1
+
+
+def test_schema_validation_checks_types_and_suggests_renamed_columns():
+    df = pd.DataFrame({"customer_nme": ["Alice", "Bob"], "age": [30, 31]})
+
+    report = check_data_quality(
+        df,
+        expected_columns=["customer_name", "age"],
+        expected_dtypes={"customer_name": "object", "age": "int64"},
+    )
+
+    schema = report["schema_validation"]
+    assert schema["type_issues"] == []
+    assert schema["renamed_columns"] == [
+        {"expected": "customer_name", "actual": "customer_nme", "confidence": 0.96}
+    ]
+    assert schema["status"] == "warning"
+
+
+def test_schema_validation_reports_datatype_mismatch():
+    df = pd.DataFrame({"age": ["30", "31"]})
+
+    report = check_data_quality(df, expected_dtypes={"age": "int64"})
+
+    assert report["schema_validation"]["type_issues"] == [
+        {"column": "age", "expected": "int64", "actual": "object"}
+    ]
+    assert report["schema_validation"]["status"] == "warning"
