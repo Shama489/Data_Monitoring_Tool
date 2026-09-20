@@ -23,6 +23,31 @@ def _bad_request(message: str) -> None:
     raise HTTPException(status_code=400, detail=message)
 
 
+def _quality_options(payload: dict[str, Any]) -> dict[str, Any]:
+    rules = payload.get("rules")
+    if rules is not None and not isinstance(rules, (dict, list)):
+        _bad_request("rules must be an object or list of rule objects")
+    if isinstance(rules, list) and not all(isinstance(rule, dict) for rule in rules):
+        _bad_request("rules list entries must be objects")
+
+    expected_columns = payload.get("expected_columns")
+    if expected_columns is not None and not isinstance(expected_columns, list):
+        _bad_request("expected_columns must be a list")
+
+    expected_dtypes = payload.get("expected_dtypes")
+    if expected_dtypes is not None and not isinstance(expected_dtypes, dict):
+        _bad_request("expected_dtypes must be an object")
+
+    return {
+        "expected_columns": expected_columns,
+        "expected_dtypes": expected_dtypes,
+        "timestamp_column": payload.get("timestamp_column"),
+        "max_age_hours": payload.get("max_age_hours"),
+        "similarity_threshold": payload.get("similarity_threshold", 0.8),
+        "rules": rules,
+    }
+
+
 @app.get("/")
 def home():
     return {"message": "Data Monitoring Tool Running"}
@@ -81,15 +106,7 @@ def analyze_data_quality_endpoint(payload: dict[str, Any]):
     if df.empty:
         _bad_request("Dataset must not be empty.")
 
-    report = check_data_quality(
-        df,
-        expected_columns=payload.get("expected_columns"),
-        expected_dtypes=payload.get("expected_dtypes"),
-        timestamp_column=payload.get("timestamp_column"),
-        max_age_hours=payload.get("max_age_hours"),
-        similarity_threshold=payload.get("similarity_threshold", 0.8),
-        rules=payload.get("rules"),
-    )
+    report = check_data_quality(df, **_quality_options(payload))
     quality_score = calculate_data_quality_score(df)
     ai_summary = generate_ai_quality_summary(df, report, quality_score)
     return {
@@ -114,15 +131,7 @@ def analyze_data_quality_csv_endpoint(payload: dict[str, Any]):
     if df.empty:
         _bad_request("CSV dataset must not be empty.")
 
-    report = check_data_quality(
-        df,
-        expected_columns=payload.get("expected_columns"),
-        expected_dtypes=payload.get("expected_dtypes"),
-        timestamp_column=payload.get("timestamp_column"),
-        max_age_hours=payload.get("max_age_hours"),
-        similarity_threshold=payload.get("similarity_threshold", 0.8),
-        rules=payload.get("rules"),
-    )
+    report = check_data_quality(df, **_quality_options(payload))
     quality_score = calculate_data_quality_score(df)
     ai_summary = generate_ai_quality_summary(df, report, quality_score)
     return {

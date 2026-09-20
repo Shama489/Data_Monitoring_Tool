@@ -274,3 +274,28 @@ def test_schema_validation_reports_datatype_mismatch():
         {"column": "age", "expected": "int64", "actual": "object"}
     ]
     assert report["schema_validation"]["status"] == "warning"
+
+
+def test_business_rule_engine_supports_multiple_operators_and_row_details():
+    df = pd.DataFrame(
+        {
+            "age": [20, -1, 42],
+            "email": ["valid@example.com", "invalid", "also@example.com"],
+            "status": ["active", "deleted", "pending"],
+        }
+    )
+
+    report = check_data_quality(
+        df,
+        rules=[
+            {"id": "age_range", "column": "age", "operator": "between", "value": [0, 120]},
+            {"id": "email_format", "column": "email", "operator": "regex", "value": r"^[^@]+@[^@]+\.[^@]+$"},
+            {"id": "allowed_status", "column": "status", "operator": "in", "value": ["active", "pending"], "severity": "warning"},
+        ],
+    )
+
+    rules_by_id = {item["id"]: item for item in report["business_rule_validation"]["rules"]}
+    assert report["business_rule_validation"]["violations"] == 3
+    assert rules_by_id["age_range"]["failed_rows"] == [1]
+    assert rules_by_id["email_format"]["failed_rows"] == [1]
+    assert rules_by_id["allowed_status"]["severity"] == "warning"
