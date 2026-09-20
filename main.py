@@ -81,7 +81,15 @@ def analyze_data_quality_endpoint(payload: dict[str, Any]):
     if df.empty:
         _bad_request("Dataset must not be empty.")
 
-    report = check_data_quality(df)
+    report = check_data_quality(
+        df,
+        expected_columns=payload.get("expected_columns"),
+        expected_dtypes=payload.get("expected_dtypes"),
+        timestamp_column=payload.get("timestamp_column"),
+        max_age_hours=payload.get("max_age_hours"),
+        similarity_threshold=payload.get("similarity_threshold", 0.8),
+        rules=payload.get("rules"),
+    )
     quality_score = calculate_data_quality_score(df)
     ai_summary = generate_ai_quality_summary(df, report, quality_score)
     return {
@@ -106,7 +114,15 @@ def analyze_data_quality_csv_endpoint(payload: dict[str, Any]):
     if df.empty:
         _bad_request("CSV dataset must not be empty.")
 
-    report = check_data_quality(df)
+    report = check_data_quality(
+        df,
+        expected_columns=payload.get("expected_columns"),
+        expected_dtypes=payload.get("expected_dtypes"),
+        timestamp_column=payload.get("timestamp_column"),
+        max_age_hours=payload.get("max_age_hours"),
+        similarity_threshold=payload.get("similarity_threshold", 0.8),
+        rules=payload.get("rules"),
+    )
     quality_score = calculate_data_quality_score(df)
     ai_summary = generate_ai_quality_summary(df, report, quality_score)
     return {
