@@ -1,6 +1,7 @@
 import math
 import json
 import os
+import re
 import warnings
 
 import pandas as pd
@@ -132,34 +133,87 @@ def check_data_quality(
         except Exception:
             freshness_report["is_fresh"] = False
 
-    business_rules = rules or {}
+    normalized_rules = []
+    if isinstance(rules, dict):
+        for column_name, rule in rules.items():
+            if isinstance(rule, str):
+                normalized_rules.append({"id": f"{column_name}:{rule}", "column": column_name, "expression": rule})
+            elif isinstance(rule, dict):
+                normalized_rules.append({"id": rule.get("id", column_name), "column": column_name, **rule})
+    elif isinstance(rules, list):
+        normalized_rules = [rule for rule in rules if isinstance(rule, dict)]
+    elif rules is not None:
+        normalized_rules = []
+
+    def evaluate_rule(value, rule):
+        if pd.isna(value):
+            return bool(rule.get("allow_null", False)) if rule.get("operator") != "is_null" else True
+
+        operator = rule.get("operator")
+        expected = rule.get("value")
+        if rule.get("expression") == ">= 0":
+            operator, expected = ">=", 0
+        elif rule.get("expression") == "contains @":
+            operator, expected = "contains", "@"
+
+        try:
+            if operator in {">", ">=", "<", "<=", "==", "!="}:
+                actual = pd.to_numeric(value, errors="coerce") if isinstance(expected, (int, float)) else value
+                return {">": actual > expected, ">=": actual >= expected, "<": actual < expected, "<=": actual <= expected, "==": actual == expected, "!=": actual != expected}[operator]
+            if operator == "between":
+                return expected[0] <= value <= expected[1]
+            if operator == "in":
+                return value in expected
+            if operator == "not_in":
+                return value not in expected
+            text_value = str(value)
+            if operator == "contains":
+                return str(expected) in text_value
+            if operator == "starts_with":
+                return text_value.startswith(str(expected))
+            if operator == "ends_with":
+                return text_value.endswith(str(expected))
+            if operator == "regex":
+                return re.search(str(expected), text_value) is not None
+            if operator == "is_not_null":
+                return True
+            if operator == "is_null":
+                return False
+        except (TypeError, ValueError, IndexError, re.error):
+            return False
+        return None
+
     violations = 0
-    rule_details = {}
-    for column_name, rule in business_rules.items():
+    rule_details = []
+    for position, rule in enumerate(normalized_rules):
+        rule_id = str(rule.get("id", f"rule_{position + 1}"))
+        column_name = rule.get("column")
+        display_rule = {key: value for key, value in rule.items() if key != "id"}
         if column_name not in df.columns:
-            rule_details[column_name] = {"rule": rule, "violations": 0, "status": "missing_column"}
+            rule_details.append({"id": rule_id, "rule": display_rule, "violations": len(df), "failed_rows": list(df.index), "status": "missing_column"})
+            violations += len(df)
             continue
 
-        series = df[column_name]
-        column_violations = 0
-        for value in series:
-            if pd.isna(value):
-                continue
-            text = str(value).strip()
-            if rule == ">= 0":
-                try:
-                    if pd.to_numeric(value, errors="coerce") < 0:
-                        column_violations += 1
-                except Exception:
-                    column_violations += 1
-            elif rule == "contains @":
-                if "@" not in text:
-                    column_violations += 1
-            else:
-                rule_details[column_name] = {"rule": rule, "violations": column_violations, "status": "unsupported_rule"}
-                continue
-        violations += column_violations
-        rule_details[column_name] = {"rule": rule, "violations": column_violations, "status": "ok" if column_violations == 0 else "violated"}
+        failed_rows = []
+        unsupported = False
+        for row_index, value in df[column_name].items():
+            result = evaluate_rule(value, rule)
+            if result is None:
+                unsupported = True
+                break
+            if not result:
+                failed_rows.append(row_index)
+        status = "unsupported_rule" if unsupported else ("ok" if not failed_rows else "violated")
+        violations += len(failed_rows)
+        rule_details.append({
+            "id": rule_id,
+            "rule": display_rule,
+            "severity": rule.get("severity", "error"),
+            "violations": len(failed_rows),
+            "failed_rows": failed_rows,
+            "pass_rate": round((len(df) - len(failed_rows)) / max(len(df), 1) * 100, 2),
+            "status": status,
+        })
 
     report = {
         "rows": df.shape[0],
@@ -171,7 +225,7 @@ def check_data_quality(
         "schema_validation": schema_report,
         "duplicate_detection": duplicate_details,
         "data_freshness": freshness_report,
-        "business_rule_validation": {"rules": rule_details, "violations": violations},
+        "business_rule_validation": {"rules": rule_details, "violations": violations, "status": "ok" if violations == 0 else "warning"},
     }
     return report
 
