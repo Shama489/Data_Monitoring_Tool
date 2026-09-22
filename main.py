@@ -210,10 +210,22 @@ def forecast_endpoint(payload: dict[str, Any]):
     try:
         df = pd.DataFrame(dataset)
         periods = int(payload.get("periods", 4))
+        if periods < 1 or periods > 365:
+            _bad_request("periods must be between 1 and 365.")
+
+        method = str(payload.get("method", "auto")).lower()
+        allowed_methods = {"auto", "arima", "linear", "prophet", "lstm"}
+        if method not in allowed_methods:
+            _bad_request("method must be one of: auto, arima, linear, prophet, lstm.")
+
+        frequency = str(payload.get("frequency", "W"))
+        if not frequency:
+            _bad_request("frequency is required.")
+
         if payload.get("metric") == "data_health":
-            report = forecast_data_health(df, date_column, periods, payload.get("frequency", "W"))
+            report = forecast_data_health(df, date_column, periods, frequency)
         else:
-            report = forecast_metric(df, date_column, payload.get("value_column"), periods, payload.get("frequency", "W"), payload.get("method", "auto"))
+            report = forecast_metric(df, date_column, payload.get("value_column"), periods, frequency, method)
         return {"report": report}
     except (TypeError, ValueError) as error:
         _bad_request(str(error))

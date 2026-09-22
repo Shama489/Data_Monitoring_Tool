@@ -27,6 +27,8 @@ try:
 except ImportError:  # pragma: no cover
     OpenAI = None
 
+SUPPORTED_FORECAST_METHODS = {"auto", "arima", "linear", "prophet", "lstm"}
+
 # 🎨 MODERN GRAPH THEME 
 def apply_modern_theme(fig, height=420):
     fig.update_layout(
@@ -766,8 +768,8 @@ def forecast_metric(df, date_column, value_column=None, periods=4, frequency="W"
     if len(series) < 3:
         raise ValueError("At least three time periods are required for forecasting.")
 
-    requested_method = method.lower()
-    if requested_method not in {"auto", "arima", "linear", "prophet", "lstm"}:
+    requested_method = str(method).lower()
+    if requested_method not in SUPPORTED_FORECAST_METHODS:
         raise ValueError("method must be one of: auto, arima, linear, prophet, lstm.")
 
     forecast_method = "linear"
