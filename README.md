@@ -13,6 +13,17 @@ uvicorn main:app --reload
 
 The API is available at `http://127.0.0.1:8000`, with interactive documentation at `/docs`.
 
+## Run the Explainable AI Dashboard
+
+Start the interactive XAI dashboard in a second terminal:
+
+```powershell
+.\venv\Scripts\Activate.ps1
+streamlit run xai_dashboard.py
+```
+
+The dashboard supports CSV upload, classification or regression selection, target-column selection, interactive global feature-importance charts, SHAP impact charts when SHAP is available, explanation details, and JSON report download.
+
 ---
 
 ## Key Features
@@ -30,6 +41,7 @@ The API is available at `http://127.0.0.1:8000`, with interactive documentation 
 - **Cardinality Analysis**: Analyze unique values in each column for better feature understanding.  
 - **Memory Profiling**: Monitor memory usage of each column and optimize dataset performance.  
 - **Model Evaluation**: Train ML models (Random Forest) and evaluate metrics like precision, recall, F1-score, and accuracy with interactive tables and charts.
+- **Explainable AI Dashboard**: Explore Random Forest feature importance and optional SHAP explanations through an interactive Streamlit workflow.
 
 ---
 
