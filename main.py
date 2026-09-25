@@ -48,6 +48,13 @@ def _quality_options(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _use_llm_quality_summary(payload: dict[str, Any]) -> bool:
+    use_llm = payload.get("use_llm", False)
+    if not isinstance(use_llm, bool):
+        _bad_request("use_llm must be a boolean")
+    return use_llm
+
+
 @app.get("/")
 def home():
     return {"message": "Data Monitoring Tool Running"}
@@ -108,7 +115,9 @@ def analyze_data_quality_endpoint(payload: dict[str, Any]):
 
     report = check_data_quality(df, **_quality_options(payload))
     quality_score = calculate_data_quality_score(df)
-    ai_summary = generate_ai_quality_summary(df, report, quality_score)
+    ai_summary = generate_ai_quality_summary(
+        df, report, quality_score, use_llm=_use_llm_quality_summary(payload)
+    )
     return {
         "report": report,
         "quality_score": quality_score,
@@ -133,7 +142,9 @@ def analyze_data_quality_csv_endpoint(payload: dict[str, Any]):
 
     report = check_data_quality(df, **_quality_options(payload))
     quality_score = calculate_data_quality_score(df)
-    ai_summary = generate_ai_quality_summary(df, report, quality_score)
+    ai_summary = generate_ai_quality_summary(
+        df, report, quality_score, use_llm=_use_llm_quality_summary(payload)
+    )
     return {
         "report": report,
         "quality_score": quality_score,

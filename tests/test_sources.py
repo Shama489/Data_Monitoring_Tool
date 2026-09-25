@@ -58,3 +58,41 @@ def test_sources_endpoint_rejects_empty_source_list():
 
     assert response.status_code == 400
     assert response.json()["detail"] == "sources must be a non-empty list"
+
+
+def test_quality_endpoint_forwards_optional_llm_flag(monkeypatch):
+    calls = []
+
+    def fake_summary(df, report, quality_score, use_llm=False):
+        calls.append(use_llm)
+        return {
+            "summary": "built-in",
+            "risk_level": "low",
+            "key_findings": [],
+            "recommended_actions": [],
+        }
+
+    monkeypatch.setattr("main.generate_ai_quality_summary", fake_summary)
+
+    default_response = client.post(
+        "/api/data-quality/analyze",
+        json={"data": [{"value": 1}]},
+    )
+    llm_response = client.post(
+        "/api/data-quality/analyze",
+        json={"data": [{"value": 1}], "use_llm": True},
+    )
+
+    assert default_response.status_code == 200
+    assert llm_response.status_code == 200
+    assert calls == [False, True]
+
+
+def test_quality_endpoint_rejects_non_boolean_llm_flag():
+    response = client.post(
+        "/api/data-quality/analyze",
+        json={"data": [{"value": 1}], "use_llm": "true"},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "use_llm must be a boolean"
