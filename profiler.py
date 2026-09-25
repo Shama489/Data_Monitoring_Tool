@@ -563,7 +563,6 @@ def _compute_psi(baseline_values, current_values):
         return float(sum(
             (curr - base) * math.log((curr + epsilon) / (base + epsilon))
             for base, curr in zip(baseline_pct, current_pct)
-            if base > 0 and curr > 0
         ))
 
     baseline_counts = baseline_series.astype(str).value_counts(normalize=True)
