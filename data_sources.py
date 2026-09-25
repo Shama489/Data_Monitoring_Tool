@@ -47,7 +47,12 @@ def load_local_file(path: str, file_type: str = "", sheet_name: str | int | None
 def load_sql_query(database_url: str, query: str, params: dict[str, Any] | None = None) -> pd.DataFrame:
     if not database_url.strip():
         raise DataSourceError("database_url is required")
-    if not query.strip() or not query.lstrip().lower().startswith("select"):
+    normalized_query = query.strip().rstrip(";").strip()
+    if (
+        not normalized_query
+        or not normalized_query.lower().startswith("select ")
+        or ";" in normalized_query
+    ):
         raise DataSourceError("Only SELECT queries are allowed")
     engine = create_engine(database_url, pool_pre_ping=True)
     try:

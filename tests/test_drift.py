@@ -63,6 +63,15 @@ def test_drift_detection_flags_new_categories():
     assert report["drift_detected"] is True
 
 
+def test_numeric_psi_includes_baseline_empty_bins():
+    baseline = pd.DataFrame({"value": [0, 0, 0, 1, 1, 1]})
+    current = pd.DataFrame({"value": [0.5, 0.5, 0.5, 0.5]})
+
+    report = analyze_dataset_drift(baseline, current)
+
+    assert report["feature_metrics"]["value"]["psi"] > 0
+
+
 def test_data_quality_and_ai_summary_are_generated():
     df = pd.DataFrame(
         {

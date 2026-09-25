@@ -27,6 +27,11 @@ def test_sql_loader_rejects_non_select_queries():
         load_sql_query("sqlite://", "DELETE FROM events")
 
 
+def test_sql_loader_rejects_multi_statement_select_queries():
+    with pytest.raises(DataSourceError, match="Only SELECT queries"):
+        load_sql_query("sqlite://", "SELECT 1; DELETE FROM events")
+
+
 def test_sources_endpoint_reports_success_and_partial_failure(tmp_path):
     path = tmp_path / "events.csv"
     pd.DataFrame({"id": [1], "status": ["ok"]}).to_csv(path, index=False)
