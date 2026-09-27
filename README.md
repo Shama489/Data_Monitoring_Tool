@@ -224,8 +224,10 @@ The tool now includes a baseline-vs-current drift workflow for the high-priority
 
 API usage:
 
-- `POST /api/data-quality/analyze` with a dataset payload to get null counts, duplicates, score, and AI guidance.  
-- `POST /api/data-quality/analyze-csv` with `csv` content for quality analysis.  
+- `POST /api/data-quality/analyze` with a dataset payload to get null counts, duplicates, score, and AI guidance.
+- `POST /api/data-quality/analyze-csv` with `csv` content for quality analysis.
+
+Quality endpoints accept optional `use_llm: true` to request an OpenAI quality summary. Set `OPENAI_API_KEY` and optionally `OPENAI_MODEL` to enable it; without configuration, or if the request fails, the built-in summary is returned.
 - `POST /api/drift/analyze` with `baseline` and `current` JSON arrays or dictionaries.  
 - `POST /api/drift/analyze-csv` with `baseline_csv` and `current_csv` content.
 
