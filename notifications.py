@@ -15,10 +15,89 @@ from email.message import EmailMessage
 from typing import Any
 
 SUPPORTED_CHANNELS = {"email", "sms", "whatsapp", "slack", "teams"}
+SUPPORTED_OPERATORS = {">", ">=", "<", "<=", "==", "!=", "contains", "in", "not_in"}
 
 
 class NotificationError(RuntimeError):
     """Raised when a notification cannot be delivered."""
+
+
+def _compare_values(actual: Any, operator: str, expected: Any) -> bool:
+    if actual is None:
+        return False
+
+    operator = str(operator).lower().strip()
+    if operator in {">", ">=", "<", "<=", "==", "!="}:
+        try:
+            comparable_actual = float(actual)
+            comparable_expected = float(expected)
+        except (TypeError, ValueError):
+            if operator == "==":
+                return str(actual) == str(expected)
+            if operator == "!=":
+                return str(actual) != str(expected)
+            return False
+
+        return {
+            ">": comparable_actual > comparable_expected,
+            ">=": comparable_actual >= comparable_expected,
+            "<": comparable_actual < comparable_expected,
+            "<=": comparable_actual <= comparable_expected,
+            "==": comparable_actual == comparable_expected,
+            "!=": comparable_actual != comparable_expected,
+        }[operator]
+
+    if operator == "contains":
+        return str(expected).lower() in str(actual).lower()
+    if operator == "in":
+        if isinstance(expected, (list, tuple, set)):
+            return actual in expected
+        return str(actual) in str(expected)
+    if operator == "not_in":
+        if isinstance(expected, (list, tuple, set)):
+            return actual not in expected
+        return str(actual) not in str(expected)
+    return False
+
+
+def evaluate_alert_rules(metrics: dict[str, Any], rules: list[dict[str, Any]] | None) -> dict[str, Any]:
+    """Return matched rules for monitoring metrics with threshold comparisons."""
+    if not isinstance(rules, list):
+        return {"triggered": False, "matches": [], "total_checked": 0}
+
+    matches: list[dict[str, Any]] = []
+    for rule in rules:
+        if not isinstance(rule, dict):
+            continue
+        metric = str(rule.get("metric", "")).strip()
+        if not metric:
+            continue
+        operator = str(rule.get("operator", "")).strip()
+        if not operator:
+            operator = "=="
+        if operator not in SUPPORTED_OPERATORS and operator not in {">", ">=", "<", "<=", "==", "!="}:
+            continue
+
+        actual_value = metrics.get(metric)
+        if actual_value is None and metric not in metrics:
+            continue
+
+        matched = _compare_values(actual_value, operator, rule.get("value"))
+        if matched:
+            matches.append(
+                {
+                    "metric": metric,
+                    "actual": actual_value,
+                    "operator": operator,
+                    "expected": rule.get("value"),
+                    "channel": rule.get("channel"),
+                    "recipient": rule.get("recipient", ""),
+                    "subject": rule.get("subject", "Data monitoring alert"),
+                    "message": rule.get("message", f"{metric} matched alert rule"),
+                }
+            )
+
+    return {"triggered": bool(matches), "matches": matches, "total_checked": len(matches)}
 
 
 def _required_env(*names: str) -> dict[str, str]:

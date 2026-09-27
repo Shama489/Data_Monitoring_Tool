@@ -1,4 +1,19 @@
-from notifications import send_notifications
+from notifications import evaluate_alert_rules, send_notifications
+
+
+def test_alert_rules_trigger_when_thresholds_are_met():
+    result = evaluate_alert_rules(
+        {"quality_score": 62, "drift_score": 85, "severity": "high"},
+        [
+            {"metric": "quality_score", "operator": "<", "value": 70, "channel": "email", "recipient": "alerts@example.com"},
+            {"metric": "drift_score", "operator": ">=", "value": 80, "channel": "slack"},
+            {"metric": "severity", "operator": "==", "value": "high", "channel": "sms", "recipient": "+15550000000"},
+        ],
+    )
+
+    assert result["triggered"] is True
+    assert len(result["matches"]) == 3
+    assert result["matches"][0]["metric"] == "quality_score"
 
 
 def test_notifications_support_dry_run_for_all_channels():

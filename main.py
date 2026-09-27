@@ -13,7 +13,7 @@ from profiler import (
     generate_ai_quality_summary,
     train_and_explain_model,
 )
-from notifications import NotificationError, send_notifications
+from notifications import NotificationError, evaluate_alert_rules, send_notifications
 from data_sources import DataSourceError, load_source, summarize_source
 
 app = FastAPI(title="Data Monitoring Tool")
@@ -53,6 +53,78 @@ def _use_llm_quality_summary(payload: dict[str, Any]) -> bool:
     if not isinstance(use_llm, bool):
         _bad_request("use_llm must be a boolean")
     return use_llm
+
+
+def _notification_channels(payload: dict[str, Any]) -> list[Any]:
+    for key in ("notifications", "alert_channels", "channels"):
+        value = payload.get(key)
+        if value is None:
+            continue
+        if isinstance(value, list):
+            return value
+        if isinstance(value, (str, dict)):
+            return [value]
+    return []
+
+
+def _should_send_notifications(payload: dict[str, Any]) -> bool:
+    return bool(payload.get("notify", payload.get("send_notifications", False))) or bool(_notification_channels(payload))
+
+
+def _trigger_monitoring_notifications(
+    payload: dict[str, Any],
+    event_type: str,
+    message: str,
+    subject: str,
+    severity: str = "warning",
+) -> dict[str, Any]:
+    channels = _notification_channels(payload)
+    if not channels:
+        return {"status": "skipped", "reason": "no notification channels configured"}
+
+    alert = {
+        "message": message,
+        "subject": subject,
+        "severity": severity,
+        "event_type": event_type,
+        "channels": channels,
+    }
+    try:
+        return send_notifications(alert)
+    except NotificationError as error:
+        return {"status": "failed", "error": str(error)}
+
+
+def _send_rule_based_notifications(payload: dict[str, Any], event_type: str, metrics: dict[str, Any], subject: str) -> dict[str, Any]:
+    alert_rules = payload.get("alert_rules")
+    if not isinstance(alert_rules, list) or not alert_rules:
+        return {"status": "skipped", "reason": "no alert rules configured"}
+
+    rule_result = evaluate_alert_rules(metrics, alert_rules)
+    if not rule_result["triggered"]:
+        return {"status": "skipped", "reason": "no alert rules matched"}
+
+    channels = []
+    for match in rule_result["matches"]:
+        channel = match.get("channel")
+        recipient = match.get("recipient", "")
+        if channel:
+            channels.append({"channel": channel, "recipient": recipient})
+
+    if not channels:
+        return {"status": "skipped", "reason": "matched rules had no delivery channels"}
+
+    summary = "; ".join(f"{m['metric']}={m['actual']}" for m in rule_result["matches"])
+    try:
+        return send_notifications({
+            "message": f"{event_type.replace('_', ' ').title()} alert: {summary}",
+            "subject": subject,
+            "severity": max((metrics.get("risk_level", "warning"), metrics.get("severity", "warning")), key=lambda value: str(value)),
+            "event_type": event_type,
+            "channels": channels,
+        })
+    except NotificationError as error:
+        return {"status": "failed", "error": str(error)}
 
 
 @app.get("/")
@@ -118,10 +190,37 @@ def analyze_data_quality_endpoint(payload: dict[str, Any]):
     ai_summary = generate_ai_quality_summary(
         df, report, quality_score, use_llm=_use_llm_quality_summary(payload)
     )
+    notification_result = None
+    if _should_send_notifications(payload):
+        risk_level = ai_summary.get("risk_level", "unknown")
+        summary_text = ai_summary.get("summary", "Data quality review completed.")
+        notification_result = _trigger_monitoring_notifications(
+            payload,
+            "data_quality",
+            f"Data quality alert: score={quality_score.get('overall_score', 0)}; risk={risk_level}; details={summary_text}",
+            "Data Monitoring Alert",
+            severity=risk_level,
+        )
+    if payload.get("alert_rules"):
+        rule_result = _send_rule_based_notifications(
+            payload,
+            "data_quality",
+            {
+                "quality_score": quality_score.get("overall_score", 0),
+                "risk_level": ai_summary.get("risk_level", "unknown"),
+                "severity": ai_summary.get("risk_level", "unknown"),
+                "total_nulls": report.get("total_nulls", 0),
+                "duplicates": report.get("duplicates", 0),
+            },
+            "Data Monitoring Alert",
+        )
+        if rule_result.get("status") != "skipped":
+            notification_result = rule_result
     return {
         "report": report,
         "quality_score": quality_score,
         "ai_summary": ai_summary,
+        "notifications": notification_result or {"status": "skipped", "reason": "notifications not requested"},
         "message": "Data quality analysis completed successfully.",
     }
 
@@ -145,10 +244,22 @@ def analyze_data_quality_csv_endpoint(payload: dict[str, Any]):
     ai_summary = generate_ai_quality_summary(
         df, report, quality_score, use_llm=_use_llm_quality_summary(payload)
     )
+    notification_result = None
+    if _should_send_notifications(payload):
+        risk_level = ai_summary.get("risk_level", "unknown")
+        summary_text = ai_summary.get("summary", "Data quality review completed.")
+        notification_result = _trigger_monitoring_notifications(
+            payload,
+            "data_quality_csv",
+            f"CSV data quality alert: score={quality_score.get('overall_score', 0)}; risk={risk_level}; details={summary_text}",
+            "CSV Data Monitoring Alert",
+            severity=risk_level,
+        )
     return {
         "report": report,
         "quality_score": quality_score,
         "ai_summary": ai_summary,
+        "notifications": notification_result or {"status": "skipped", "reason": "notifications not requested"},
     }
 
 
@@ -170,8 +281,37 @@ def analyze_drift_endpoint(payload: dict[str, Any]):
         _bad_request("Baseline and current datasets must not be empty.")
 
     report = analyze_dataset_drift(baseline_df, current_df)
+    notification_result = None
+    if _should_send_notifications(payload):
+        drift_score = report.get("overall_drift_score", 0)
+        message = (
+            f"Drift alert: overall drift score={drift_score}; "
+            f"severity={report.get('overall_severity', 'low')}; "
+            f"detected={report.get('drift_detected', False)}"
+        )
+        notification_result = _trigger_monitoring_notifications(
+            payload,
+            "data_drift",
+            message,
+            "Drift Detection Alert",
+            severity=report.get("overall_severity", "low"),
+        )
+    if payload.get("alert_rules"):
+        rule_result = _send_rule_based_notifications(
+            payload,
+            "data_drift",
+            {
+                "drift_score": report.get("overall_drift_score", 0),
+                "severity": report.get("overall_severity", "low"),
+                "drift_detected": report.get("drift_detected", False),
+            },
+            "Drift Detection Alert",
+        )
+        if rule_result.get("status") != "skipped":
+            notification_result = rule_result
     return {
         "report": report,
+        "notifications": notification_result or {"status": "skipped", "reason": "notifications not requested"},
         "message": "Drift analysis completed successfully.",
     }
 
@@ -197,7 +337,26 @@ def analyze_drift_csv_endpoint(payload: dict[str, Any]):
         report = analyze_dataset_drift(baseline_df, current_df)
     except (TypeError, ValueError) as error:
         _bad_request(str(error))
-    return {"report": report}
+
+    notification_result = None
+    if _should_send_notifications(payload):
+        drift_score = report.get("overall_drift_score", 0)
+        message = (
+            f"CSV drift alert: overall drift score={drift_score}; "
+            f"severity={report.get('overall_severity', 'low')}; "
+            f"detected={report.get('drift_detected', False)}"
+        )
+        notification_result = _trigger_monitoring_notifications(
+            payload,
+            "data_drift_csv",
+            message,
+            "CSV Drift Detection Alert",
+            severity=report.get("overall_severity", "low"),
+        )
+    return {
+        "report": report,
+        "notifications": notification_result or {"status": "skipped", "reason": "notifications not requested"},
+    }
 
 
 @app.post("/api/analytics/trends")

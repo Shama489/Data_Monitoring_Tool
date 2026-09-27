@@ -96,3 +96,52 @@ def test_quality_endpoint_rejects_non_boolean_llm_flag():
 
     assert response.status_code == 400
     assert response.json()["detail"] == "use_llm must be a boolean"
+
+
+def test_quality_endpoint_triggers_notifications_when_requested(monkeypatch):
+    seen = {}
+
+    def fake_send_notifications(alert):
+        seen["alert"] = alert
+        return {"status": "sent", "sent": [{"channel": "email", "status": "dry_run"}]}
+
+    monkeypatch.setattr("main.send_notifications", fake_send_notifications)
+
+    response = client.post(
+        "/api/data-quality/analyze",
+        json={
+            "data": [{"value": 1}, {"value": 50}],
+            "notify": True,
+            "channels": [{"channel": "email", "recipient": "alerts@example.com"}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["notifications"]["status"] == "sent"
+    assert seen["alert"]["event_type"] == "data_quality"
+    assert "Data quality alert" in seen["alert"]["message"]
+
+
+def test_drift_endpoint_triggers_notifications_when_requested(monkeypatch):
+    seen = {}
+
+    def fake_send_notifications(alert):
+        seen["alert"] = alert
+        return {"status": "sent", "sent": [{"channel": "slack", "status": "dry_run"}]}
+
+    monkeypatch.setattr("main.send_notifications", fake_send_notifications)
+
+    response = client.post(
+        "/api/drift/analyze",
+        json={
+            "baseline": [{"value": 1}, {"value": 2}, {"value": 3}],
+            "current": [{"value": 1}, {"value": 10}, {"value": 11}],
+            "notify": True,
+            "channels": [{"channel": "slack", "recipient": "https://example.com/webhook"}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["notifications"]["status"] == "sent"
+    assert seen["alert"]["event_type"] == "data_drift"
+    assert "Drift alert" in seen["alert"]["message"]
