@@ -1,0 +1,68 @@
+Fully missing Features
+
+- Near-duplicate detection through advanced similarity matching
+- Data freshness alerts and scheduled freshness monitoring
+- Natural-language querying
+- AutoML model selection
+- Root-cause analysis
+- Encryption for uploaded files and user data
+- Audit logs
+- Role-based access control
+- Multi-user authentication
+- Custom dashboard builder
+- Dark mode UI
+- Multi-language support
+- Mobile-responsive dashboard
+- Scheduled reports
+- PDF, Excel, and PowerPoint report downloads
+- Fraud detection workflow
+- Data classification workflow
+- Clustering analysis
+- Recommendation engine
+- Predictive maintenance
+- Chatbot assistant
+- Voice commands
+- Data lineage visualization
+- Pipeline monitoring
+- Dataset comparison tool
+- Real-time monitoring
+- Full executive dashboard UI
+
+Partially implemented
+
+- Schema validation
+  - Basic schema reporting exists.
+  - Full datatype validation and renamed-column detection are not complete.
+  - API configuration is not fully forwarded.
+
+- Business-rule validation
+  - Basic rules such as `>= 0` and `contains @` exist.
+  - A complete configurable rule engine is not implemented.
+
+- Forecasting
+  - Linear and ARIMA forecasting work.
+  - Prophet and LSTM currently fall back because optional runtimes are unavailable.
+
+- Explainable AI
+  - Feature importance and SHAP support exist.
+  - A complete interactive XAI dashboard is not implemented.
+
+- Generative AI summaries
+  - Basic AI-style summaries exist.
+  - Full report-generation workflows and executive report automation are missing.
+
+## Implemented
+
+- Exact duplicate detection
+- Data quality analysis
+- Drift detection
+- Trend analysis
+- ARIMA and linear forecasting
+- Feature importance
+- Optional SHAP explanations
+- Multi-source loading
+- Database/cloud source support
+- Email, SMS, WhatsApp, Slack, and Teams notifications
+- Basic API endpoints
+
+The biggest remaining implementation gaps are the dashboard UI, authentication/security, pipeline monitoring, lineage, chatbot, dataset comparison, and advanced ML workflows.
