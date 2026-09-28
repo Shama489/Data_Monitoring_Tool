@@ -2,6 +2,7 @@ from notifications import (
     ALERT_HISTORY,
     ALERT_RULES,
     evaluate_alert_rules,
+    get_alert_history,
     reset_alert_state,
     send_notifications,
 )
@@ -25,6 +26,21 @@ def test_alert_history_and_cooldown_take_effect():
     assert second["success"] is False
     assert second["status"] == "cooldown"
     assert len(ALERT_HISTORY) == 1
+
+
+def test_alert_history_is_persisted_to_sqlite():
+    reset_alert_state()
+    send_notifications({
+        "message": "Persisted alert",
+        "subject": "Database test",
+        "event_type": "data_quality",
+        "dry_run": True,
+        "channels": [{"channel": "email", "recipient": "alerts@example.com"}],
+    })
+
+    history = get_alert_history(limit=10)
+    assert len(history) >= 1
+    assert any(item["message"] == "Persisted alert" for item in history)
 
 
 def test_alert_rules_trigger_when_thresholds_are_met():
