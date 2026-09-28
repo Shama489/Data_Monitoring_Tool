@@ -13,7 +13,14 @@ from profiler import (
     generate_ai_quality_summary,
     train_and_explain_model,
 )
-from notifications import NotificationError, evaluate_alert_rules, send_notifications
+from notifications import (
+    ALERT_HISTORY,
+    ALERT_RULES,
+    NotificationError,
+    evaluate_alert_rules,
+    reset_alert_state,
+    send_notifications,
+)
 from data_sources import DataSourceError, load_source, summarize_source
 
 app = FastAPI(title="Data Monitoring Tool")
@@ -169,6 +176,53 @@ def send_notifications_endpoint(payload: dict[str, Any]):
         return send_notifications(payload)
     except NotificationError as error:
         _bad_request(str(error))
+
+
+@app.get("/api/alerts/rules")
+def list_alert_rules_endpoint():
+    return {"rules": ALERT_RULES}
+
+
+@app.post("/api/alerts/rules")
+def upsert_alert_rules_endpoint(payload: dict[str, Any]):
+    if "rules" in payload:
+        incoming = payload["rules"]
+    else:
+        incoming = [payload]
+
+    if not isinstance(incoming, list):
+        _bad_request("rules must be a list")
+
+    valid_rules = []
+    for rule in incoming:
+        if not isinstance(rule, dict):
+            _bad_request("each rule must be an object")
+        metric = str(rule.get("metric", "")).strip()
+        if not metric:
+            _bad_request("rule metric is required")
+        valid_rules.append({
+            "metric": metric,
+            "operator": str(rule.get("operator", "==")),
+            "value": rule.get("value"),
+            "channel": rule.get("channel"),
+            "recipient": rule.get("recipient", ""),
+            "subject": rule.get("subject", "Data monitoring alert"),
+            "message": rule.get("message", f"{metric} matched alert rule"),
+        })
+
+    ALERT_RULES[:] = valid_rules
+    return {"rules": ALERT_RULES, "count": len(ALERT_RULES)}
+
+
+@app.delete("/api/alerts/rules")
+def clear_alert_rules_endpoint():
+    reset_alert_state()
+    return {"rules": ALERT_RULES, "history": ALERT_HISTORY}
+
+
+@app.get("/api/alerts/history")
+def list_alert_history_endpoint():
+    return {"history": ALERT_HISTORY}
 
 
 @app.post("/api/data-quality/analyze")
