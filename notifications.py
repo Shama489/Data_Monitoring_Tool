@@ -8,6 +8,7 @@ import base64
 import json
 import os
 import smtplib
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -16,6 +17,9 @@ from typing import Any
 
 SUPPORTED_CHANNELS = {"email", "sms", "whatsapp", "slack", "teams"}
 SUPPORTED_OPERATORS = {">", ">=", "<", "<=", "==", "!=", "contains", "in", "not_in"}
+ALERT_HISTORY: list[dict[str, Any]] = []
+ALERT_RULES: list[dict[str, Any]] = []
+ALERT_COOLDOWN_SECONDS = 300
 
 
 class NotificationError(RuntimeError):
@@ -98,6 +102,52 @@ def evaluate_alert_rules(metrics: dict[str, Any], rules: list[dict[str, Any]] | 
             )
 
     return {"triggered": bool(matches), "matches": matches, "total_checked": len(matches)}
+
+
+def reset_alert_state() -> None:
+    ALERT_HISTORY.clear()
+    ALERT_RULES.clear()
+
+
+def _channel_keys(channels: list[Any]) -> tuple[str, ...]:
+    keys = []
+    for item in channels:
+        if isinstance(item, str):
+            keys.append(item.strip())
+        elif isinstance(item, dict):
+            channel_name = str(item.get("channel", "")).strip()
+            if channel_name:
+                keys.append(channel_name)
+    return tuple(sorted(filter(None, keys)))
+
+
+def _alert_dedupe_key(message: str, channels: list[Any]) -> tuple[str, tuple[str, ...]]:
+    return (message.strip(), _channel_keys(channels))
+
+
+def _last_alert_in_cooldown(message: str, channels: list[Any]) -> dict[str, Any] | None:
+    key = _alert_dedupe_key(message, channels)
+    now = time.time()
+    for item in reversed(ALERT_HISTORY):
+        if item.get("dedupe_key") == key and now - float(item.get("timestamp", 0.0)) < ALERT_COOLDOWN_SECONDS:
+            return item
+    return None
+
+
+def _append_alert_history(alert: dict[str, Any], status: str, channels: list[Any], sent: list[dict[str, Any]] | None = None, failed: list[dict[str, Any]] | None = None):
+    event = {
+        "id": len(ALERT_HISTORY) + 1,
+        "timestamp": time.time(),
+        "status": status,
+        "message": str(alert.get("message", "")),
+        "subject": str(alert.get("subject", "Data monitoring alert")),
+        "channels": channels,
+        "dedupe_key": _alert_dedupe_key(str(alert.get("message", "")), channels),
+        "sent": sent or [],
+        "failed": failed or [],
+    }
+    ALERT_HISTORY.append(event)
+    return event
 
 
 def _required_env(*names: str) -> dict[str, str]:
@@ -191,9 +241,22 @@ def send_notifications(alert: dict[str, Any]) -> dict[str, Any]:
     channels = alert.get("channels", [])
     if not isinstance(channels, list) or not channels:
         raise NotificationError("channels must be a non-empty list")
+
     message = str(alert.get("message", ""))
     subject = str(alert.get("subject", "Data monitoring alert"))
     dry_run = bool(alert.get("dry_run", False))
+
+    cooldown_match = _last_alert_in_cooldown(message, channels)
+    if cooldown_match is not None:
+        return {
+            "sent": [],
+            "failed": [{"channel": "cooldown", "error": f"Alert suppressed for {ALERT_COOLDOWN_SECONDS} seconds"}],
+            "success": False,
+            "status": "cooldown",
+            "cooldown_seconds": ALERT_COOLDOWN_SECONDS,
+            "last_alert": cooldown_match,
+        }
+
     results = []
     failures = []
     for item in channels:
@@ -208,4 +271,13 @@ def send_notifications(alert: dict[str, Any]) -> dict[str, Any]:
             results.append(send_notification(channel, recipient, message, subject, dry_run))
         except (NotificationError, ValueError, TypeError) as error:
             failures.append({"channel": channel, "error": str(error)})
-    return {"sent": results, "failed": failures, "success": not failures}
+
+    status = "success" if not failures else "partial_failure"
+    _append_alert_history(alert, status, channels, results, failures)
+    return {
+        "sent": results,
+        "failed": failures,
+        "success": not failures,
+        "status": status,
+        "history": ALERT_HISTORY[-1],
+    }
