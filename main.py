@@ -1,7 +1,7 @@
 from typing import Any
 
 import pandas as pd
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 
 from profiler import (
     analyze_dataset_drift,
@@ -14,11 +14,10 @@ from profiler import (
     train_and_explain_model,
 )
 from notifications import (
-    ALERT_HISTORY,
     ALERT_RULES,
     NotificationError,
     evaluate_alert_rules,
-    reset_alert_state,
+    get_alert_history,
     send_notifications,
 )
 from data_sources import DataSourceError, load_source, summarize_source
@@ -103,7 +102,7 @@ def _trigger_monitoring_notifications(
 
 
 def _send_rule_based_notifications(payload: dict[str, Any], event_type: str, metrics: dict[str, Any], subject: str) -> dict[str, Any]:
-    alert_rules = payload.get("alert_rules")
+    alert_rules = payload.get("alert_rules", ALERT_RULES)
     if not isinstance(alert_rules, list) or not alert_rules:
         return {"status": "skipped", "reason": "no alert rules configured"}
 
@@ -216,13 +215,17 @@ def upsert_alert_rules_endpoint(payload: dict[str, Any]):
 
 @app.delete("/api/alerts/rules")
 def clear_alert_rules_endpoint():
-    reset_alert_state()
-    return {"rules": ALERT_RULES, "history": ALERT_HISTORY}
+    ALERT_RULES.clear()
+    return {"rules": ALERT_RULES}
 
 
 @app.get("/api/alerts/history")
-def list_alert_history_endpoint():
-    return {"history": ALERT_HISTORY}
+def list_alert_history_endpoint(
+    limit: int = Query(default=50, ge=1, le=500),
+    status: str | None = None,
+    event_type: str | None = None,
+):
+    return {"history": get_alert_history(limit=limit, status=status, event_type=event_type)}
 
 
 @app.post("/api/data-quality/analyze")
@@ -255,21 +258,20 @@ def analyze_data_quality_endpoint(payload: dict[str, Any]):
             "Data Monitoring Alert",
             severity=risk_level,
         )
-    if payload.get("alert_rules"):
-        rule_result = _send_rule_based_notifications(
-            payload,
-            "data_quality",
-            {
-                "quality_score": quality_score.get("overall_score", 0),
-                "risk_level": ai_summary.get("risk_level", "unknown"),
-                "severity": ai_summary.get("risk_level", "unknown"),
-                "total_nulls": report.get("total_nulls", 0),
-                "duplicates": report.get("duplicates", 0),
-            },
-            "Data Monitoring Alert",
-        )
-        if rule_result.get("status") != "skipped":
-            notification_result = rule_result
+    rule_result = _send_rule_based_notifications(
+        payload,
+        "data_quality",
+        {
+            "quality_score": quality_score.get("overall_score", 0),
+            "risk_level": ai_summary.get("risk_level", "unknown"),
+            "severity": ai_summary.get("risk_level", "unknown"),
+            "total_nulls": report.get("total_nulls", 0),
+            "duplicates": report.get("duplicates", 0),
+        },
+        "Data Monitoring Alert",
+    )
+    if rule_result.get("status") != "skipped":
+        notification_result = rule_result
     return {
         "report": report,
         "quality_score": quality_score,
@@ -309,6 +311,20 @@ def analyze_data_quality_csv_endpoint(payload: dict[str, Any]):
             "CSV Data Monitoring Alert",
             severity=risk_level,
         )
+    rule_result = _send_rule_based_notifications(
+        payload,
+        "data_quality_csv",
+        {
+            "quality_score": quality_score.get("overall_score", 0),
+            "risk_level": ai_summary.get("risk_level", "unknown"),
+            "severity": ai_summary.get("risk_level", "unknown"),
+            "total_nulls": report.get("total_nulls", 0),
+            "duplicates": report.get("duplicates", 0),
+        },
+        "CSV Data Monitoring Alert",
+    )
+    if rule_result.get("status") != "skipped":
+        notification_result = rule_result
     return {
         "report": report,
         "quality_score": quality_score,
@@ -350,19 +366,18 @@ def analyze_drift_endpoint(payload: dict[str, Any]):
             "Drift Detection Alert",
             severity=report.get("overall_severity", "low"),
         )
-    if payload.get("alert_rules"):
-        rule_result = _send_rule_based_notifications(
-            payload,
-            "data_drift",
-            {
-                "drift_score": report.get("overall_drift_score", 0),
-                "severity": report.get("overall_severity", "low"),
-                "drift_detected": report.get("drift_detected", False),
-            },
-            "Drift Detection Alert",
-        )
-        if rule_result.get("status") != "skipped":
-            notification_result = rule_result
+    rule_result = _send_rule_based_notifications(
+        payload,
+        "data_drift",
+        {
+            "drift_score": report.get("overall_drift_score", 0),
+            "severity": report.get("overall_severity", "low"),
+            "drift_detected": report.get("drift_detected", False),
+        },
+        "Drift Detection Alert",
+    )
+    if rule_result.get("status") != "skipped":
+        notification_result = rule_result
     return {
         "report": report,
         "notifications": notification_result or {"status": "skipped", "reason": "notifications not requested"},
@@ -407,6 +422,18 @@ def analyze_drift_csv_endpoint(payload: dict[str, Any]):
             "CSV Drift Detection Alert",
             severity=report.get("overall_severity", "low"),
         )
+    rule_result = _send_rule_based_notifications(
+        payload,
+        "data_drift_csv",
+        {
+            "drift_score": report.get("overall_drift_score", 0),
+            "severity": report.get("overall_severity", "low"),
+            "drift_detected": report.get("drift_detected", False),
+        },
+        "CSV Drift Detection Alert",
+    )
+    if rule_result.get("status") != "skipped":
+        notification_result = rule_result
     return {
         "report": report,
         "notifications": notification_result or {"status": "skipped", "reason": "notifications not requested"},

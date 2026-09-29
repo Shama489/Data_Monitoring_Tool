@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 
 from data_sources import DataSourceError, load_local_file, load_sql_query
 from main import app
+from notifications import ALERT_HISTORY, reset_alert_state
 
 
 client = TestClient(app)
@@ -145,3 +146,63 @@ def test_drift_endpoint_triggers_notifications_when_requested(monkeypatch):
     assert response.json()["notifications"]["status"] == "sent"
     assert seen["alert"]["event_type"] == "data_drift"
     assert "Drift alert" in seen["alert"]["message"]
+
+
+def test_saved_alert_rules_trigger_quality_notifications(monkeypatch, tmp_path):
+    monkeypatch.setattr("notifications.ALERT_DB_PATH", str(tmp_path / "alerts.db"))
+    reset_alert_state()
+    posted_rules = client.post(
+        "/api/alerts/rules",
+        json={"rules": [{
+            "metric": "quality_score",
+            "operator": ">=",
+            "value": 0,
+            "channel": "email",
+            "recipient": "alerts@example.com",
+        }]},
+    )
+    assert posted_rules.status_code == 200
+
+    sent_alerts = []
+    monkeypatch.setattr("main.send_notifications", lambda alert: sent_alerts.append(alert) or {"status": "sent"})
+    response = client.post("/api/data-quality/analyze", json={"data": [{"value": 1}]})
+
+    assert response.status_code == 200
+    assert response.json()["notifications"]["status"] == "sent"
+    assert sent_alerts[0]["channels"] == [{"channel": "email", "recipient": "alerts@example.com"}]
+
+
+def test_alert_history_endpoint_reads_persisted_history(monkeypatch, tmp_path):
+    monkeypatch.setattr("notifications.ALERT_DB_PATH", str(tmp_path / "alerts.db"))
+    reset_alert_state()
+    response = client.post(
+        "/api/notifications/send",
+        json={"message": "persisted through API", "dry_run": True, "channels": ["email"]},
+    )
+    assert response.status_code == 200
+
+    ALERT_HISTORY.clear()
+    history_response = client.get("/api/alerts/history")
+
+    assert history_response.status_code == 200
+    assert any(item["message"] == "persisted through API" for item in history_response.json()["history"])
+
+
+def test_clearing_alert_rules_preserves_persisted_history(monkeypatch, tmp_path):
+    monkeypatch.setattr("notifications.ALERT_DB_PATH", str(tmp_path / "alerts.db"))
+    reset_alert_state()
+    client.post(
+        "/api/notifications/send",
+        json={"message": "keep this history", "dry_run": True, "channels": ["email"]},
+    )
+    client.post(
+        "/api/alerts/rules",
+        json={"rules": [{"metric": "quality_score", "operator": "<", "value": 50}]},
+    )
+
+    response = client.delete("/api/alerts/rules")
+
+    assert response.status_code == 200
+    ALERT_HISTORY.clear()
+    history_response = client.get("/api/alerts/history")
+    assert any(item["message"] == "keep this history" for item in history_response.json()["history"])

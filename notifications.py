@@ -7,6 +7,7 @@ kept dependency-free so the API can run without optional SDKs.
 import base64
 import json
 import os
+import sqlite3
 import smtplib
 import time
 import urllib.error
@@ -20,6 +21,7 @@ SUPPORTED_OPERATORS = {">", ">=", "<", "<=", "==", "!=", "contains", "in", "not_
 ALERT_HISTORY: list[dict[str, Any]] = []
 ALERT_RULES: list[dict[str, Any]] = []
 ALERT_COOLDOWN_SECONDS = 300
+ALERT_DB_PATH = os.path.join(os.path.dirname(__file__), "alerts.db")
 
 
 class NotificationError(RuntimeError):
@@ -104,9 +106,74 @@ def evaluate_alert_rules(metrics: dict[str, Any], rules: list[dict[str, Any]] | 
     return {"triggered": bool(matches), "matches": matches, "total_checked": len(matches)}
 
 
+def _init_alert_db() -> sqlite3.Connection:
+    connection = sqlite3.connect(ALERT_DB_PATH)
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS alerts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp REAL NOT NULL,
+            status TEXT NOT NULL,
+            message TEXT NOT NULL,
+            subject TEXT NOT NULL,
+            channels TEXT NOT NULL,
+            dedupe_key TEXT NOT NULL,
+            sent TEXT DEFAULT '[]',
+            failed TEXT DEFAULT '[]',
+            event_type TEXT DEFAULT '',
+            severity TEXT DEFAULT 'warning'
+        )
+        """
+    )
+    connection.commit()
+    return connection
+
+
+def get_alert_history(limit: int = 50, status: str | None = None, event_type: str | None = None) -> list[dict[str, Any]]:
+    connection = _init_alert_db()
+    try:
+        query = "SELECT id, timestamp, status, message, subject, channels, dedupe_key, sent, failed, event_type, severity FROM alerts"
+        clauses = []
+        params: list[Any] = []
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        if event_type:
+            clauses.append("event_type = ?")
+            params.append(event_type)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+        rows = connection.execute(query, params).fetchall()
+        history = []
+        for row in rows:
+            history.append({
+                "id": row[0],
+                "timestamp": row[1],
+                "status": row[2],
+                "message": row[3],
+                "subject": row[4],
+                "channels": json.loads(row[5]) if row[5] else [],
+                "dedupe_key": row[6],
+                "sent": json.loads(row[7]) if row[7] else [],
+                "failed": json.loads(row[8]) if row[8] else [],
+                "event_type": row[9],
+                "severity": row[10],
+            })
+        return history
+    finally:
+        connection.close()
+
+
 def reset_alert_state() -> None:
     ALERT_HISTORY.clear()
     ALERT_RULES.clear()
+    if os.path.exists(ALERT_DB_PATH):
+        try:
+            os.remove(ALERT_DB_PATH)
+        except OSError:
+            pass
 
 
 def _channel_keys(channels: list[Any]) -> tuple[str, ...]:
@@ -135,6 +202,7 @@ def _last_alert_in_cooldown(message: str, channels: list[Any]) -> dict[str, Any]
 
 
 def _append_alert_history(alert: dict[str, Any], status: str, channels: list[Any], sent: list[dict[str, Any]] | None = None, failed: list[dict[str, Any]] | None = None):
+    dedupe_key = _alert_dedupe_key(str(alert.get("message", "")), channels)
     event = {
         "id": len(ALERT_HISTORY) + 1,
         "timestamp": time.time(),
@@ -142,11 +210,35 @@ def _append_alert_history(alert: dict[str, Any], status: str, channels: list[Any
         "message": str(alert.get("message", "")),
         "subject": str(alert.get("subject", "Data monitoring alert")),
         "channels": channels,
-        "dedupe_key": _alert_dedupe_key(str(alert.get("message", "")), channels),
+        "dedupe_key": dedupe_key,
         "sent": sent or [],
         "failed": failed or [],
+        "event_type": str(alert.get("event_type", "")),
+        "severity": str(alert.get("severity", "warning")),
     }
     ALERT_HISTORY.append(event)
+
+    connection = _init_alert_db()
+    try:
+        connection.execute(
+            "INSERT INTO alerts (timestamp, status, message, subject, channels, dedupe_key, sent, failed, event_type, severity) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                event["timestamp"],
+                event["status"],
+                event["message"],
+                event["subject"],
+                json.dumps(channels),
+                json.dumps(dedupe_key),
+                json.dumps(event["sent"]),
+                json.dumps(event["failed"]),
+                event["event_type"],
+                event["severity"],
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
     return event
 
 
@@ -273,11 +365,11 @@ def send_notifications(alert: dict[str, Any]) -> dict[str, Any]:
             failures.append({"channel": channel, "error": str(error)})
 
     status = "success" if not failures else "partial_failure"
-    _append_alert_history(alert, status, channels, results, failures)
+    history_record = _append_alert_history(alert, status, channels, results, failures)
     return {
         "sent": results,
         "failed": failures,
         "success": not failures,
         "status": status,
-        "history": ALERT_HISTORY[-1],
+        "history": history_record,
     }
