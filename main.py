@@ -14,12 +14,10 @@ from profiler import (
     train_and_explain_model,
 )
 from notifications import (
-    ALERT_HISTORY,
     ALERT_RULES,
     NotificationError,
     evaluate_alert_rules,
     get_alert_history,
-    reset_alert_state,
     send_notifications,
 )
 from data_sources import DataSourceError, load_source, summarize_source
