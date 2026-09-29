@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -30,6 +31,8 @@ def _read_file_bytes(content: bytes, file_type: str, source_name: str, sheet_nam
             return pd.read_parquet(stream)
         if extension == "tsv":
             return pd.read_csv(stream, sep="\t")
+        if extension == "txt":
+            return pd.read_csv(stream, sep=None, engine="python")
         raise DataSourceError(f"Unsupported file type: {extension or 'unknown'}")
     except DataSourceError:
         raise
@@ -141,7 +144,7 @@ def load_source(source: dict[str, Any]) -> pd.DataFrame:
     source_type = str(source.get("type", "")).lower().strip()
     file_type = str(source.get("file_type", ""))
     sheet_name = source.get("sheet_name")
-    if source_type in {"csv", "excel", "xlsx", "xls", "json", "parquet", "tsv"}:
+    if source_type in {"csv", "excel", "xlsx", "xls", "json", "parquet", "tsv", "txt"}:
         path = source.get("path") or source.get("location")
         if not path:
             raise DataSourceError("path is required for file sources")
@@ -158,6 +161,74 @@ def load_source(source: dict[str, Any]) -> pd.DataFrame:
     if source_type in {"google_drive", "gdrive"}:
         return load_google_drive(str(source.get("file_id", "")), file_type, sheet_name)
     raise DataSourceError(f"Unsupported source type: {source_type or 'unknown'}")
+
+
+def source_capabilities() -> dict[str, Any]:
+    """Report supported sources, optional SDK availability, and setup requirements."""
+    providers = [
+        {
+            "type": "local_files",
+            "formats": ["csv", "excel", "json", "parquet", "tsv", "txt"],
+            "dependencies": {"pandas": "pandas", "excel": "openpyxl", "parquet": "pyarrow"},
+            "required_fields": ["path"],
+            "credential_setup": "No credentials required; file must be readable by the API process.",
+        },
+        {
+            "type": "sql",
+            "aliases": ["postgresql", "mysql"],
+            "dependencies": {"sqlalchemy": "sqlalchemy", "postgresql": "psycopg2", "mysql": "pymysql"},
+            "required_fields": ["url", "query"],
+            "credential_setup": "Supply a database URL and a read-only SELECT query.",
+        },
+        {
+            "type": "mongodb",
+            "dependencies": {"pymongo": "pymongo"},
+            "required_fields": ["uri", "database", "collection"],
+            "credential_setup": "Supply a MongoDB URI with read access to the target collection.",
+        },
+        {
+            "type": "s3",
+            "dependencies": {"boto3": "boto3"},
+            "required_fields": ["bucket", "key"],
+            "credential_setup": "Configure the AWS SDK credential chain (environment variables, profile, or execution role).",
+        },
+        {
+            "type": "dropbox",
+            "dependencies": {"dropbox": "dropbox"},
+            "required_fields": ["path"],
+            "credential_env": ["DROPBOX_ACCESS_TOKEN"],
+        },
+        {
+            "type": "google_drive",
+            "dependencies": {"google-api-python-client": "googleapiclient", "google-auth": "google.auth"},
+            "required_fields": ["file_id"],
+            "credential_env": ["GOOGLE_APPLICATION_CREDENTIALS"],
+        },
+    ]
+
+    for provider in providers:
+        missing_dependencies = []
+        for package, module in provider["dependencies"].items():
+            try:
+                installed = importlib.util.find_spec(module) is not None
+            except (ImportError, ModuleNotFoundError, ValueError):
+                installed = False
+            if not installed:
+                missing_dependencies.append(package)
+
+        missing_configuration = [
+            variable for variable in provider.get("credential_env", []) if not os.getenv(variable)
+        ]
+        provider["missing_dependencies"] = missing_dependencies
+        provider["missing_configuration"] = missing_configuration
+        if missing_dependencies:
+            provider["status"] = "missing_dependency"
+        elif missing_configuration:
+            provider["status"] = "configuration_required"
+        else:
+            provider["status"] = "ready"
+
+    return {"providers": providers}
 
 
 def summarize_source(source: dict[str, Any], df: pd.DataFrame) -> dict[str, Any]:

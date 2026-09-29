@@ -20,7 +20,7 @@ from notifications import (
     get_alert_history,
     send_notifications,
 )
-from data_sources import DataSourceError, load_source, summarize_source
+from data_sources import DataSourceError, load_source, source_capabilities, summarize_source
 
 app = FastAPI(title="Data Monitoring Tool")
 
@@ -141,6 +141,11 @@ def home():
 @app.get("/api/health")
 def health_check():
     return {"status": "ok", "service": "data-monitoring-tool"}
+
+
+@app.get("/api/sources/capabilities")
+def source_capabilities_endpoint():
+    return source_capabilities()
 
 
 @app.post("/api/sources/analyze")
