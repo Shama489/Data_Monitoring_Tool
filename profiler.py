@@ -9,6 +9,8 @@ import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 from sklearn.ensemble import IsolationForest, RandomForestClassifier, RandomForestRegressor
+from sklearn.metrics import accuracy_score, confusion_matrix, mean_absolute_error, mean_squared_error, precision_recall_fscore_support, r2_score
+from sklearn.model_selection import train_test_split
 
 try:
     from statsmodels.tsa.arima.model import ARIMA
@@ -854,12 +856,18 @@ def forecast_data_health(df, date_column, periods=4, frequency="W"):
     }
 
 
-def train_and_explain_model(df, target_column, task="classification"):
-    """Train a small baseline Random Forest and return feature importance plus SHAP explanations."""
+def train_and_explain_model(df, target_column, task="classification", test_size=0.2):
+    """Train a Random Forest, evaluate a holdout set, and return global/local explanations."""
     if target_column not in df.columns:
         raise ValueError(f"Target column '{target_column}' was not found in the dataset.")
     if task not in {"classification", "regression"}:
         raise ValueError("task must be classification or regression.")
+    try:
+        test_size = float(test_size)
+    except (TypeError, ValueError) as error:
+        raise ValueError("test_size must be a number between 0.1 and 0.5.") from error
+    if not 0.1 <= test_size <= 0.5:
+        raise ValueError("test_size must be between 0.1 and 0.5.")
 
     working = df.dropna(subset=[target_column]).copy()
     if len(working) < 4:
@@ -872,46 +880,127 @@ def train_and_explain_model(df, target_column, task="classification"):
     if features.shape[1] == 0:
         raise ValueError("At least one usable feature is required.")
 
+    stratify = None
+    if task == "classification":
+        class_counts = target.value_counts()
+        test_rows = math.ceil(len(target) * test_size)
+        train_rows = len(target) - test_rows
+        if class_counts.min() >= 2 and test_rows >= len(class_counts) and train_rows >= len(class_counts):
+            stratify = target
+
+    try:
+        train_features, test_features, train_target, test_target = train_test_split(
+            features,
+            target,
+            test_size=test_size,
+            random_state=42,
+            stratify=stratify,
+        )
+    except ValueError as error:
+        raise ValueError(f"Could not create a holdout split: {error}") from error
+
     if task == "classification":
         model = RandomForestClassifier(n_estimators=100, random_state=42)
     else:
         model = RandomForestRegressor(n_estimators=100, random_state=42)
-    model.fit(features, target)
+    model.fit(train_features, train_target)
+    predictions = model.predict(test_features)
 
     importances = sorted(
         [{"feature": name, "importance": round(float(value), 6)} for name, value in zip(features.columns, model.feature_importances_)],
         key=lambda item: item["importance"],
         reverse=True,
     )
+    if task == "classification":
+        precision, recall, f1, _ = precision_recall_fscore_support(
+            test_target, predictions, average="weighted", zero_division=0
+        )
+        labels = list(model.classes_)
+        holdout_metrics = {
+            "accuracy": round(float(accuracy_score(test_target, predictions)), 4),
+            "precision_weighted": round(float(precision), 4),
+            "recall_weighted": round(float(recall), 4),
+            "f1_weighted": round(float(f1), 4),
+            "confusion_matrix": confusion_matrix(test_target, predictions, labels=labels).tolist(),
+            "class_labels": [str(label) for label in labels],
+        }
+    else:
+        holdout_metrics = {
+            "mae": round(float(mean_absolute_error(test_target, predictions)), 4),
+            "rmse": round(float(np.sqrt(mean_squared_error(test_target, predictions))), 4),
+            "r2": round(float(r2_score(test_target, predictions)), 4) if len(test_target) > 1 else None,
+        }
+
+    prediction_rows = []
+    for row_index, actual, predicted in zip(test_target.index, test_target.tolist(), predictions.tolist()):
+        prediction_rows.append({
+            "row_index": int(row_index) if isinstance(row_index, (int, np.integer)) else str(row_index),
+            "actual": actual.item() if isinstance(actual, np.generic) else actual,
+            "predicted": predicted.item() if isinstance(predicted, np.generic) else predicted,
+        })
+
     result = {
         "task": task,
         "target": target_column,
         "rows": int(len(features)),
         "features": int(features.shape[1]),
+        "test_size": test_size,
+        "holdout": {
+            "rows": int(len(test_features)),
+            "metrics": holdout_metrics,
+            "predictions": prediction_rows[:200],
+        },
         "feature_importance": importances,
         "shap_available": shap is not None,
         "shap_values": None,
+        "local_explanations": [],
         "explanation_summary": {
             "top_features": importances[:10],
             "model_type": type(model).__name__,
-            "interpretation": "Higher feature importance indicates greater contribution to the fitted model predictions.",
+            "interpretation": "Global feature importance describes model reliance; holdout metrics estimate performance on unseen rows.",
         },
     }
     if shap is not None:
         try:
-            explanation = shap.TreeExplainer(model)(features)
+            explanation_rows = test_features.head(100)
+            explanation = shap.TreeExplainer(model)(explanation_rows)
             values = explanation.values
             if values.ndim == 3:
-                values = np.mean(np.abs(values), axis=2)
+                global_values = np.mean(np.abs(values), axis=(0, 2))
             else:
-                values = np.abs(values)
+                global_values = np.mean(np.abs(values), axis=0)
             result["shap_values"] = [
                 {"feature": name, "mean_abs_shap": round(float(value), 6)}
-                for name, value in sorted(zip(features.columns, values.mean(axis=0)), key=lambda item: item[1], reverse=True)
+                for name, value in sorted(zip(features.columns, global_values), key=lambda item: item[1], reverse=True)
             ]
             result["explanation_summary"]["top_shap_features"] = result["shap_values"][:10]
+            for position, row_index in enumerate(explanation_rows.index):
+                if values.ndim == 3:
+                    predicted_class = predictions[position]
+                    class_position = list(model.classes_).index(predicted_class)
+                    local_values = values[position, :, class_position]
+                else:
+                    local_values = values[position]
+                top_local = sorted(
+                    zip(features.columns, local_values),
+                    key=lambda item: abs(float(item[1])),
+                    reverse=True,
+                )[:10]
+                actual = test_target.loc[row_index]
+                predicted = predictions[position]
+                result["local_explanations"].append({
+                    "row_index": int(row_index) if isinstance(row_index, (int, np.integer)) else str(row_index),
+                    "actual": actual.item() if isinstance(actual, np.generic) else actual,
+                    "predicted": predicted.item() if isinstance(predicted, np.generic) else predicted,
+                    "features": [
+                        {"feature": name, "shap_value": round(float(value), 6)}
+                        for name, value in top_local
+                    ],
+                })
         except Exception:
             result["shap_available"] = False
+            result["shap_values"] = None
+            result["local_explanations"] = []
     return result
 
 

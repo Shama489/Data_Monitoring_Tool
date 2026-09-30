@@ -16,11 +16,24 @@ def test_local_file_loader_supports_csv_and_json(tmp_path):
     frame = pd.DataFrame({"id": [1, 2], "status": ["ok", "warn"]})
     csv_path = tmp_path / "events.csv"
     json_path = tmp_path / "events.json"
+    txt_path = tmp_path / "events.txt"
     frame.to_csv(csv_path, index=False)
     json_path.write_text(json.dumps(frame.to_dict(orient="records")), encoding="utf-8")
+    frame.to_csv(txt_path, index=False, sep="\t")
 
     pd.testing.assert_frame_equal(load_local_file(str(csv_path)), frame)
     pd.testing.assert_frame_equal(load_local_file(str(json_path)), frame)
+    pd.testing.assert_frame_equal(load_local_file(str(txt_path)), frame)
+
+
+def test_source_capabilities_report_provider_setup():
+    response = client.get("/api/sources/capabilities")
+
+    assert response.status_code == 200
+    providers = {provider["type"]: provider for provider in response.json()["providers"]}
+    assert "txt" in providers["local_files"]["formats"]
+    assert providers["dropbox"]["credential_env"] == ["DROPBOX_ACCESS_TOKEN"]
+    assert "missing_dependencies" in providers["s3"]
 
 
 def test_sql_loader_rejects_non_select_queries():
@@ -206,3 +219,25 @@ def test_clearing_alert_rules_preserves_persisted_history(monkeypatch, tmp_path)
     ALERT_HISTORY.clear()
     history_response = client.get("/api/alerts/history")
     assert any(item["message"] == "keep this history" for item in history_response.json()["history"])
+
+
+def test_explain_api_returns_holdout_metrics_and_accepts_test_size(monkeypatch):
+    monkeypatch.setattr("profiler.shap", None)
+    response = client.post(
+        "/api/analytics/explain",
+        json={
+            "data": [
+                {"signal": value, "target": value % 2}
+                for value in range(20)
+            ],
+            "target_column": "target",
+            "task": "classification",
+            "test_size": 0.3,
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()["report"]
+    assert body["test_size"] == 0.3
+    assert body["holdout"]["rows"] == 6
+    assert "accuracy" in body["holdout"]["metrics"]

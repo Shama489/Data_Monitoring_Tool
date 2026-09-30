@@ -191,6 +191,44 @@ def test_model_explanations_return_ranked_feature_importance():
     assert explanation["explanation_summary"]["top_features"]
 
 
+def test_model_explanations_include_classification_holdout_metrics(monkeypatch):
+    monkeypatch.setattr("profiler.shap", None)
+    df = pd.DataFrame({
+        "signal": list(range(30)),
+        "segment": ["A", "B", "C"] * 10,
+        "target": [0, 1] * 15,
+    })
+
+    report = train_and_explain_model(df, "target", test_size=0.3)
+
+    assert report["test_size"] == 0.3
+    assert report["holdout"]["rows"] == 9
+    assert set(report["holdout"]["metrics"]) >= {
+        "accuracy", "precision_weighted", "recall_weighted", "f1_weighted", "confusion_matrix"
+    }
+    assert report["holdout"]["predictions"]
+
+
+def test_model_explanations_include_regression_holdout_metrics(monkeypatch):
+    monkeypatch.setattr("profiler.shap", None)
+    df = pd.DataFrame({
+        "signal": list(range(20)),
+        "target": [value * 2 + 1 for value in range(20)],
+    })
+
+    report = train_and_explain_model(df, "target", task="regression")
+
+    assert set(report["holdout"]["metrics"]) == {"mae", "rmse", "r2"}
+    assert report["holdout"]["metrics"]["mae"] >= 0
+
+
+def test_model_explanations_reject_invalid_holdout_share():
+    df = pd.DataFrame({"feature": [1, 2, 3, 4], "target": [0, 0, 1, 1]})
+
+    with pytest.raises(ValueError, match="test_size"):
+        train_and_explain_model(df, "target", test_size=0.8)
+
+
 def test_get_table_data_rejects_invalid_table_names():
     with pytest.raises(ValueError, match="table name"):
         get_table_data("users; DROP TABLE accounts;")
