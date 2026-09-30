@@ -1,6 +1,7 @@
 import math
 import json
 import os
+import random
 import re
 import warnings
 
@@ -30,6 +31,60 @@ except ImportError:  # pragma: no cover
     OpenAI = None
 
 SUPPORTED_FORECAST_METHODS = {"auto", "arima", "linear", "prophet", "lstm"}
+NEAR_DUPLICATE_EXACT_LIMIT = 500
+NEAR_DUPLICATE_MAX_CANDIDATES = 1_000_000
+
+
+def _near_duplicate_candidates(rows):
+    row_count = len(rows)
+    total_pairs = math.comb(row_count, 2)
+    if row_count <= NEAR_DUPLICATE_EXACT_LIMIT:
+        return {(left, right) for left in range(row_count) for right in range(left + 1, row_count)}, "exhaustive", False
+
+    prime = 4_294_967_311
+    random_generator = random.Random(42)
+    coefficients = [
+        (random_generator.randrange(1, prime), random_generator.randrange(0, prime))
+        for _ in range(64)
+    ]
+    signatures = []
+    for row in rows:
+        text = "\x1f".join(row)
+        shingles = set(text)
+        shingles.update(text[index:index + 2] for index in range(max(len(text) - 1, 0)))
+        shingles.update(text[index:index + 3] for index in range(max(len(text) - 2, 0)))
+        hashed_shingles = [hash(shingle) & 0xFFFFFFFF for shingle in shingles]
+        if not hashed_shingles:
+            hashed_shingles = [0]
+        signatures.append([
+            min((coefficient * value + offset) % prime for value in hashed_shingles)
+            for coefficient, offset in coefficients
+        ])
+
+    candidates = set()
+    truncated = False
+    for band in range(32):
+        buckets = {}
+        start = band * 2
+        for row_index, signature in enumerate(signatures):
+            buckets.setdefault(tuple(signature[start:start + 2]), []).append(row_index)
+        for bucket in buckets.values():
+            if len(bucket) < 2:
+                continue
+            for bucket_position, left in enumerate(bucket[:-1]):
+                for right in bucket[bucket_position + 1:]:
+                    candidates.add((left, right))
+                    if len(candidates) >= NEAR_DUPLICATE_MAX_CANDIDATES:
+                        truncated = True
+                        break
+                if truncated:
+                    break
+            if truncated:
+                break
+        if truncated:
+            break
+
+    return candidates, "minhash_lsh", truncated
 
 # 🎨 MODERN GRAPH THEME 
 def apply_modern_theme(fig, height=420):
