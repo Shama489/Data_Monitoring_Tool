@@ -494,7 +494,12 @@ def explain_model_endpoint(payload: dict[str, Any]):
     if dataset is None or not target_column:
         _bad_request("Dataset and target_column are required.")
     try:
-        report = train_and_explain_model(pd.DataFrame(dataset), target_column, payload.get("task", "classification"))
+        report = train_and_explain_model(
+            pd.DataFrame(dataset),
+            target_column,
+            payload.get("task", "classification"),
+            payload.get("test_size", 0.2),
+        )
         return {"report": report}
     except (TypeError, ValueError) as error:
         _bad_request(str(error))

@@ -22,7 +22,7 @@ Start the interactive XAI dashboard in a second terminal:
 streamlit run xai_dashboard.py
 ```
 
-The dashboard supports CSV upload, classification or regression selection, target-column selection, interactive global feature-importance charts, SHAP impact charts when SHAP is available, explanation details, and JSON report download.
+The dashboard supports CSV upload, classification or regression selection, target-column selection, configurable holdout evaluation, model performance metrics, global feature importance, per-row SHAP explanations when available, and JSON report download.
 
 ---
 
@@ -250,9 +250,13 @@ Quality endpoints accept optional `use_llm: true` to request an OpenAI quality s
 }
 ```
 
-Supported source types are `csv`, `excel`, `json`, `parquet`, `tsv`, `sql`, `postgresql`, `mysql`, `mongodb`, `s3`, `dropbox`, and `google_drive`. SQL sources only accept `SELECT` queries. Configure cloud credentials through the provider SDK environment variables, including `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`, `DROPBOX_ACCESS_TOKEN`, and `GOOGLE_APPLICATION_CREDENTIALS`.
+Supported source types are `csv`, `excel`, `json`, `parquet`, `tsv`, `txt`, `sql`, `postgresql`, `mysql`, `mongodb`, `s3`, `dropbox`, and `google_drive`. SQL sources only accept `SELECT` queries. Configure cloud credentials through the provider SDK environment variables, including `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`, `DROPBOX_ACCESS_TOKEN`, and `GOOGLE_APPLICATION_CREDENTIALS`.
 
-Provider SDKs are optional at import time. Install the entries in `requirements.txt` when the corresponding source types are needed.
+Use `GET /api/sources/capabilities` to check supported providers, missing SDKs, and required credential configuration before submitting a multi-source analysis. Provider SDK imports remain optional at startup; install the relevant entries from `requirements.txt` when needed. AWS credentials are resolved through the normal SDK chain, including environment variables, profiles, and execution roles.
+
+## Explainability and Model Evaluation
+
+The XAI dashboard and `POST /api/analytics/explain` report evaluate a held-out test split in addition to global feature importance. Classification reports weighted precision, recall, F1, accuracy, and a confusion matrix; regression reports MAE, RMSE, and R². The dashboard supports selecting a holdout share from 10% to 50%, reviewing actual-versus-predicted rows, and inspecting per-row SHAP contributions when the optional SHAP calculation is available.
 
 ## AI-Powered Features
 
