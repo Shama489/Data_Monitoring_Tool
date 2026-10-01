@@ -3,6 +3,7 @@ from typing import Any
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Query
 
+from agents.monitoring_agent import build_tool_registry, run_monitoring
 from profiler import (
     analyze_dataset_drift,
     analyze_trends,
@@ -146,6 +147,23 @@ def health_check():
 @app.get("/api/sources/capabilities")
 def source_capabilities_endpoint():
     return source_capabilities()
+
+
+@app.get("/api/monitoring/tools")
+def monitoring_tools_endpoint():
+    return {"tools": build_tool_registry().describe()}
+
+
+@app.post("/api/monitoring/analyze")
+def monitoring_analyze_endpoint(payload: dict[str, Any]):
+    try:
+        return run_monitoring(
+            payload,
+            quality_options=_quality_options(payload),
+            use_llm=_use_llm_quality_summary(payload),
+        )
+    except (DataSourceError, TypeError, ValueError) as error:
+        _bad_request(str(error))
 
 
 @app.post("/api/sources/analyze")
