@@ -74,6 +74,55 @@ def test_sources_endpoint_rejects_empty_source_list():
     assert response.json()["detail"] == "sources must be a non-empty list"
 
 
+def test_monitoring_agent_runs_quality_by_default_and_returns_evidence():
+    response = client.post(
+        "/api/monitoring/analyze",
+        json={"data": [{"age": 20}, {"age": None}, {"age": 20}]},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["checks"] == ["quality"]
+    assert [item["tool"] for item in body["tool_trace"]] == ["data.load", "quality.analyze"]
+    assert body["root_cause"]["status"] == "attention_required"
+    assert {finding["signal"] for finding in body["root_cause"]["findings"]} >= {
+        "missing_values",
+        "duplicate_rows",
+    }
+    assert "drift" not in body["results"]
+
+
+def test_monitoring_agent_selects_drift_when_baseline_is_present():
+    response = client.post(
+        "/api/monitoring/analyze",
+        json={
+            "baseline": [{"value": 0}, {"value": 0}, {"value": 1}, {"value": 1}],
+            "current": [{"value": 10}, {"value": 10}, {"value": 11}, {"value": 11}],
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["checks"] == ["quality", "drift"]
+    assert "drift.analyze" in [item["tool"] for item in body["tool_trace"]]
+    assert body["results"]["drift"]["drift_detected"] is True
+    drift_finding = next(
+        finding for finding in body["root_cause"]["findings"]
+        if finding["signal"] == "distribution_drift"
+    )
+    assert drift_finding["evidence"]["overall_drift_score"] == body["results"]["drift"]["overall_drift_score"]
+
+
+def test_monitoring_agent_rejects_unknown_checks():
+    response = client.post(
+        "/api/monitoring/analyze",
+        json={"data": [{"value": 1}], "checks": ["forecast"]},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "checks may contain only quality and drift"
+
+
 def test_quality_endpoint_forwards_optional_llm_flag(monkeypatch):
     calls = []
 

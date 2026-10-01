@@ -1,4 +1,6 @@
 import math
+import importlib
+import hashlib
 import json
 import os
 import random
@@ -37,7 +39,6 @@ NEAR_DUPLICATE_MAX_CANDIDATES = 1_000_000
 
 def _near_duplicate_candidates(rows):
     row_count = len(rows)
-    total_pairs = math.comb(row_count, 2)
     if row_count <= NEAR_DUPLICATE_EXACT_LIMIT:
         return {(left, right) for left in range(row_count) for right in range(left + 1, row_count)}, "exhaustive", False
 
@@ -50,10 +51,21 @@ def _near_duplicate_candidates(rows):
     signatures = []
     for row in rows:
         text = "\x1f".join(row)
-        shingles = set(text)
-        shingles.update(text[index:index + 2] for index in range(max(len(text) - 1, 0)))
-        shingles.update(text[index:index + 3] for index in range(max(len(text) - 2, 0)))
-        hashed_shingles = [hash(shingle) & 0xFFFFFFFF for shingle in shingles]
+        tokens = re.findall(r"[a-z0-9]+", text)
+        shingles = set(tokens)
+        shingles.update(
+            f"{left}\x1f{right}"
+            for left, right in zip(tokens, tokens[1:])
+        )
+        if len(tokens) < 4:
+            shingles.update(text[index:index + 2] for index in range(max(len(text) - 1, 0)))
+            shingles.update(text[index:index + 3] for index in range(max(len(text) - 2, 0)))
+        if not shingles:
+            shingles.add(text)
+        hashed_shingles = [
+            int.from_bytes(hashlib.blake2b(shingle.encode("utf-8"), digest_size=4).digest(), "big")
+            for shingle in shingles
+        ]
         if not hashed_shingles:
             hashed_shingles = [0]
         signatures.append([
@@ -111,26 +123,50 @@ def check_data_quality(
 ):
     exact_duplicates = int(df.duplicated().sum())
 
-    duplicate_details = {"exact_duplicates": exact_duplicates, "near_duplicate_pairs": 0, "similarity_threshold": similarity_threshold}
+    duplicate_details = {
+        "exact_duplicates": exact_duplicates,
+        "near_duplicate_pairs": 0,
+        "similarity_threshold": similarity_threshold,
+        "candidate_generation": "disabled",
+        "candidate_generation_approximate": False,
+        "candidate_pairs_checked": 0,
+        "candidate_pairs_total": 0,
+        "candidate_generation_truncated": False,
+    }
     if df.shape[0] >= 2 and similarity_threshold is not None:
-        near_duplicate_count = 0
-        for i in range(len(df)):
-            left = df.iloc[i].fillna("").astype(str)
-            for j in range(i + 1, len(df)):
-                right = df.iloc[j].fillna("").astype(str)
-                scores = []
-                for left_value, right_value in zip(left, right):
-                    left_text = str(left_value).strip().lower()
-                    right_text = str(right_value).strip().lower()
-                    if left_text == right_text:
-                        scores.append(1.0)
-                    elif left_text and right_text:
-                        from difflib import SequenceMatcher
-                        scores.append(SequenceMatcher(None, left_text, right_text).ratio())
-                    else:
-                        scores.append(0.0)
-                if scores and (sum(scores) / len(scores)) >= similarity_threshold:
-                    near_duplicate_count += 1
+        from difflib import SequenceMatcher
+
+        row_counts = {}
+        for row in df.itertuples(index=False, name=None):
+            normalized_row = tuple(
+                "" if pd.isna(value) else str(value).strip().lower()
+                for value in row
+            )
+            row_counts[normalized_row] = row_counts.get(normalized_row, 0) + 1
+
+        unique_rows = list(row_counts)
+        candidates, candidate_generation, truncated = _near_duplicate_candidates(unique_rows)
+        near_duplicate_count = sum(count * (count - 1) // 2 for count in row_counts.values())
+        for left_index, right_index in candidates:
+            left = unique_rows[left_index]
+            right = unique_rows[right_index]
+            scores = [
+                1.0 if left_text == right_text else (
+                    SequenceMatcher(None, left_text, right_text).ratio()
+                    if left_text and right_text else 0.0
+                )
+                for left_text, right_text in zip(left, right)
+            ]
+            if scores and (sum(scores) / len(scores)) >= similarity_threshold:
+                near_duplicate_count += row_counts[left] * row_counts[right]
+
+        duplicate_details.update({
+            "candidate_generation": candidate_generation,
+            "candidate_generation_approximate": candidate_generation == "minhash_lsh",
+            "candidate_pairs_checked": len(candidates),
+            "candidate_pairs_total": math.comb(len(unique_rows), 2),
+            "candidate_generation_truncated": truncated,
+        })
         duplicate_details["near_duplicate_pairs"] = near_duplicate_count
 
     expected_columns = list(expected_columns or [])
@@ -816,6 +852,52 @@ def analyze_trends(df, date_column, value_column=None):
     }
 
 
+def _forecast_lstm(series, periods):
+    try:
+        tf = importlib.import_module("tensorflow")
+    except ImportError as error:
+        raise ImportError("LSTM forecasting requires TensorFlow; install project requirements.") from error
+
+    if len(series) < 10:
+        raise ValueError("LSTM forecasting requires at least 10 time periods.")
+
+    values = series.to_numpy(dtype=np.float32)
+    center = float(np.mean(values))
+    scale = float(np.std(values)) or 1.0
+    normalized = (values - center) / scale
+    lookback = min(12, max(3, len(normalized) // 4))
+    train_features = np.asarray([
+        normalized[index - lookback:index]
+        for index in range(lookback, len(normalized))
+    ], dtype=np.float32).reshape(-1, lookback, 1)
+    train_targets = normalized[lookback:]
+
+    tf.keras.backend.clear_session()
+    tf.keras.utils.set_random_seed(42)
+    model = tf.keras.Sequential([
+        tf.keras.layers.Input(shape=(lookback, 1)),
+        tf.keras.layers.LSTM(16),
+        tf.keras.layers.Dense(1),
+    ])
+    model.compile(optimizer="adam", loss="mean_squared_error")
+    model.fit(
+        train_features,
+        train_targets,
+        epochs=50,
+        batch_size=min(16, len(train_features)),
+        verbose=0,
+        shuffle=False,
+    )
+
+    window = normalized[-lookback:].copy()
+    predictions = []
+    for _ in range(periods):
+        prediction = float(model.predict(window.reshape(1, lookback, 1), verbose=0)[0, 0])
+        predictions.append(prediction * scale + center)
+        window = np.append(window[1:], prediction)
+    return np.asarray(predictions, dtype=float)
+
+
 def forecast_metric(df, date_column, value_column=None, periods=4, frequency="W", method="auto"):
     """Forecast future row volume or a numeric metric with optional advanced models."""
     if periods < 1 or periods > 365:
@@ -850,7 +932,13 @@ def forecast_metric(df, date_column, value_column=None, periods=4, frequency="W"
             fallback_reason = f"Prophet failed; used the available fallback model. Details: {error}"
 
     if requested_method == "lstm":
-        fallback_reason = "LSTM requires an optional deep-learning runtime; used the linear fallback model."
+        try:
+            forecast_values = _forecast_lstm(series, periods)
+            forecast_method = "LSTM"
+        except ImportError as error:
+            fallback_reason = f"{error} Used the linear fallback model."
+        except Exception as error:
+            fallback_reason = f"LSTM failed; used the linear fallback model. Details: {error}"
 
     if forecast_values is None and requested_method in {"auto", "arima"} and ARIMA is not None and len(series) >= 8:
         candidate_orders = [(1, 1, 1), (0, 1, 1), (1, 0, 1), (1, 1, 0)]

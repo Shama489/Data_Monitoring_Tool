@@ -1,3 +1,4 @@
+import hashlib
 import warnings
 
 import pandas as pd
@@ -171,6 +172,32 @@ def test_forecast_metric_supports_advanced_method_names():
     assert report["method"] in {"Prophet", "linear", "ARIMA"}
 
 
+def test_forecast_metric_uses_lstm_forecast_when_available(monkeypatch):
+    dates = pd.date_range("2025-01-01", periods=12, freq="W")
+    df = pd.DataFrame({"event_date": dates, "amount": range(12)})
+    monkeypatch.setattr("profiler._forecast_lstm", lambda _series, periods: [42.0] * periods)
+
+    report = forecast_metric(df, "event_date", "amount", periods=2, method="lstm")
+
+    assert report["method"] == "LSTM"
+    assert report["fallback_reason"] is None
+    assert [item["value"] for item in report["forecast"]] == [42.0, 42.0]
+
+
+def test_forecast_metric_reports_lstm_runtime_fallback(monkeypatch):
+    dates = pd.date_range("2025-01-01", periods=12, freq="W")
+    df = pd.DataFrame({"event_date": dates, "amount": range(12)})
+
+    def missing_runtime(_series, _periods):
+        raise ImportError("TensorFlow is unavailable")
+
+    monkeypatch.setattr("profiler._forecast_lstm", missing_runtime)
+    report = forecast_metric(df, "event_date", "amount", periods=2, method="lstm")
+
+    assert report["method"] == "linear"
+    assert "TensorFlow is unavailable" in report["fallback_reason"]
+
+
 def test_model_explanations_return_ranked_feature_importance():
     df = pd.DataFrame(
         {
@@ -293,6 +320,26 @@ def test_near_duplicate_detection_flags_similar_rows():
     report = check_data_quality(df, similarity_threshold=0.8)
 
     assert report["duplicate_detection"]["near_duplicate_pairs"] >= 1
+
+
+def test_near_duplicate_detection_scales_candidate_search_for_large_frames():
+    def token(prefix, index):
+        return hashlib.sha256(f"{prefix}:{index}".encode()).hexdigest()[:16]
+
+    names = [token("name", index) for index in range(510)]
+    emails = [token("email", index) for index in range(510)]
+    regions = [token("region", index) for index in range(510)]
+    names[1] = names[0][:-1] + ("0" if names[0][-1] != "0" else "1")
+    emails[1] = emails[0]
+    regions[1] = regions[0]
+    df = pd.DataFrame({"name": names, "email": emails, "region": regions})
+
+    report = check_data_quality(df)
+    duplicate_details = report["duplicate_detection"]
+
+    assert duplicate_details["candidate_generation"] == "minhash_lsh"
+    assert duplicate_details["candidate_pairs_checked"] < duplicate_details["candidate_pairs_total"]
+    assert duplicate_details["near_duplicate_pairs"] >= 1
 
 
 def test_schema_validation_checks_types_and_suggests_renamed_columns():

@@ -258,6 +258,8 @@ Use `GET /api/sources/capabilities` to check supported providers, missing SDKs, 
 
 The XAI dashboard and `POST /api/analytics/explain` report evaluate a held-out test split in addition to global feature importance. Classification reports weighted precision, recall, F1, accuracy, and a confusion matrix; regression reports MAE, RMSE, and R². The dashboard supports selecting a holdout share from 10% to 50%, reviewing actual-versus-predicted rows, and inspecting per-row SHAP contributions when the optional SHAP calculation is available.
 
+Forecasting supports linear and ARIMA models, with Prophet and TensorFlow-backed LSTM options. LSTM forecasts require at least 10 time periods; if its runtime is unavailable or training fails, the response identifies the reason and uses the linear fallback. Near-duplicate checks use exact candidate comparisons for smaller datasets and MinHash/LSH candidate generation with exact similarity verification for larger datasets; large-input results include candidate-generation and truncation metadata.
+
 ## AI-Powered Features
 
 The project now includes AI-style quality assessment capabilities that summarize dataset health, highlight top issues, and recommend follow-up actions based on missing values, duplicates, and risk level.

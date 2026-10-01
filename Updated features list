@@ -1,6 +1,5 @@
 Fully missing Features
 
-- Near-duplicate detection through advanced similarity matching
 - Data freshness alerts and scheduled freshness monitoring
 - Natural-language querying
 - AutoML model selection
@@ -41,11 +40,12 @@ Partially implemented
 
 - Forecasting
   - Linear and ARIMA forecasting work.
-  - Prophet and LSTM currently fall back because optional runtimes are unavailable.
+  - Prophet is optional; TensorFlow-backed LSTM forecasting is implemented.
+  - Forecast responses identify when an optional model falls back to linear.
 
 - Explainable AI
-  - Feature importance and SHAP support exist.
-  - A complete interactive XAI dashboard is not implemented.
+  - Feature importance and optional SHAP support exist.
+  - The XAI dashboard supports evaluation and per-row explanations; a full monitoring dashboard is not implemented.
 
 - Generative AI summaries
   - Basic AI-style summaries exist.
@@ -54,6 +54,7 @@ Partially implemented
 ## Implemented
 
 - Exact duplicate detection
+- Near-duplicate detection with exact scoring and scalable LSH candidate generation
 - Data quality analysis
 - Drift detection
 - Trend analysis
