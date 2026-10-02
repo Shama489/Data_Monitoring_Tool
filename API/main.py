@@ -6,6 +6,7 @@ from fastapi import FastAPI, HTTPException
 from profiler import (
     analyze_dataset_drift,
     analyze_trends,
+    answer_monitoring_question,
     calculate_data_quality_score,
     check_data_quality,
     forecast_data_health,

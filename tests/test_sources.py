@@ -116,11 +116,58 @@ def test_monitoring_agent_selects_drift_when_baseline_is_present():
 def test_monitoring_agent_rejects_unknown_checks():
     response = client.post(
         "/api/monitoring/analyze",
-        json={"data": [{"value": 1}], "checks": ["forecast"]},
+        json={"data": [{"value": 1}], "checks": ["unknown"]},
     )
 
     assert response.status_code == 400
-    assert response.json()["detail"] == "checks may contain only quality and drift"
+    assert response.json()["detail"] == "checks may contain only quality, drift, forecast, and explain"
+
+
+def test_monitoring_agent_runs_selected_forecast_tool():
+    dates = pd.date_range("2025-01-01", periods=8, freq="W")
+    response = client.post(
+        "/api/monitoring/analyze",
+        json={
+            "data": [{"event_date": date.isoformat(), "amount": index} for index, date in enumerate(dates)],
+            "checks": ["forecast"],
+            "date_column": "event_date",
+            "value_column": "amount",
+            "periods": 2,
+            "method": "linear",
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["checks"] == ["forecast"]
+    assert [item["tool"] for item in body["tool_trace"]] == ["data.load", "forecast.run"]
+    assert len(body["results"]["forecast"]["forecast"]) == 2
+
+
+def test_monitoring_agent_loads_source_and_sends_requested_notification(monkeypatch, tmp_path):
+    source_path = tmp_path / "events.csv"
+    pd.DataFrame({"value": [1, None]}).to_csv(source_path, index=False)
+    sent_alerts = []
+    monkeypatch.setattr(
+        "tools.notification_tools.send_notifications",
+        lambda alert: sent_alerts.append(alert) or {"status": "sent"},
+    )
+
+    response = client.post(
+        "/api/monitoring/analyze",
+        json={
+            "source": {"type": "csv", "path": str(source_path)},
+            "notify": True,
+            "channels": ["slack"],
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["tool_trace"][0]["tool"] == "data.load"
+    assert body["notifications"]["status"] == "sent"
+    assert sent_alerts[0]["event_type"] == "monitoring_workflow"
+    assert sent_alerts[0]["channels"] == ["slack"]
 
 
 def test_quality_endpoint_forwards_optional_llm_flag(monkeypatch):

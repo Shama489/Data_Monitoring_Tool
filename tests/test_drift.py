@@ -9,9 +9,11 @@ from backend import get_table_data
 from profiler import (
     analyze_dataset_drift,
     analyze_trends,
+    answer_monitoring_question,
     calculate_data_quality_score,
     check_data_quality,
     classify_drift_severity,
+    detect_anomalies_isolation_forest,
     forecast_data_health,
     forecast_metric,
     generate_ai_quality_summary,
@@ -91,6 +93,40 @@ def test_data_quality_and_ai_summary_are_generated():
     assert "summary" in ai_summary
     assert "key_findings" in ai_summary
     assert "recommended_actions" in ai_summary
+
+
+def test_monitoring_assistant_answers_quality_and_drift_questions():
+    df = pd.DataFrame(
+        {
+            "age": [20, None, 22, 24, 26, 30, 32, 35],
+            "region": ["A", "A", "B", "B", "A", "B", "A", "B"],
+            "score": [10, 12, None, 14, 15, 16, 17, 18],
+        }
+    )
+    baseline = pd.DataFrame({"age": [20, 22, 24, 26, 28, 30], "region": ["A", "B", "A", "B", "A", "B"]})
+    quality_report = check_data_quality(df)
+    drift_report = analyze_dataset_drift(baseline, df)
+    anomalies = detect_anomalies_isolation_forest(df)
+
+    quality_answer = answer_monitoring_question(
+        "How many missing values do we have in the dataset?",
+        df=df,
+        quality_report=quality_report,
+        drift_report=drift_report,
+        anomaly_report=anomalies,
+    )
+    drift_answer = answer_monitoring_question(
+        "Is there drift in the monitoring data?",
+        df=df,
+        quality_report=quality_report,
+        drift_report=drift_report,
+        anomaly_report=anomalies,
+    )
+
+    assert quality_answer["category"] == "quality"
+    assert "2" in quality_answer["answer"] or "two" in quality_answer["answer"].lower()
+    assert drift_answer["category"] == "drift"
+    assert "yes" in drift_answer["answer"].lower() or "drift detected" in drift_answer["answer"].lower()
 
 
 def test_generate_ai_quality_summary_uses_llm_when_available(monkeypatch):

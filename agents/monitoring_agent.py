@@ -1,11 +1,14 @@
 from typing import Any
 
 from agents.root_cause_agent import investigate
+from profiler import answer_monitoring_question
 from tools.data_tools import dataframe_from_value, load_dataset
 from tools.drift_tools import analyze_drift
+from tools.ml_tools import forecast_data
 from tools.notification_tools import send_monitoring_notification
 from tools.quality_tools import analyze_quality
 from tools.registry import ToolRegistry
+from tools.xai_tools import explain_model
 
 
 def build_tool_registry() -> ToolRegistry:
@@ -13,6 +16,9 @@ def build_tool_registry() -> ToolRegistry:
     registry.register("data.load", "Load a dataset from inline records or a configured source.", load_dataset)
     registry.register("quality.analyze", "Run deterministic data quality, schema, freshness, and rule checks.", analyze_quality)
     registry.register("drift.analyze", "Compare current data with a baseline and calculate feature drift.", analyze_drift)
+    registry.register("forecast.run", "Forecast a selected metric using the existing forecasting methods.", forecast_data)
+    registry.register("xai.explain", "Train and explain a model with holdout evaluation and optional SHAP output.", explain_model)
+    registry.register("assistant.answer", "Answer natural-language questions about data quality, missing values, anomalies, drift, and monitoring results.", answer_monitoring_question)
     registry.register("notification.send", "Send an explicitly requested monitoring notification.", send_monitoring_notification)
     return registry
 
@@ -25,8 +31,8 @@ def run_monitoring(payload: dict[str, Any], quality_options: dict[str, Any], use
             checks.append("drift")
     if not isinstance(checks, list) or not checks or not all(isinstance(check, str) for check in checks):
         raise ValueError("checks must be a non-empty list containing quality and/or drift")
-    if any(check not in {"quality", "drift"} for check in checks):
-        raise ValueError("checks may contain only quality and drift")
+    if any(check not in {"quality", "drift", "forecast", "explain"} for check in checks):
+        raise ValueError("checks may contain only quality, drift, forecast, and explain")
     checks = list(dict.fromkeys(checks))
 
     registry = build_tool_registry()
@@ -53,6 +59,29 @@ def run_monitoring(payload: dict[str, Any], quality_options: dict[str, Any], use
         baseline = dataframe_from_value(baseline_data, "Baseline dataset")
         results["drift"] = registry.run("drift.analyze", baseline=baseline, current=frame)
         trace.append({"tool": "drift.analyze", "status": "completed"})
+
+    if "forecast" in checks:
+        results["forecast"] = registry.run(
+            "forecast.run",
+            frame=frame,
+            date_column=payload.get("date_column"),
+            value_column=payload.get("value_column"),
+            periods=int(payload.get("periods", 4)),
+            frequency=str(payload.get("frequency", "W")),
+            method=str(payload.get("method", "auto")),
+            metric=payload.get("metric"),
+        )
+        trace.append({"tool": "forecast.run", "status": "completed"})
+
+    if "explain" in checks:
+        results["explanation"] = registry.run(
+            "xai.explain",
+            frame=frame,
+            target_column=payload.get("target_column"),
+            task=payload.get("task", "classification"),
+            test_size=payload.get("test_size", 0.2),
+        )
+        trace.append({"tool": "xai.explain", "status": "completed"})
 
     root_cause = investigate(results)
     notifications = {"status": "skipped", "reason": "notifications not requested"}

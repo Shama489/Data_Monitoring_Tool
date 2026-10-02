@@ -18,6 +18,8 @@ def load_dataset(payload: dict[str, Any]) -> pd.DataFrame:
         if dataset is None:
             dataset = payload.get("records")
         if dataset is None:
+            dataset = payload.get("current")
+        if dataset is None:
             raise ValueError("Dataset payload or source is required.")
         try:
             frame = pd.DataFrame(dataset)

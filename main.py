@@ -7,6 +7,7 @@ from agents.monitoring_agent import build_tool_registry, run_monitoring
 from profiler import (
     analyze_dataset_drift,
     analyze_trends,
+    answer_monitoring_question,
     calculate_data_quality_score,
     check_data_quality,
     forecast_data_health,
@@ -152,6 +153,45 @@ def source_capabilities_endpoint():
 @app.get("/api/monitoring/tools")
 def monitoring_tools_endpoint():
     return {"tools": build_tool_registry().describe()}
+
+
+@app.post("/api/assistant/ask")
+def assistant_ask_endpoint(payload: dict[str, Any]):
+    question = payload.get("question")
+    if not isinstance(question, str) or not question.strip():
+        _bad_request("question must be a non-empty string")
+
+    df_value = payload.get("data") or payload.get("dataset") or payload.get("records")
+    df = None
+    if df_value is not None:
+        if isinstance(df_value, list):
+            df = pd.DataFrame(df_value)
+        elif isinstance(df_value, pd.DataFrame):
+            df = df_value
+        elif isinstance(df_value, dict):
+            df = pd.DataFrame([df_value])
+        else:
+            _bad_request("data, dataset, or records must be a list, dataframe, or object")
+
+    quality_report = payload.get("quality_report")
+    drift_report = payload.get("drift_report")
+    anomaly_report = payload.get("anomaly_report")
+
+    if quality_report is not None and not isinstance(quality_report, dict):
+        _bad_request("quality_report must be an object")
+    if drift_report is not None and not isinstance(drift_report, dict):
+        _bad_request("drift_report must be an object")
+    if anomaly_report is not None and not isinstance(anomaly_report, dict):
+        _bad_request("anomaly_report must be an object")
+
+    response = answer_monitoring_question(
+        question,
+        df=df,
+        quality_report=quality_report,
+        drift_report=drift_report,
+        anomaly_report=anomaly_report,
+    )
+    return {"question": question, **response}
 
 
 @app.post("/api/monitoring/analyze")
