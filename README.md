@@ -231,6 +231,21 @@ Quality endpoints accept optional `use_llm: true` to request an OpenAI quality s
 - `POST /api/drift/analyze` with `baseline` and `current` JSON arrays or dictionaries.  
 - `POST /api/drift/analyze-csv` with `baseline_csv` and `current_csv` content.
 
+## Agentic Monitoring Workflow
+
+`POST /api/monitoring/analyze` orchestrates the existing deterministic monitoring functions through a tool registry. It accepts inline records (`data`, `dataset`, or `records`) or a single configured `source`; a `baseline` enables drift analysis automatically. Use `checks` to select `quality`, `drift`, `forecast`, and/or `explain`. Drift requires a baseline, while forecast and explain require `date_column` and `target_column`, respectively. The current dataset may be supplied as `current`.
+
+```json
+{
+	"data": [{"age": 28, "income": 42000}, {"age": null, "income": 51000}],
+	"baseline": [{"age": 31, "income": 39000}, {"age": 34, "income": 47000}],
+	"expected_columns": ["age", "income"],
+	"notify": false
+}
+```
+
+The response includes the selected checks, executed tool trace, quality and drift results, and root-cause findings with evidence taken from those results. Notifications are sent only when `notify` is `true` and findings exist; provide `channels` to choose recipients. `GET /api/monitoring/tools` lists the registered deterministic tools. The workflow planner uses explicit request fields and rules; it does not require an LLM, and `use_llm` only opts into the existing quality-summary feature.
+
 ## Enterprise Source Monitoring
 
 `POST /api/sources/analyze` accepts a list of sources and returns a compact quality summary for each one. A request can mix local files and database or cloud sources:

@@ -450,6 +450,140 @@ def generate_ai_quality_summary(df, report=None, quality_score=None, use_llm=Fal
         "recommended_actions": recommended_actions,
     }
 
+
+def answer_monitoring_question(
+    question: str,
+    df=None,
+    quality_report=None,
+    drift_report=None,
+    anomaly_report=None,
+    monitoring_results=None,
+):
+    if not isinstance(question, str) or not question.strip():
+        raise ValueError("question must be a non-empty string")
+
+    normalized_question = question.strip().lower()
+    if monitoring_results is None:
+        monitoring_results = {}
+
+    if quality_report is None and df is not None:
+        quality_report = check_data_quality(df)
+    if drift_report is None and isinstance(monitoring_results, dict):
+        drift_report = monitoring_results.get("drift")
+    if anomaly_report is None and isinstance(monitoring_results, dict):
+        anomaly_report = monitoring_results.get("anomalies")
+    if anomaly_report is None and df is not None:
+        anomaly_report = detect_anomalies_isolation_forest(df)
+
+    quality_score = None
+    if df is not None:
+        quality_score = calculate_data_quality_score(df)
+
+    missing_total = 0
+    missing_columns = []
+    if isinstance(quality_report, dict):
+        missing_total = int(quality_report.get("total_nulls", 0))
+        missing_columns = [
+            column for column, value in quality_report.get("null_per_column", {}).items()
+            if value and int(value) > 0
+        ]
+
+    if any(token in normalized_question for token in ["missing", "null", "blank", "na"]):
+        answer = (
+            f"There are {missing_total} missing values across {len(missing_columns)} columns."
+            if missing_columns
+            else f"There are no missing values in the current dataset."
+        )
+        if missing_columns:
+            answer += f" Impacted columns include: {', '.join(missing_columns[:5])}."
+        return {
+            "category": "quality",
+            "answer": answer,
+            "confidence": "high",
+            "context": {
+                "total_missing_values": missing_total,
+                "columns_with_missing_values": missing_columns,
+            },
+        }
+
+    if any(token in normalized_question for token in ["quality", "score", "health", "good", "bad"]):
+        score = quality_score.get("overall_score", 0) if quality_score else 0
+        if score:
+            answer = f"The overall data quality score is {float(score):.1f}/100, which indicates a {('low' if score < 60 else 'moderate' if score < 85 else 'strong')} quality profile."
+        else:
+            answer = "The dataset quality score is not available from the provided monitoring context."
+        return {
+            "category": "quality",
+            "answer": answer,
+            "confidence": "high",
+            "context": {"quality_score": score},
+        }
+
+    if any(token in normalized_question for token in ["anomaly", "outlier", "abnormal"]):
+        if isinstance(anomaly_report, dict) and anomaly_report.get("total_anomalies") is not None:
+            total = int(anomaly_report.get("total_anomalies", 0))
+            pct = float(anomaly_report.get("anomaly_percentage", 0.0))
+            answer = f"I found {total} anomalies, which is {pct:.1f}% of the rows in the dataset."
+        else:
+            answer = "No anomaly summary was provided for the current dataset."
+        return {
+            "category": "anomaly",
+            "answer": answer,
+            "confidence": "medium",
+            "context": {"anomaly_report": anomaly_report},
+        }
+
+    if any(token in normalized_question for token in ["drift", "shift", "distribution"]):
+        if isinstance(drift_report, dict):
+            score = float(drift_report.get("overall_drift_score", 0.0))
+            severity = drift_report.get("overall_severity", "unknown")
+            if drift_report.get("drift_detected"):
+                answer = f"Yes—drift was detected. The overall drift score is {score:.1f} ({severity} severity)."
+            else:
+                answer = f"No material drift was detected. The overall drift score is {score:.1f} ({severity} severity)."
+        else:
+            answer = "No drift report is available for the current monitoring context."
+        return {
+            "category": "drift",
+            "answer": answer,
+            "confidence": "high",
+            "context": {"drift_report": drift_report},
+        }
+
+    if any(token in normalized_question for token in ["summary", "overall", "status", "monitor"]):
+        quality_score_value = quality_score.get("overall_score", 0) if quality_score else 0
+        drift_score = float(drift_report.get("overall_drift_score", 0.0)) if isinstance(drift_report, dict) else 0.0
+        anomaly_total = int(anomaly_report.get("total_anomalies", 0)) if isinstance(anomaly_report, dict) else 0
+        answer = (
+            f"Overall quality is {float(quality_score_value):.1f}/100, drift is {drift_score:.1f}, and there are "
+            f"{anomaly_total} anomalies in the current monitoring snapshot."
+        )
+        return {
+            "category": "monitoring",
+            "answer": answer,
+            "confidence": "medium",
+            "context": {
+                "quality_score": quality_score_value,
+                "drift_score": drift_score,
+                "anomaly_total": anomaly_total,
+            },
+        }
+
+    answer = (
+        "I can answer questions about dataset quality, missing values, anomalies, drift, and current monitoring status. "
+        "Try asking about missing values, quality score, anomalies, or drift."
+    )
+    return {
+        "category": "general",
+        "answer": answer,
+        "confidence": "low",
+        "context": {
+            "quality_report": quality_report,
+            "drift_report": drift_report,
+            "anomaly_report": anomaly_report,
+        },
+    }
+
 # QUALITY VISUALS
 def plot_null_distribution(df):
     nulls = df.isnull().sum()
