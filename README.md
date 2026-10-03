@@ -13,6 +13,31 @@ uvicorn main:app --reload
 
 The API is available at `http://127.0.0.1:8000`, with interactive documentation at `/docs`.
 
+## Persistent monitoring data
+
+The API stores datasets, monitoring results, alert rules and history, configuration
+values, and audit records in SQLite. By default, the database is placed in the
+user's local application-data directory. Set `MONITORING_DB_PATH` before starting
+the API to select another database file:
+
+```powershell
+$env:MONITORING_DB_PATH = "C:\data\monitoring.db"
+uvicorn main:app --reload
+```
+
+The existing `alerts.db` alert history is migrated to the new database on first
+use. Available management endpoints include:
+
+- `POST /api/datasets`, `GET /api/datasets`, and `GET`/`DELETE /api/datasets/{id}`
+- `GET /api/monitoring/results` and `GET /api/monitoring/results/{id}`
+- `GET`/`POST`/`DELETE /api/alerts/rules` and `GET /api/alerts/history`
+- `GET`/`PUT /api/configurations` and `DELETE /api/configurations/{key}`
+- `GET /api/audit`
+
+Monitoring workflows automatically persist their input datasets and result.
+Saved datasets can be monitored again by passing their `dataset_id` to
+`POST /api/monitoring/analyze`.
+
 ## Run the Explainable AI Dashboard
 
 Start the interactive XAI dashboard in a second terminal:
@@ -33,6 +58,7 @@ The dashboard supports CSV upload, classification or regression selection, targe
 - **Data Quality Analysis**: Detect null values, duplicates, and generate automated recommendations for cleaning the dataset.  
 - **Data Quality API Integration**: Expose ready-to-use FastAPI endpoints for dataset quality checks from external apps and services.  
 - **Enterprise Source Monitoring**: Analyze multiple local files, SQL databases, MongoDB collections, and cloud objects in one request.
+- **Persistent Monitoring State**: Store datasets, analysis results, alert rules and history, configuration, and audit records in SQLite.
 - **AI-Powered Features**: Generate AI-style summaries, risk assessments, and recommended actions from the observed data quality issues.  
 - **Statistical Insights**: Generate descriptive statistics for numeric and categorical columns.  
 - **Correlation & Relationships**: Visualize correlations between columns using heatmaps and tables.  
@@ -65,6 +91,7 @@ The dashboard supports CSV upload, classification or regression selection, targe
 - **Scikit-learn** – Machine learning modeling and anomaly detection  
 - **Plotly** – Interactive visualizations
 - **SQLAlchemy** – PostgreSQL and MySQL database connectivity
+- **SQLite** – Durable application state and alert management
 
 ---
 

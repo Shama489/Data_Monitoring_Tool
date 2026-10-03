@@ -1,3 +1,4 @@
+import json
 from typing import Any
 
 import pandas as pd
@@ -18,11 +19,29 @@ from profiler import (
 from notifications import (
     ALERT_RULES,
     NotificationError,
+    SUPPORTED_OPERATORS,
     evaluate_alert_rules,
+    get_persisted_alert_rules,
     get_alert_history,
+    persist_alert_rules,
     send_notifications,
 )
 from data_sources import DataSourceError, load_source, source_capabilities, summarize_source
+from monitoring_store import (
+    delete_configuration,
+    delete_dataset,
+    get_audit_records,
+    get_configurations,
+    get_dataset,
+    get_monitoring_result,
+    list_datasets,
+    list_monitoring_results,
+    persist_monitoring_run,
+    save_dataset,
+    set_configuration,
+    set_configurations,
+)
+from tools.data_tools import load_dataset
 
 app = FastAPI(title="Data Monitoring Tool")
 
@@ -53,6 +72,65 @@ def _quality_options(payload: dict[str, Any]) -> dict[str, Any]:
         "max_age_hours": payload.get("max_age_hours"),
         "similarity_threshold": payload.get("similarity_threshold", 0.8),
         "rules": rules,
+    }
+
+
+def _dataset_name(payload: dict[str, Any], default: str = "monitoring_dataset") -> str:
+    name = payload.get("dataset_name", payload.get("name"))
+    if isinstance(name, str) and name.strip():
+        return name.strip()
+    source = payload.get("source")
+    if isinstance(source, dict):
+        path = source.get("path") or source.get("location")
+        if path:
+            return str(path).replace("\\", "/").rstrip("/").rsplit("/", 1)[-1] or default
+    return default
+
+
+def _dataset_source(payload: dict[str, Any]) -> dict[str, Any]:
+    source = payload.get("source")
+    if not isinstance(source, dict):
+        return {"type": "inline"}
+    details = {
+        key: source[key]
+        for key in ("type", "file_type", "name", "key", "collection")
+        if source.get(key) is not None
+    }
+    path = source.get("path") or source.get("location")
+    if path:
+        details["name"] = str(path).replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+    return details
+
+
+def _frame_records(frame: pd.DataFrame) -> list[dict[str, Any]]:
+    return json.loads(frame.to_json(orient="records", date_format="iso"))
+
+
+def _persist_endpoint_result(
+    payload: dict[str, Any],
+    frame: pd.DataFrame,
+    check_type: str,
+    result: dict[str, Any],
+    baseline: pd.DataFrame | None = None,
+) -> dict[str, Any]:
+    specs = [{
+        "key": "current",
+        "name": _dataset_name(payload),
+        "data": _frame_records(frame),
+        "source": _dataset_source(payload),
+    }]
+    if baseline is not None:
+        specs.append({
+            "key": "baseline",
+            "name": f"{_dataset_name(payload)}_baseline",
+            "data": _frame_records(baseline),
+            "source": {"type": "inline"},
+        })
+    dataset_ids, result_id = persist_monitoring_run(specs, check_type, result)
+    return {
+        "dataset_id": dataset_ids["current"],
+        "result_id": result_id,
+        **({"baseline_dataset_id": dataset_ids["baseline"]} if "baseline" in dataset_ids else {}),
     }
 
 
@@ -104,7 +182,9 @@ def _trigger_monitoring_notifications(
 
 
 def _send_rule_based_notifications(payload: dict[str, Any], event_type: str, metrics: dict[str, Any], subject: str) -> dict[str, Any]:
-    alert_rules = payload.get("alert_rules", ALERT_RULES)
+    alert_rules = payload.get("alert_rules")
+    if alert_rules is None:
+        alert_rules = get_persisted_alert_rules()
     if not isinstance(alert_rules, list) or not alert_rules:
         return {"status": "skipped", "reason": "no alert rules configured"}
 
@@ -123,11 +203,16 @@ def _send_rule_based_notifications(payload: dict[str, Any], event_type: str, met
         return {"status": "skipped", "reason": "matched rules had no delivery channels"}
 
     summary = "; ".join(f"{m['metric']}={m['actual']}" for m in rule_result["matches"])
+    severity_order = {"critical": 5, "high": 4, "medium": 3, "warning": 2, "low": 1}
+    severity = max(
+        (metrics.get("risk_level", "warning"), metrics.get("severity", "warning")),
+        key=lambda value: severity_order.get(str(value).lower(), 0),
+    )
     try:
         return send_notifications({
             "message": f"{event_type.replace('_', ' ').title()} alert: {summary}",
             "subject": subject,
-            "severity": max((metrics.get("risk_level", "warning"), metrics.get("severity", "warning")), key=lambda value: str(value)),
+            "severity": severity,
             "event_type": event_type,
             "channels": channels,
         })
@@ -222,7 +307,16 @@ def analyze_sources_endpoint(payload: dict[str, Any]):
             frame = load_source(source)
             if frame.empty:
                 raise DataSourceError("Source dataset must not be empty")
-            reports.append(summarize_source(source, frame))
+            report = summarize_source(source, frame)
+            report.update(
+                _persist_endpoint_result(
+                    {"source": source},
+                    frame,
+                    "source_summary",
+                    report,
+                )
+            )
+            reports.append(report)
         except (DataSourceError, TypeError, ValueError) as error:
             failures.append({"index": index, "type": source.get("type"), "error": str(error)})
 
@@ -242,7 +336,9 @@ def send_notifications_endpoint(payload: dict[str, Any]):
 
 @app.get("/api/alerts/rules")
 def list_alert_rules_endpoint():
-    return {"rules": ALERT_RULES}
+    rules = get_persisted_alert_rules()
+    ALERT_RULES[:] = rules
+    return {"rules": rules}
 
 
 @app.post("/api/alerts/rules")
@@ -262,9 +358,14 @@ def upsert_alert_rules_endpoint(payload: dict[str, Any]):
         metric = str(rule.get("metric", "")).strip()
         if not metric:
             _bad_request("rule metric is required")
+        operator = str(rule.get("operator", "==")).strip().lower()
+        if operator not in SUPPORTED_OPERATORS:
+            _bad_request(f"unsupported alert rule operator: {operator}")
+        if "value" not in rule:
+            _bad_request("rule value is required")
         valid_rules.append({
             "metric": metric,
-            "operator": str(rule.get("operator", "==")),
+            "operator": operator,
             "value": rule.get("value"),
             "channel": rule.get("channel"),
             "recipient": rule.get("recipient", ""),
@@ -272,12 +373,14 @@ def upsert_alert_rules_endpoint(payload: dict[str, Any]):
             "message": rule.get("message", f"{metric} matched alert rule"),
         })
 
+    persist_alert_rules(valid_rules)
     ALERT_RULES[:] = valid_rules
     return {"rules": ALERT_RULES, "count": len(ALERT_RULES)}
 
 
 @app.delete("/api/alerts/rules")
 def clear_alert_rules_endpoint():
+    persist_alert_rules([])
     ALERT_RULES.clear()
     return {"rules": ALERT_RULES}
 
@@ -289,6 +392,107 @@ def list_alert_history_endpoint(
     event_type: str | None = None,
 ):
     return {"history": get_alert_history(limit=limit, status=status, event_type=event_type)}
+
+
+@app.get("/api/datasets")
+def list_datasets_endpoint(
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+):
+    return {"datasets": list_datasets(limit=limit, offset=offset)}
+
+
+@app.post("/api/datasets", status_code=201)
+def create_dataset_endpoint(payload: dict[str, Any]):
+    try:
+        frame = load_dataset(payload)
+    except (DataSourceError, TypeError, ValueError) as error:
+        _bad_request(str(error))
+    name = _dataset_name(payload, default="")
+    if not name:
+        _bad_request("dataset name is required")
+    dataset_id = save_dataset(
+        name,
+        _frame_records(frame),
+        _dataset_source(payload),
+    )
+    return {"id": dataset_id, "name": name}
+
+
+@app.get("/api/datasets/{dataset_id}")
+def get_dataset_endpoint(dataset_id: str):
+    dataset = get_dataset(dataset_id)
+    if dataset is None:
+        raise HTTPException(status_code=404, detail="Dataset was not found")
+    return dataset
+
+
+@app.delete("/api/datasets/{dataset_id}")
+def delete_dataset_endpoint(dataset_id: str):
+    if not delete_dataset(dataset_id):
+        raise HTTPException(status_code=404, detail="Dataset was not found")
+    return {"deleted": True, "id": dataset_id}
+
+
+@app.get("/api/monitoring/results")
+def list_monitoring_results_endpoint(
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    dataset_id: str | None = None,
+):
+    return {
+        "results": list_monitoring_results(
+            limit=limit,
+            offset=offset,
+            dataset_id=dataset_id,
+        )
+    }
+
+
+@app.get("/api/monitoring/results/{result_id}")
+def get_monitoring_result_endpoint(result_id: str):
+    result = get_monitoring_result(result_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Monitoring result was not found")
+    return result
+
+
+@app.get("/api/configurations")
+def get_configurations_endpoint():
+    return {"configurations": get_configurations()}
+
+
+@app.put("/api/configurations")
+def update_configurations_endpoint(payload: dict[str, Any]):
+    configurations = payload.get("configurations")
+    if configurations is not None:
+        if not isinstance(configurations, dict):
+            _bad_request("configurations must be an object")
+        if not all(isinstance(key, str) and key.strip() for key in configurations):
+            _bad_request("configuration keys must be non-empty strings")
+        set_configurations({
+            key.strip(): value for key, value in configurations.items()
+        })
+    elif isinstance(payload.get("key"), str) and payload["key"].strip() and "value" in payload:
+        set_configuration(payload["key"].strip(), payload["value"])
+    else:
+        _bad_request("provide a key/value pair or a configurations object")
+    return {"configurations": get_configurations()}
+
+
+@app.delete("/api/configurations/{key}")
+def delete_configuration_endpoint(key: str):
+    if not delete_configuration(key):
+        raise HTTPException(status_code=404, detail="Configuration was not found")
+    return {"deleted": True, "key": key}
+
+
+@app.get("/api/audit")
+def get_audit_records_endpoint(
+    limit: int = Query(default=100, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
+):
+    return {"records": get_audit_records(limit=limit, offset=offset)}
 
 
 @app.post("/api/data-quality/analyze")
@@ -335,13 +539,15 @@ def analyze_data_quality_endpoint(payload: dict[str, Any]):
     )
     if rule_result.get("status") != "skipped":
         notification_result = rule_result
-    return {
+    response = {
         "report": report,
         "quality_score": quality_score,
         "ai_summary": ai_summary,
         "notifications": notification_result or {"status": "skipped", "reason": "notifications not requested"},
         "message": "Data quality analysis completed successfully.",
     }
+    response.update(_persist_endpoint_result(payload, df, "data_quality", response))
+    return response
 
 
 @app.post("/api/data-quality/analyze-csv")
@@ -388,12 +594,14 @@ def analyze_data_quality_csv_endpoint(payload: dict[str, Any]):
     )
     if rule_result.get("status") != "skipped":
         notification_result = rule_result
-    return {
+    response = {
         "report": report,
         "quality_score": quality_score,
         "ai_summary": ai_summary,
         "notifications": notification_result or {"status": "skipped", "reason": "notifications not requested"},
     }
+    response.update(_persist_endpoint_result(payload, df, "data_quality_csv", response))
+    return response
 
 
 @app.post("/api/drift/analyze")
@@ -441,11 +649,21 @@ def analyze_drift_endpoint(payload: dict[str, Any]):
     )
     if rule_result.get("status") != "skipped":
         notification_result = rule_result
-    return {
+    response = {
         "report": report,
         "notifications": notification_result or {"status": "skipped", "reason": "notifications not requested"},
         "message": "Drift analysis completed successfully.",
     }
+    response.update(
+        _persist_endpoint_result(
+            payload,
+            current_df,
+            "data_drift",
+            response,
+            baseline=baseline_df,
+        )
+    )
+    return response
 
 
 @app.post("/api/drift/analyze-csv")
@@ -497,10 +715,20 @@ def analyze_drift_csv_endpoint(payload: dict[str, Any]):
     )
     if rule_result.get("status") != "skipped":
         notification_result = rule_result
-    return {
+    response = {
         "report": report,
         "notifications": notification_result or {"status": "skipped", "reason": "notifications not requested"},
     }
+    response.update(
+        _persist_endpoint_result(
+            payload,
+            current_df,
+            "data_drift_csv",
+            response,
+            baseline=baseline_df,
+        )
+    )
+    return response
 
 
 @app.post("/api/analytics/trends")
@@ -510,9 +738,13 @@ def analyze_trends_endpoint(payload: dict[str, Any]):
     if dataset is None or not date_column:
         _bad_request("Dataset and date_column are required.")
     try:
-        return {"report": analyze_trends(pd.DataFrame(dataset), date_column, payload.get("value_column"))}
+        frame = pd.DataFrame(dataset)
+        report = analyze_trends(frame, date_column, payload.get("value_column"))
     except (TypeError, ValueError) as error:
         _bad_request(str(error))
+    response = {"report": report}
+    response.update(_persist_endpoint_result(payload, frame, "trends", response))
+    return response
 
 
 @app.post("/api/analytics/forecast")
@@ -540,9 +772,11 @@ def forecast_endpoint(payload: dict[str, Any]):
             report = forecast_data_health(df, date_column, periods, frequency)
         else:
             report = forecast_metric(df, date_column, payload.get("value_column"), periods, frequency, method)
-        return {"report": report}
     except (TypeError, ValueError) as error:
         _bad_request(str(error))
+    response = {"report": report}
+    response.update(_persist_endpoint_result(payload, df, "forecast", response))
+    return response
 
 
 @app.post("/api/analytics/explain")
@@ -552,12 +786,15 @@ def explain_model_endpoint(payload: dict[str, Any]):
     if dataset is None or not target_column:
         _bad_request("Dataset and target_column are required.")
     try:
+        frame = pd.DataFrame(dataset)
         report = train_and_explain_model(
-            pd.DataFrame(dataset),
+            frame,
             target_column,
             payload.get("task", "classification"),
             payload.get("test_size", 0.2),
         )
-        return {"report": report}
     except (TypeError, ValueError) as error:
         _bad_request(str(error))
+    response = {"report": report}
+    response.update(_persist_endpoint_result(payload, frame, "explanation", response))
+    return response

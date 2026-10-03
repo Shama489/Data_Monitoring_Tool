@@ -223,7 +223,8 @@ def check_data_quality(
             if not timestamps.empty:
                 latest_timestamp = timestamps.max()
                 freshness_report["latest_timestamp"] = latest_timestamp.isoformat()
-                freshness_report["age_hours"] = round(float((pd.Timestamp.now() - latest_timestamp).total_seconds() / 3600), 2)
+                now = pd.Timestamp.now(tz=latest_timestamp.tz)
+                freshness_report["age_hours"] = round(float((now - latest_timestamp).total_seconds() / 3600), 2)
                 freshness_report["is_fresh"] = freshness_report["age_hours"] <= float(max_age_hours)
         except Exception:
             freshness_report["is_fresh"] = False
