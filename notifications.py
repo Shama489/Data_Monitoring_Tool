@@ -16,12 +16,23 @@ import urllib.request
 from email.message import EmailMessage
 from typing import Any
 
+from monitoring_store import (
+    clear_alert_data,
+    database_path,
+    get_alert_rules as _get_alert_rules,
+    open_database,
+    replace_alert_rules as _replace_alert_rules,
+)
+
 SUPPORTED_CHANNELS = {"email", "sms", "whatsapp", "slack", "teams"}
 SUPPORTED_OPERATORS = {">", ">=", "<", "<=", "==", "!=", "contains", "in", "not_in"}
 ALERT_HISTORY: list[dict[str, Any]] = []
 ALERT_RULES: list[dict[str, Any]] = []
 ALERT_COOLDOWN_SECONDS = 300
-ALERT_DB_PATH = os.path.join(os.path.dirname(__file__), "alerts.db")
+ALERT_DB_PATH = os.getenv(
+    "MONITORING_DB_PATH",
+    database_path(),
+)
 
 
 class NotificationError(RuntimeError):
@@ -107,26 +118,7 @@ def evaluate_alert_rules(metrics: dict[str, Any], rules: list[dict[str, Any]] | 
 
 
 def _init_alert_db() -> sqlite3.Connection:
-    connection = sqlite3.connect(ALERT_DB_PATH)
-    connection.execute(
-        """
-        CREATE TABLE IF NOT EXISTS alerts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp REAL NOT NULL,
-            status TEXT NOT NULL,
-            message TEXT NOT NULL,
-            subject TEXT NOT NULL,
-            channels TEXT NOT NULL,
-            dedupe_key TEXT NOT NULL,
-            sent TEXT DEFAULT '[]',
-            failed TEXT DEFAULT '[]',
-            event_type TEXT DEFAULT '',
-            severity TEXT DEFAULT 'warning'
-        )
-        """
-    )
-    connection.commit()
-    return connection
+    return open_database(os.getenv("MONITORING_DB_PATH", ALERT_DB_PATH))
 
 
 def get_alert_history(limit: int = 50, status: str | None = None, event_type: str | None = None) -> list[dict[str, Any]]:
@@ -169,11 +161,15 @@ def get_alert_history(limit: int = 50, status: str | None = None, event_type: st
 def reset_alert_state() -> None:
     ALERT_HISTORY.clear()
     ALERT_RULES.clear()
-    if os.path.exists(ALERT_DB_PATH):
-        try:
-            os.remove(ALERT_DB_PATH)
-        except OSError:
-            pass
+    clear_alert_data(os.getenv("MONITORING_DB_PATH", ALERT_DB_PATH))
+
+
+def get_persisted_alert_rules() -> list[dict[str, Any]]:
+    return _get_alert_rules(os.getenv("MONITORING_DB_PATH", ALERT_DB_PATH))
+
+
+def persist_alert_rules(rules: list[dict[str, Any]]) -> None:
+    _replace_alert_rules(rules, os.getenv("MONITORING_DB_PATH", ALERT_DB_PATH))
 
 
 def _channel_keys(channels: list[Any]) -> tuple[str, ...]:
@@ -198,13 +194,37 @@ def _last_alert_in_cooldown(message: str, channels: list[Any]) -> dict[str, Any]
     for item in reversed(ALERT_HISTORY):
         if item.get("dedupe_key") == key and now - float(item.get("timestamp", 0.0)) < ALERT_COOLDOWN_SECONDS:
             return item
-    return None
+
+    connection = _init_alert_db()
+    try:
+        row = connection.execute(
+            "SELECT id, timestamp, status, message, subject, channels, dedupe_key, "
+            "sent, failed, event_type, severity FROM alerts "
+            "WHERE dedupe_key = ? AND timestamp >= ? ORDER BY id DESC LIMIT 1",
+            (json.dumps(key), now - ALERT_COOLDOWN_SECONDS),
+        ).fetchone()
+    finally:
+        connection.close()
+    if row is None:
+        return None
+    return {
+        "id": row[0],
+        "timestamp": row[1],
+        "status": row[2],
+        "message": row[3],
+        "subject": row[4],
+        "channels": json.loads(row[5]) if row[5] else [],
+        "dedupe_key": key,
+        "sent": json.loads(row[7]) if row[7] else [],
+        "failed": json.loads(row[8]) if row[8] else [],
+        "event_type": row[9],
+        "severity": row[10],
+    }
 
 
 def _append_alert_history(alert: dict[str, Any], status: str, channels: list[Any], sent: list[dict[str, Any]] | None = None, failed: list[dict[str, Any]] | None = None):
     dedupe_key = _alert_dedupe_key(str(alert.get("message", "")), channels)
     event = {
-        "id": len(ALERT_HISTORY) + 1,
         "timestamp": time.time(),
         "status": status,
         "message": str(alert.get("message", "")),
@@ -216,11 +236,10 @@ def _append_alert_history(alert: dict[str, Any], status: str, channels: list[Any
         "event_type": str(alert.get("event_type", "")),
         "severity": str(alert.get("severity", "warning")),
     }
-    ALERT_HISTORY.append(event)
 
     connection = _init_alert_db()
     try:
-        connection.execute(
+        cursor = connection.execute(
             "INSERT INTO alerts (timestamp, status, message, subject, channels, dedupe_key, sent, failed, event_type, severity) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 event["timestamp"],
@@ -235,10 +254,27 @@ def _append_alert_history(alert: dict[str, Any], status: str, channels: list[Any
                 event["severity"],
             ),
         )
+        event["id"] = cursor.lastrowid
+        connection.execute(
+            "INSERT INTO audit_records (timestamp, action, entity_type, entity_id, details) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                event["timestamp"],
+                "recorded",
+                "alert",
+                str(event["id"]),
+                json.dumps({
+                    "status": event["status"],
+                    "event_type": event["event_type"],
+                    "severity": event["severity"],
+                }),
+            ),
+        )
         connection.commit()
     finally:
         connection.close()
 
+    ALERT_HISTORY.append(event)
     return event
 
 
