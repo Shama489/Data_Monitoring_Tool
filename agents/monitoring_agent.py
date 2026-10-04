@@ -50,7 +50,12 @@ def build_tool_registry() -> ToolRegistry:
     return registry
 
 
-def run_monitoring(payload: dict[str, Any], quality_options: dict[str, Any], use_llm: bool = False) -> dict[str, Any]:
+def run_monitoring(
+    payload: dict[str, Any],
+    quality_options: dict[str, Any],
+    use_llm: bool = False,
+    owner_id: str | None = None,
+) -> dict[str, Any]:
     checks = payload.get("checks")
     if checks is None:
         checks = ["quality"]
@@ -68,7 +73,7 @@ def run_monitoring(payload: dict[str, Any], quality_options: dict[str, Any], use
 
     registry = build_tool_registry()
     trace = []
-    frame = registry.run("data.load", payload=payload)
+    frame = load_dataset(payload, owner_id=owner_id)
     trace.append({"tool": "data.load", "status": "completed"})
 
     results = {}
@@ -92,7 +97,7 @@ def run_monitoring(payload: dict[str, Any], quality_options: dict[str, Any], use
         if baseline_id is not None:
             if not isinstance(baseline_id, str) or not baseline_id.strip():
                 raise ValueError("baseline_dataset_id must be a non-empty string")
-            baseline = load_dataset({"dataset_id": baseline_id})
+            baseline = load_dataset({"dataset_id": baseline_id}, owner_id=owner_id)
         else:
             baseline = dataframe_from_value(baseline_data, "Baseline dataset")
         results["drift"] = registry.run("drift.analyze", baseline=baseline, current=frame)
@@ -187,7 +192,9 @@ def run_monitoring(payload: dict[str, Any], quality_options: dict[str, Any], use
             )
         )
 
-    dataset_ids, result_id = persist_monitoring_run(datasets, "monitoring", response)
+    dataset_ids, result_id = persist_monitoring_run(
+        datasets, "monitoring", response, owner_id=owner_id
+    )
     response["dataset_id"] = dataset_ids.get("current")
     response["result_id"] = result_id
     if "baseline" in dataset_ids:
