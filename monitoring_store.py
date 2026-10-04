@@ -45,14 +45,16 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             name TEXT NOT NULL,
             source TEXT NOT NULL,
             data TEXT NOT NULL,
-            created_at REAL NOT NULL
+            created_at REAL NOT NULL,
+            owner_id TEXT
         );
         CREATE TABLE IF NOT EXISTS monitoring_results (
             id TEXT PRIMARY KEY,
             dataset_id TEXT REFERENCES datasets(id) ON DELETE SET NULL,
             check_type TEXT NOT NULL,
             result TEXT NOT NULL,
-            created_at REAL NOT NULL
+            created_at REAL NOT NULL,
+            owner_id TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_monitoring_results_dataset
             ON monitoring_results(dataset_id, created_at DESC);
@@ -74,6 +76,24 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             entity_id TEXT,
             details TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS users (
+            id TEXT PRIMARY KEY,
+            username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL CHECK(role IN ('admin', 'analyst', 'viewer')),
+            is_active INTEGER NOT NULL DEFAULT 1,
+            created_at REAL NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS security_migrations (
+            migration_id TEXT PRIMARY KEY,
+            applied_at REAL NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS login_attempts (
+            client_key TEXT PRIMARY KEY,
+            attempts INTEGER NOT NULL,
+            window_started REAL NOT NULL,
+            blocked_until REAL NOT NULL
+        );
         CREATE INDEX IF NOT EXISTS idx_audit_records_timestamp
             ON audit_records(timestamp DESC);
         CREATE TABLE IF NOT EXISTS alerts (
@@ -93,6 +113,154 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             ON alerts(timestamp DESC);
         """
     )
+    connection.execute("BEGIN IMMEDIATE")
+    for table in ("datasets", "monitoring_results", "audit_records"):
+        columns = {
+            row["name"]
+            for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        if "owner_id" not in columns:
+            connection.execute(f"ALTER TABLE {table} ADD COLUMN owner_id TEXT")
+
+
+def _migrate_stored_content(connection: sqlite3.Connection) -> None:
+    if not os.getenv("AUTH_SECRET_KEY"):
+        return
+    migration_id = "encrypt_dataset_and_result_content_v1"
+    if connection.execute(
+        "SELECT 1 FROM security_migrations WHERE migration_id = ?",
+        (migration_id,),
+    ).fetchone():
+        return
+
+    from auth_security import encrypt_legacy_value
+
+    for table, content_column in (
+        ("datasets", "data"),
+        ("monitoring_results", "result"),
+    ):
+        rows = connection.execute(
+            f"SELECT id, {content_column} FROM {table}"
+        ).fetchall()
+        connection.executemany(
+            f"UPDATE {table} SET {content_column} = ? WHERE id = ?",
+            [
+                (encrypt_legacy_value(row[content_column]), row["id"])
+                for row in rows
+            ],
+        )
+    connection.execute(
+        "INSERT INTO security_migrations (migration_id, applied_at) VALUES (?, ?)",
+        (migration_id, time.time()),
+    )
+
+
+def create_user(username: str, password_hash: str, role: str) -> dict[str, Any]:
+    user_id = uuid.uuid4().hex
+    try:
+        with connect_database() as connection:
+            connection.execute(
+                "INSERT INTO users (id, username, password_hash, role, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (user_id, username, password_hash, role, time.time()),
+            )
+            _audit(connection, "created", "user", user_id, {"username": username, "role": role})
+    except sqlite3.IntegrityError as error:
+        raise ValueError("username is already registered") from error
+    return {"id": user_id, "username": username, "role": role, "is_active": True}
+
+
+def get_user_by_username(username: str) -> dict[str, Any] | None:
+    with connect_database() as connection:
+        row = connection.execute(
+            "SELECT id, username, password_hash, role, is_active FROM users WHERE username = ?",
+            (username,),
+        ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def get_user_by_id(user_id: str) -> dict[str, Any] | None:
+    with connect_database() as connection:
+        row = connection.execute(
+            "SELECT id, username, role, is_active FROM users WHERE id = ?",
+            (user_id,),
+        ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def list_users(limit: int = 500) -> list[dict[str, Any]]:
+    with connect_database() as connection:
+        rows = connection.execute(
+            "SELECT id, username, role, is_active, created_at FROM users "
+            "ORDER BY created_at, username LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def update_user(user_id: str, role: str, is_active: bool) -> dict[str, Any] | None:
+    with connect_database() as connection:
+        cursor = connection.execute(
+            "UPDATE users SET role = ?, is_active = ? WHERE id = ?",
+            (role, int(is_active), user_id),
+        )
+        if cursor.rowcount == 0:
+            return None
+        row = connection.execute(
+            "SELECT id, username, role, is_active FROM users WHERE id = ?", (user_id,)
+        ).fetchone()
+        _audit(
+            connection,
+            "updated",
+            "user",
+            user_id,
+            {"username": row["username"], "role": role, "is_active": bool(is_active)},
+        )
+    return dict(row)
+
+
+def login_retry_after(client_key: str) -> int:
+    now = time.time()
+    with connect_database() as connection:
+        row = connection.execute(
+            "SELECT blocked_until FROM login_attempts WHERE client_key = ?",
+            (client_key,),
+        ).fetchone()
+    return max(0, int(row["blocked_until"] - now + 0.999)) if row else 0
+
+
+def record_login_failure(
+    client_key: str, max_attempts: int = 5, window_seconds: int = 900
+) -> int:
+    now = time.time()
+    with connect_database() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute(
+            "SELECT attempts, window_started, blocked_until FROM login_attempts "
+            "WHERE client_key = ?",
+            (client_key,),
+        ).fetchone()
+        if row and row["blocked_until"] > now:
+            return int(row["blocked_until"] - now + 0.999)
+        attempts = row["attempts"] if row and row["window_started"] > now - window_seconds else 0
+        window_started = row["window_started"] if attempts else now
+        attempts += 1
+        blocked_until = now + window_seconds if attempts >= max_attempts else 0
+        connection.execute(
+            "INSERT INTO login_attempts (client_key, attempts, window_started, blocked_until) "
+            "VALUES (?, ?, ?, ?) ON CONFLICT(client_key) DO UPDATE SET "
+            "attempts = excluded.attempts, window_started = excluded.window_started, "
+            "blocked_until = excluded.blocked_until",
+            (client_key, attempts, window_started, blocked_until),
+        )
+    return max(0, int(blocked_until - now + 0.999))
+
+
+def clear_login_failures(client_key: str) -> None:
+    with connect_database() as connection:
+        connection.execute(
+            "DELETE FROM login_attempts WHERE client_key = ?", (client_key,)
+        )
 
 
 def _migrate_legacy_alerts(connection: sqlite3.Connection, target: Path) -> None:
@@ -138,6 +306,7 @@ def open_database(database: str | None = None) -> sqlite3.Connection:
         if is_new_database:
             connection.execute("PRAGMA journal_mode = WAL")
         _create_schema(connection)
+        _migrate_stored_content(connection)
         if (
             is_new_database
             and not os.getenv("MONITORING_DB_PATH")
@@ -171,11 +340,13 @@ def _audit(
     entity_type: str,
     entity_id: str | None,
     details: Any,
+    owner_id: str | None = None,
 ) -> None:
     connection.execute(
-        "INSERT INTO audit_records (timestamp, action, entity_type, entity_id, details) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (time.time(), action, entity_type, entity_id, _encode(details)),
+        "INSERT INTO audit_records "
+        "(timestamp, action, entity_type, entity_id, details, owner_id) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (time.time(), action, entity_type, entity_id, _encode(details), owner_id),
     )
 
 
@@ -184,45 +355,69 @@ def _insert_dataset(
     name: str,
     data: Any,
     source: Any = None,
+    owner_id: str | None = None,
 ) -> str:
+    from auth_security import encrypt_data
+
     dataset_id = uuid.uuid4().hex
     connection.execute(
-        "INSERT INTO datasets (id, name, source, data, created_at) VALUES (?, ?, ?, ?, ?)",
-        (dataset_id, name, _encode(source or {}), _encode(data), time.time()),
+        "INSERT INTO datasets (id, name, source, data, created_at, owner_id) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (dataset_id, name, _encode(source or {}), encrypt_data(data), time.time(), owner_id),
     )
-    _audit(connection, "created", "dataset", dataset_id, {"name": name})
+    _audit(connection, "created", "dataset", dataset_id, {"name": name}, owner_id)
     return dataset_id
 
 
-def save_dataset(name: str, data: Any, source: Any = None) -> str:
+def save_dataset(
+    name: str, data: Any, source: Any = None, owner_id: str | None = None
+) -> str:
     with connect_database() as connection:
-        return _insert_dataset(connection, name, data, source)
+        return _insert_dataset(connection, name, data, source, owner_id)
 
 
-def get_dataset(dataset_id: str) -> dict[str, Any] | None:
+def get_dataset(dataset_id: str, owner_id: str | None = None) -> dict[str, Any] | None:
+    from auth_security import decrypt_data
+
     with connect_database() as connection:
-        row = connection.execute(
-            "SELECT id, name, source, data, created_at FROM datasets WHERE id = ?",
-            (dataset_id,),
-        ).fetchone()
+        if owner_id is None:
+            row = connection.execute(
+                "SELECT id, name, source, data, created_at FROM datasets WHERE id = ?",
+                (dataset_id,),
+            ).fetchone()
+        else:
+            row = connection.execute(
+                "SELECT id, name, source, data, created_at FROM datasets "
+                "WHERE id = ? AND owner_id = ?",
+                (dataset_id, owner_id),
+            ).fetchone()
     if row is None:
         return None
     return {
         "id": row["id"],
         "name": row["name"],
         "source": _decode(row["source"], {}),
-        "data": _decode(row["data"], []),
+        "data": decrypt_data(row["data"]),
         "created_at": row["created_at"],
     }
 
 
-def list_datasets(limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
+def list_datasets(
+    limit: int = 100, offset: int = 0, owner_id: str | None = None
+) -> list[dict[str, Any]]:
     with connect_database() as connection:
-        rows = connection.execute(
-            "SELECT id, name, source, created_at FROM datasets "
-            "ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
-            (limit, offset),
-        ).fetchall()
+        if owner_id is None:
+            rows = connection.execute(
+                "SELECT id, name, source, created_at FROM datasets "
+                "ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+                (limit, offset),
+            ).fetchall()
+        else:
+            rows = connection.execute(
+                "SELECT id, name, source, created_at FROM datasets WHERE owner_id = ? "
+                "ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+                (owner_id, limit, offset),
+            ).fetchall()
     return [
         {
             "id": row["id"],
@@ -234,15 +429,21 @@ def list_datasets(limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
     ]
 
 
-def delete_dataset(dataset_id: str) -> bool:
+def delete_dataset(dataset_id: str, owner_id: str | None = None) -> bool:
     with connect_database() as connection:
-        row = connection.execute(
-            "SELECT name FROM datasets WHERE id = ?", (dataset_id,)
-        ).fetchone()
+        if owner_id is None:
+            row = connection.execute(
+                "SELECT name FROM datasets WHERE id = ?", (dataset_id,)
+            ).fetchone()
+        else:
+            row = connection.execute(
+                "SELECT name FROM datasets WHERE id = ? AND owner_id = ?",
+                (dataset_id, owner_id),
+            ).fetchone()
         if row is None:
             return False
         connection.execute("DELETE FROM datasets WHERE id = ?", (dataset_id,))
-        _audit(connection, "deleted", "dataset", dataset_id, {"name": row["name"]})
+        _audit(connection, "deleted", "dataset", dataset_id, {"name": row["name"]}, owner_id)
     return True
 
 
@@ -250,15 +451,19 @@ def persist_monitoring_run(
     datasets: list[dict[str, Any]],
     check_type: str,
     result: Any,
+    owner_id: str | None = None,
 ) -> tuple[dict[str, str], str]:
     """Atomically persist the datasets, result, and matching audit events."""
+    from auth_security import encrypt_data
+
     ids: dict[str, str] = {}
     with connect_database() as connection:
         for item in datasets:
             dataset_id = item.get("id")
             if dataset_id:
                 exists = connection.execute(
-                    "SELECT 1 FROM datasets WHERE id = ?", (dataset_id,)
+                    "SELECT 1 FROM datasets WHERE id = ? AND (? IS NULL OR owner_id = ?)",
+                    (dataset_id, owner_id, owner_id),
                 ).fetchone()
                 if exists is None:
                     raise ValueError(f"Stored dataset was not found: {dataset_id}")
@@ -268,15 +473,24 @@ def persist_monitoring_run(
                     item["name"],
                     item["data"],
                     item.get("source"),
+                    owner_id,
                 )
             ids[item["key"]] = dataset_id
 
         current_dataset_id = ids.get("current")
         result_id = uuid.uuid4().hex
         connection.execute(
-            "INSERT INTO monitoring_results (id, dataset_id, check_type, result, created_at) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (result_id, current_dataset_id, check_type, _encode(result), time.time()),
+            "INSERT INTO monitoring_results "
+            "(id, dataset_id, check_type, result, created_at, owner_id) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                result_id,
+                current_dataset_id,
+                check_type,
+                encrypt_data(result),
+                time.time(),
+                owner_id,
+            ),
         )
         _audit(
             connection,
@@ -284,24 +498,36 @@ def persist_monitoring_run(
             "monitoring_result",
             result_id,
             {"check_type": check_type, "dataset_id": current_dataset_id},
+            owner_id,
         )
     return ids, result_id
 
 
-def get_monitoring_result(result_id: str) -> dict[str, Any] | None:
+def get_monitoring_result(
+    result_id: str, owner_id: str | None = None
+) -> dict[str, Any] | None:
+    from auth_security import decrypt_data
+
     with connect_database() as connection:
-        row = connection.execute(
-            "SELECT id, dataset_id, check_type, result, created_at "
-            "FROM monitoring_results WHERE id = ?",
-            (result_id,),
-        ).fetchone()
+        if owner_id is None:
+            row = connection.execute(
+                "SELECT id, dataset_id, check_type, result, created_at "
+                "FROM monitoring_results WHERE id = ?",
+                (result_id,),
+            ).fetchone()
+        else:
+            row = connection.execute(
+                "SELECT id, dataset_id, check_type, result, created_at "
+                "FROM monitoring_results WHERE id = ? AND owner_id = ?",
+                (result_id, owner_id),
+            ).fetchone()
     if row is None:
         return None
     return {
         "id": row["id"],
         "dataset_id": row["dataset_id"],
         "check_type": row["check_type"],
-        "result": _decode(row["result"], {}),
+        "result": decrypt_data(row["result"]),
         "created_at": row["created_at"],
     }
 
@@ -310,14 +536,20 @@ def list_monitoring_results(
     limit: int = 100,
     offset: int = 0,
     dataset_id: str | None = None,
+    owner_id: str | None = None,
 ) -> list[dict[str, Any]]:
+    from auth_security import decrypt_data
+
     query = (
         "SELECT id, dataset_id, check_type, result, created_at "
         "FROM monitoring_results"
     )
     params: list[Any] = []
+    if owner_id is not None:
+        query += " WHERE owner_id = ?"
+        params.append(owner_id)
     if dataset_id is not None:
-        query += " WHERE dataset_id = ?"
+        query += " AND dataset_id = ?" if owner_id is not None else " WHERE dataset_id = ?"
         params.append(dataset_id)
     query += " ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?"
     params.extend((limit, offset))
@@ -328,7 +560,7 @@ def list_monitoring_results(
             "id": row["id"],
             "dataset_id": row["dataset_id"],
             "check_type": row["check_type"],
-            "result": _decode(row["result"], {}),
+            "result": decrypt_data(row["result"]),
             "created_at": row["created_at"],
         }
         for row in rows
@@ -399,13 +631,22 @@ def delete_configuration(key: str) -> bool:
         return cursor.rowcount > 0
 
 
-def get_audit_records(limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
+def get_audit_records(
+    limit: int = 100, offset: int = 0, owner_id: str | None = None
+) -> list[dict[str, Any]]:
     with connect_database() as connection:
-        rows = connection.execute(
-            "SELECT id, timestamp, action, entity_type, entity_id, details "
-            "FROM audit_records ORDER BY id DESC LIMIT ? OFFSET ?",
-            (limit, offset),
-        ).fetchall()
+        if owner_id is None:
+            rows = connection.execute(
+                "SELECT id, timestamp, action, entity_type, entity_id, details "
+                "FROM audit_records ORDER BY id DESC LIMIT ? OFFSET ?",
+                (limit, offset),
+            ).fetchall()
+        else:
+            rows = connection.execute(
+                "SELECT id, timestamp, action, entity_type, entity_id, details "
+                "FROM audit_records WHERE owner_id = ? ORDER BY id DESC LIMIT ? OFFSET ?",
+                (owner_id, limit, offset),
+            ).fetchall()
     return [
         {
             "id": row["id"],

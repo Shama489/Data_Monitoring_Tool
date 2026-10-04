@@ -1,8 +1,10 @@
 import json
+import io
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 
 from agents.monitoring_agent import build_tool_registry, run_monitoring
 from profiler import (
@@ -42,8 +44,31 @@ from monitoring_store import (
     set_configurations,
 )
 from tools.data_tools import load_dataset
+from auth_security import (
+    AuthenticationError,
+    authenticate,
+    authentication_middleware,
+    create_account,
+    current_user,
+    current_user_id,
+    current_user_scope,
+    issue_token,
+    login_attempt_key,
+    RequestBodyLimitMiddleware,
+)
+from monitoring_store import (
+    clear_login_failures,
+    list_users,
+    login_retry_after,
+    record_login_failure,
+    update_user,
+)
 
 app = FastAPI(title="Data Monitoring Tool")
+app.middleware("http")(authentication_middleware)
+app.add_middleware(RequestBodyLimitMiddleware)
+MAX_DATASET_ROWS = 100_000
+MAX_DATASET_COLUMNS = 1_000
 
 
 def _bad_request(message: str) -> None:
@@ -106,6 +131,13 @@ def _frame_records(frame: pd.DataFrame) -> list[dict[str, Any]]:
     return json.loads(frame.to_json(orient="records", date_format="iso"))
 
 
+def _validate_dataset_dimensions(frame: pd.DataFrame) -> None:
+    if len(frame.index) > MAX_DATASET_ROWS:
+        _bad_request(f"Dataset must not exceed {MAX_DATASET_ROWS:,} rows")
+    if len(frame.columns) > MAX_DATASET_COLUMNS:
+        _bad_request(f"Dataset must not exceed {MAX_DATASET_COLUMNS:,} columns")
+
+
 def _persist_endpoint_result(
     payload: dict[str, Any],
     frame: pd.DataFrame,
@@ -126,7 +158,9 @@ def _persist_endpoint_result(
             "data": _frame_records(baseline),
             "source": {"type": "inline"},
         })
-    dataset_ids, result_id = persist_monitoring_run(specs, check_type, result)
+    dataset_ids, result_id = persist_monitoring_run(
+        specs, check_type, result, owner_id=current_user_id()
+    )
     return {
         "dataset_id": dataset_ids["current"],
         "result_id": result_id,
@@ -230,6 +264,98 @@ def health_check():
     return {"status": "ok", "service": "data-monitoring-tool"}
 
 
+@app.post("/api/auth/login")
+def login_endpoint(payload: dict[str, Any], request: Request):
+    username = payload.get("username")
+    password = payload.get("password")
+    if not isinstance(username, str) or not isinstance(password, str):
+        _bad_request("username and password are required")
+    if len(username) > 128 or len(password) > 1024:
+        _bad_request("username or password exceeds the allowed length")
+    try:
+        client_key = login_attempt_key(
+            request.client.host if request.client is not None else "unknown"
+        )
+        retry_after = login_retry_after(client_key)
+        if retry_after:
+            raise HTTPException(
+                status_code=429,
+                detail="Too many failed sign-in attempts. Try again later.",
+                headers={"Retry-After": str(retry_after)},
+            )
+        user = authenticate(username.strip().lower(), password)
+        if user is None:
+            retry_after = record_login_failure(client_key)
+            if retry_after:
+                raise HTTPException(
+                    status_code=429,
+                    detail="Too many failed sign-in attempts. Try again later.",
+                    headers={"Retry-After": str(retry_after)},
+                )
+            raise HTTPException(status_code=401, detail="Invalid username or password")
+        clear_login_failures(client_key)
+        token = issue_token(user)
+    except AuthenticationError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "expires_in": 3600,
+        "user": {
+            "id": user["id"],
+            "username": user["username"],
+            "role": user["role"],
+        },
+    }
+
+
+@app.get("/api/auth/me")
+def current_user_endpoint():
+    user = current_user()
+    return {
+        "id": user["id"],
+        "username": user["username"],
+        "role": user["role"],
+    }
+
+
+@app.get("/api/auth/users")
+def list_users_endpoint():
+    return {"users": list_users()}
+
+
+@app.post("/api/auth/users", status_code=201)
+def create_user_endpoint(payload: dict[str, Any]):
+    username, password, role = (
+        payload.get("username"),
+        payload.get("password"),
+        payload.get("role"),
+    )
+    if not all(isinstance(value, str) for value in (username, password, role)):
+        _bad_request("username, password, and role are required")
+    try:
+        user = create_account(username, password, role)
+    except ValueError as error:
+        _bad_request(str(error))
+    return user
+
+
+@app.patch("/api/auth/users/{user_id}")
+def update_user_endpoint(user_id: str, payload: dict[str, Any]):
+    role = payload.get("role")
+    active = payload.get("is_active")
+    if role not in {"admin", "analyst", "viewer"}:
+        _bad_request("role must be admin, analyst, or viewer")
+    if not isinstance(active, bool):
+        _bad_request("is_active must be a boolean")
+    if user_id == current_user_id() and (not active or role != "admin"):
+        _bad_request("Administrators cannot deactivate or demote their own account")
+    user = update_user(user_id, role, active)
+    if user is None:
+        raise HTTPException(status_code=404, detail="User was not found")
+    return user
+
+
 @app.get("/api/sources/capabilities")
 def source_capabilities_endpoint():
     return source_capabilities()
@@ -286,6 +412,7 @@ def monitoring_analyze_endpoint(payload: dict[str, Any]):
             payload,
             quality_options=_quality_options(payload),
             use_llm=_use_llm_quality_summary(payload),
+            owner_id=current_user_scope(),
         )
     except (DataSourceError, TypeError, ValueError) as error:
         _bad_request(str(error))
@@ -399,15 +526,16 @@ def list_datasets_endpoint(
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
 ):
-    return {"datasets": list_datasets(limit=limit, offset=offset)}
+    return {"datasets": list_datasets(limit=limit, offset=offset, owner_id=current_user_scope())}
 
 
 @app.post("/api/datasets", status_code=201)
 def create_dataset_endpoint(payload: dict[str, Any]):
     try:
-        frame = load_dataset(payload)
+        frame = load_dataset(payload, owner_id=current_user_scope())
     except (DataSourceError, TypeError, ValueError) as error:
         _bad_request(str(error))
+    _validate_dataset_dimensions(frame)
     name = _dataset_name(payload, default="")
     if not name:
         _bad_request("dataset name is required")
@@ -415,13 +543,41 @@ def create_dataset_endpoint(payload: dict[str, Any]):
         name,
         _frame_records(frame),
         _dataset_source(payload),
+        owner_id=current_user_id(),
     )
     return {"id": dataset_id, "name": name}
 
 
+@app.post("/api/datasets/upload", status_code=201)
+async def upload_dataset_file_endpoint(request: Request, name: str = Query(min_length=1, max_length=255)):
+    if request.headers.get("content-type", "").split(";", 1)[0].strip().lower() != "text/csv":
+        _bad_request("Uploaded datasets must use the text/csv content type")
+    safe_name = Path(name.replace("\\", "/")).name
+    if not safe_name or not safe_name.lower().endswith(".csv"):
+        _bad_request("uploaded file name must end with .csv")
+    content = await request.body()
+    try:
+        header = pd.read_csv(io.BytesIO(content), nrows=0)
+        if len(header.columns) > MAX_DATASET_COLUMNS:
+            _bad_request(f"Dataset must not exceed {MAX_DATASET_COLUMNS:,} columns")
+        frame = pd.read_csv(io.BytesIO(content), nrows=MAX_DATASET_ROWS + 1)
+    except (pd.errors.ParserError, UnicodeDecodeError, ValueError) as error:
+        _bad_request(f"Invalid CSV content: {error}")
+    if frame.empty:
+        _bad_request("CSV dataset must not be empty")
+    _validate_dataset_dimensions(frame)
+    dataset_id = save_dataset(
+        safe_name,
+        _frame_records(frame),
+        {"type": "upload", "file_type": "csv", "name": safe_name},
+        owner_id=current_user_id(),
+    )
+    return {"id": dataset_id, "name": safe_name}
+
+
 @app.get("/api/datasets/{dataset_id}")
 def get_dataset_endpoint(dataset_id: str):
-    dataset = get_dataset(dataset_id)
+    dataset = get_dataset(dataset_id, owner_id=current_user_scope())
     if dataset is None:
         raise HTTPException(status_code=404, detail="Dataset was not found")
     return dataset
@@ -429,7 +585,7 @@ def get_dataset_endpoint(dataset_id: str):
 
 @app.delete("/api/datasets/{dataset_id}")
 def delete_dataset_endpoint(dataset_id: str):
-    if not delete_dataset(dataset_id):
+    if not delete_dataset(dataset_id, owner_id=current_user_scope()):
         raise HTTPException(status_code=404, detail="Dataset was not found")
     return {"deleted": True, "id": dataset_id}
 
@@ -445,13 +601,14 @@ def list_monitoring_results_endpoint(
             limit=limit,
             offset=offset,
             dataset_id=dataset_id,
+            owner_id=current_user_scope(),
         )
     }
 
 
 @app.get("/api/monitoring/results/{result_id}")
 def get_monitoring_result_endpoint(result_id: str):
-    result = get_monitoring_result(result_id)
+    result = get_monitoring_result(result_id, owner_id=current_user_scope())
     if result is None:
         raise HTTPException(status_code=404, detail="Monitoring result was not found")
     return result

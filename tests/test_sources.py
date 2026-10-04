@@ -7,9 +7,10 @@ from fastapi.testclient import TestClient
 from data_sources import DataSourceError, load_local_file, load_sql_query
 from main import app
 from notifications import ALERT_HISTORY, reset_alert_state
+from conftest import admin_headers
 
 
-client = TestClient(app)
+client = TestClient(app, headers=admin_headers())
 
 
 def test_local_file_loader_supports_csv_and_json(tmp_path):

@@ -8,10 +8,47 @@ Activate the project virtual environment and start the service:
 
 ```powershell
 .\venv\Scripts\Activate.ps1
+$env:AUTH_SECRET_KEY = (python -c "import secrets; print(secrets.token_urlsafe(48))")
+$env:ADMIN_USERNAME = "admin"
+$env:ADMIN_PASSWORD = "replace-with-a-unique-password-of-12-or-more-characters"
 uvicorn main:app --reload
 ```
 
-The API is available at `http://127.0.0.1:8000`, with interactive documentation at `/docs`.
+On first login, the configured bootstrap administrator is created if the user
+database is empty. The API is available at `http://127.0.0.1:8000`, with
+interactive documentation at `/docs`. Keep `AUTH_SECRET_KEY` stable and secret:
+it signs bearer tokens and derives the encryption key for stored datasets and
+monitoring results. Losing or changing it makes existing encrypted data
+unreadable. Do not use the example bootstrap password in a deployed environment.
+
+All API routes except `/`, `/api/health`, and `/api/auth/login` require a
+`Bearer` access token. Login with `POST /api/auth/login`; the returned access
+token expires after one hour. Administrators create and manage accounts with
+`POST`/`GET /api/auth/users` and `PATCH /api/auth/users/{id}`. Passwords are
+stored as salted scrypt hashes. Five failed login attempts from one client IP
+within 15 minutes trigger a temporary block with a `Retry-After` response.
+Roles are:
+
+- **admin**: user, configuration, alert-rule, and audit administration; can
+  access all users' stored datasets and monitoring results.
+- **analyst**: run monitoring and analysis, upload/manage their own datasets,
+  and use assistant/notification actions.
+- **viewer**: read their own datasets and monitoring results, and ask the
+  assistant; data-changing actions are denied.
+
+Datasets and monitoring results are encrypted at rest with authenticated
+encryption. Dataset and result records are scoped to their owner; non-admin
+users receive not-found responses for records they do not own. Requests larger
+than 10 MiB are rejected. The XAI Streamlit dashboard signs in through the API,
+stores its upload under the signed-in account, and disables analysis controls
+for viewers. CSV dataset uploads are limited to 100,000 rows and 1,000 columns.
+Set `API_BASE_URL` if the API is not at the default local address.
+Use HTTPS for API traffic outside localhost and protect the secret environment
+variables and database backups.
+
+The optional PostgreSQL helper in `backend.py` no longer supplies a development
+password. Configure `DB_PASSWORD` when required by the database; credentials are
+assembled with SQLAlchemy's URL builder so reserved characters are handled safely.
 
 ## Persistent monitoring data
 
@@ -29,10 +66,13 @@ The existing `alerts.db` alert history is migrated to the new database on first
 use. Available management endpoints include:
 
 - `POST /api/datasets`, `GET /api/datasets`, and `GET`/`DELETE /api/datasets/{id}`
+- `POST /api/datasets/upload?name=events.csv` for bounded raw CSV uploads
 - `GET /api/monitoring/results` and `GET /api/monitoring/results/{id}`
 - `GET`/`POST`/`DELETE /api/alerts/rules` and `GET /api/alerts/history`
 - `GET`/`PUT /api/configurations` and `DELETE /api/configurations/{key}`
 - `GET /api/audit`
+- `POST /api/auth/login`, `GET /api/auth/me`, and admin-only user management at
+  `/api/auth/users`
 
 Monitoring workflows automatically persist their input datasets and result.
 Saved datasets can be monitored again by passing their `dataset_id` to
@@ -59,6 +99,7 @@ The dashboard supports CSV upload, classification or regression selection, targe
 - **Data Quality API Integration**: Expose ready-to-use FastAPI endpoints for dataset quality checks from external apps and services.  
 - **Enterprise Source Monitoring**: Analyze multiple local files, SQL databases, MongoDB collections, and cloud objects in one request.
 - **Persistent Monitoring State**: Store datasets, analysis results, alert rules and history, configuration, and audit records in SQLite.
+- **Authentication, RBAC & Security**: Multi-user bearer-token login, admin/analyst/viewer permissions, account administration, user-scoped datasets and results, password hashing, encrypted stored uploads, and request-size limits.
 - **AI-Powered Features**: Generate AI-style summaries, risk assessments, and recommended actions from the observed data quality issues.  
 - **Statistical Insights**: Generate descriptive statistics for numeric and categorical columns.  
 - **Correlation & Relationships**: Visualize correlations between columns using heatmaps and tables.  

@@ -4,10 +4,10 @@ Fully missing Features
 - Natural-language querying
 - AutoML model selection
 - Root-cause analysis
-- Encryption for uploaded files and user data
-- Audit logs
-- Role-based access control
-- Multi-user authentication
+- ✅ Encryption for uploaded datasets and monitoring results at rest
+- Audit logs with actor ownership are available through the authenticated admin API
+- ✅ Role-based access control (admin, analyst, viewer)
+- ✅ Multi-user bearer-token authentication
 - Custom dashboard builder
 - Dark mode UI
 - Multi-language support
@@ -65,5 +65,6 @@ Partially implemented
 - Database/cloud source support
 - Email, SMS, WhatsApp, Slack, and Teams notifications
 - Basic API endpoints
+- Authentication, RBAC, encrypted stored datasets/results, and bounded CSV uploads
 
-The biggest remaining implementation gaps are the dashboard UI, authentication/security, pipeline monitoring, lineage, chatbot, dataset comparison, and advanced ML workflows.
+The biggest remaining implementation gaps are the full monitoring dashboard UI, pipeline monitoring, lineage, chatbot, dataset comparison, and advanced ML workflows.

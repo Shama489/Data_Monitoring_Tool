@@ -9,9 +9,10 @@ from notifications import ALERT_HISTORY, send_notifications
 from profiler import check_data_quality
 import monitoring_store
 from agents.monitoring_agent import run_monitoring
+from conftest import admin_headers
 
 
-client = TestClient(app)
+client = TestClient(app, headers=admin_headers())
 
 
 def test_datasets_and_monitoring_results_are_persisted_and_reusable():
