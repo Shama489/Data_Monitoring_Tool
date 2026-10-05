@@ -199,7 +199,9 @@ def test_monitoring_agent_rejects_unknown_checks():
     )
 
     assert response.status_code == 400
-    assert response.json()["detail"] == "checks may contain only quality, drift, forecast, and explain"
+    assert response.json()["detail"] == (
+        "checks may contain only quality, drift, anomalies, forecast, and explain"
+    )
 
 
 def test_monitoring_agent_runs_selected_forecast_tool():
@@ -221,6 +223,29 @@ def test_monitoring_agent_runs_selected_forecast_tool():
     assert body["checks"] == ["forecast"]
     assert [item["tool"] for item in body["tool_trace"]] == ["data.load", "forecast.run"]
     assert len(body["results"]["forecast"]["forecast"]) == 2
+
+
+def test_monitoring_agent_runs_anomaly_check_and_persists_result():
+    response = client.post(
+        "/api/monitoring/analyze",
+        json={
+            "data": [{"value": index if index < 19 else 1000} for index in range(20)],
+            "checks": ["anomalies"],
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    anomaly_report = body["results"]["anomalies"]
+    assert anomaly_report["available"] is True
+    assert anomaly_report["total_anomalies"] >= 1
+    assert "anomalies.analyze" in [
+        item["tool"] for item in body["tool_trace"]
+    ]
+    stored = client.get(
+        f"/api/monitoring/results/{body['result_id']}"
+    ).json()
+    assert stored["result"]["results"]["anomalies"] == anomaly_report
 
 
 def test_monitoring_agent_loads_source_and_sends_requested_notification(monkeypatch, tmp_path):

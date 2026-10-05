@@ -83,16 +83,22 @@ Monitoring workflows automatically persist their input datasets and result.
 Saved datasets can be monitored again by passing their `dataset_id` to
 `POST /api/monitoring/analyze`.
 
-## Run the Explainable AI Dashboard
+## Run the Monitoring Dashboard
 
-Start the interactive XAI dashboard in a second terminal:
+Start the interactive dashboard in a second terminal:
 
 ```powershell
 .\venv\Scripts\Activate.ps1
 streamlit run xai_dashboard.py
 ```
 
-The dashboard supports CSV upload, classification or regression selection, target-column selection, configurable holdout evaluation, model performance metrics, global feature importance, per-row SHAP explanations when available, and JSON report download.
+Sign in with the bootstrap administrator or an account created by an
+administrator. The default workspace combines quality scores, drift trends,
+anomaly counts, configurable monitoring runs, forecasts, XAI results, alert
+history, and saved historical reports. Users can upload or select datasets
+permitted by their role. The **Explainable AI** workspace retains the
+standalone classification/regression workflow, target selection, holdout
+evaluation, feature importance, per-row SHAP explanations, and JSON download.
 
 ---
 
@@ -104,6 +110,7 @@ The dashboard supports CSV upload, classification or regression selection, targe
 - **Data Quality API Integration**: Expose ready-to-use FastAPI endpoints for dataset quality checks from external apps and services.  
 - **Enterprise Source Monitoring**: Analyze multiple local files, SQL databases, MongoDB collections, and cloud objects in one request.
 - **Persistent Monitoring State**: Store datasets, analysis results, alert rules and history, configuration, and audit records in SQLite.
+- **Advanced Monitoring Dashboard**: Unified authenticated workspace for quality scores, drift and anomaly trends, configurable monitoring runs, forecasts, XAI reports, alerts, and historical results.
 - **Authentication, RBAC & Security**: Multi-user bearer-token login, admin/analyst/viewer permissions, account administration, user-scoped datasets and results, password hashing, encrypted stored uploads, and request-size limits.
 - **AI-Powered Features**: Generate AI-style summaries, risk assessments, and recommended actions from the observed data quality issues.  
 - **Statistical Insights**: Generate descriptive statistics for numeric and categorical columns.  

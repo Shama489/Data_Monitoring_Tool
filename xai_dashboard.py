@@ -9,6 +9,7 @@ import requests
 import streamlit as st
 
 from profiler import train_and_explain_model
+from monitoring_dashboard import render_monitoring_dashboard
 
 
 st.set_page_config(page_title="Explainable AI Monitor", page_icon="XAI", layout="wide")
@@ -72,6 +73,11 @@ st.session_state["user"] = identity_response.json()
 with st.sidebar:
     st.caption(f"Signed in as **{st.session_state['user']['username']}**")
     st.caption(f"Role: `{st.session_state['user']['role']}`")
+    selected_page = st.radio(
+        "Workspace",
+        ["Monitoring Dashboard", "Explainable AI"],
+        index=0,
+    )
     if st.button("Sign out"):
         st.session_state.pop("access_token", None)
         st.session_state.pop("user", None)
@@ -148,6 +154,14 @@ with st.sidebar:
                                     st.success(f"Updated {selected_user['username']}.")
                                 else:
                                     st.error(update_response.json().get("detail", "Could not update the user."))
+
+if selected_page == "Monitoring Dashboard":
+    render_monitoring_dashboard(
+        API_BASE_URL,
+        _api_headers(),
+        st.session_state["user"]["role"],
+    )
+    st.stop()
 
 
 def _importance_frame(report: dict, key: str, value_name: str) -> pd.DataFrame:
