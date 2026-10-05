@@ -11,6 +11,7 @@ Activate the project virtual environment and start the service:
 $env:AUTH_SECRET_KEY = (python -c "import secrets; print(secrets.token_urlsafe(48))")
 $env:ADMIN_USERNAME = "admin"
 $env:ADMIN_PASSWORD = "replace-with-a-unique-password-of-12-or-more-characters"
+$env:DATASET_ALLOWED_DIRS = "C:\data\incoming;C:\data\approved"
 uvicorn main:app --reload
 ```
 
@@ -42,6 +43,10 @@ users receive not-found responses for records they do not own. Requests larger
 than 10 MiB are rejected. The XAI Streamlit dashboard signs in through the API,
 stores its upload under the signed-in account, and disables analysis controls
 for viewers. CSV dataset uploads are limited to 100,000 rows and 1,000 columns.
+Local-file sources are disabled unless `DATASET_ALLOWED_DIRS` lists the
+directories the API is permitted to read. Paths are canonicalized (including
+symlinks), constrained to those roots, and restricted to supported tabular file
+extensions before opening.
 Set `API_BASE_URL` if the API is not at the default local address.
 Use HTTPS for API traffic outside localhost and protect the secret environment
 variables and database backups.

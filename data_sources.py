@@ -17,6 +17,78 @@ class DataSourceError(RuntimeError):
     """Raised when a monitoring source cannot be loaded."""
 
 
+_LOCAL_FILE_EXTENSIONS = {"csv", "xls", "xlsx", "json", "parquet", "tsv", "txt"}
+_EXTENSION_ALIASES = {"excel": {"xls", "xlsx"}}
+
+
+def _configured_local_roots() -> list[Path]:
+    configured = os.getenv("DATASET_ALLOWED_DIRS", "")
+    if not configured.strip():
+        raise DataSourceError(
+            "Local file sources are disabled; configure DATASET_ALLOWED_DIRS"
+        )
+
+    roots = []
+    for raw_root in configured.split(os.pathsep):
+        if not raw_root.strip():
+            continue
+        try:
+            root = Path(raw_root.strip()).expanduser().resolve(strict=True)
+        except OSError as error:
+            raise DataSourceError(
+                "A configured DATASET_ALLOWED_DIRS entry does not exist"
+            ) from error
+        if not root.is_dir():
+            raise DataSourceError("DATASET_ALLOWED_DIRS entries must be directories")
+        roots.append(root)
+    if not roots:
+        raise DataSourceError(
+            "Local file sources are disabled; configure DATASET_ALLOWED_DIRS"
+        )
+    return roots
+
+
+def _validate_local_file_path(
+    path: str | os.PathLike[str], file_type: str = ""
+) -> tuple[Path, str]:
+    raw_path = os.fspath(path)
+    if any(part == ".." for part in raw_path.replace("\\", "/").split("/")):
+        raise DataSourceError("Local file paths must not contain traversal components")
+
+    candidate = Path(raw_path).expanduser()
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError as error:
+        raise DataSourceError("Local source file was not found or could not be resolved") from error
+    if not resolved.is_file():
+        raise DataSourceError("Local source path must refer to a file")
+
+    roots = _configured_local_roots()
+    if not any(resolved.is_relative_to(root) for root in roots):
+        raise DataSourceError("Local source file is outside DATASET_ALLOWED_DIRS")
+
+    actual_extension = resolved.suffix.lower().lstrip(".")
+    requested_extension = file_type.lower().lstrip(".")
+    if actual_extension:
+        if actual_extension not in _LOCAL_FILE_EXTENSIONS:
+            raise DataSourceError(f"Unsupported file type: {actual_extension}")
+        if requested_extension:
+            accepted_extensions = _EXTENSION_ALIASES.get(
+                requested_extension, {requested_extension}
+            )
+            if actual_extension not in accepted_extensions:
+                raise DataSourceError(
+                    "Declared file type does not match the local file extension"
+                )
+        extension = actual_extension
+    else:
+        extension = requested_extension
+        if extension not in _LOCAL_FILE_EXTENSIONS | set(_EXTENSION_ALIASES):
+            raise DataSourceError(f"Unsupported file type: {extension or 'unknown'}")
+
+    return resolved, extension
+
+
 def _read_file_bytes(content: bytes, file_type: str, source_name: str, sheet_name: str | int | None = None) -> pd.DataFrame:
     extension = file_type.lower().lstrip(".") or Path(source_name).suffix.lower().lstrip(".")
     stream = io.BytesIO(content)
@@ -41,10 +113,8 @@ def _read_file_bytes(content: bytes, file_type: str, source_name: str, sheet_nam
 
 
 def load_local_file(path: str, file_type: str = "", sheet_name: str | int | None = None) -> pd.DataFrame:
-    file_path = Path(path)
-    if not file_path.is_file():
-        raise DataSourceError(f"File was not found: {path}")
-    return _read_file_bytes(file_path.read_bytes(), file_type, file_path.name, sheet_name)
+    file_path, extension = _validate_local_file_path(path, file_type)
+    return _read_file_bytes(file_path.read_bytes(), extension, file_path.name, sheet_name)
 
 
 def load_sql_query(database_url: str, query: str, params: dict[str, Any] | None = None) -> pd.DataFrame:
@@ -148,7 +218,21 @@ def load_source(source: dict[str, Any]) -> pd.DataFrame:
         path = source.get("path") or source.get("location")
         if not path:
             raise DataSourceError("path is required for file sources")
+        declared_extensions = _EXTENSION_ALIASES.get(source_type, {source_type})
+        path_extension = Path(str(path)).suffix.lower().lstrip(".")
+        if path_extension and path_extension not in declared_extensions:
+            raise DataSourceError(
+                "Source type does not match the local file extension"
+            )
         normalized_type = file_type or (Path(str(path)).suffix.lower().lstrip(".")) or source_type
+        if file_type:
+            requested_extensions = _EXTENSION_ALIASES.get(
+                file_type.lower().lstrip("."), {file_type.lower().lstrip(".")}
+            )
+            if not requested_extensions.issubset(declared_extensions):
+                raise DataSourceError(
+                    "Declared file type does not match the source type"
+                )
         return load_local_file(str(path), file_type or normalized_type, sheet_name)
     if source_type in {"postgresql", "mysql", "sql"}:
         return load_sql_query(str(source.get("url", "")), str(source.get("query", "")), source.get("params"))

@@ -13,7 +13,8 @@ from conftest import admin_headers
 client = TestClient(app, headers=admin_headers())
 
 
-def test_local_file_loader_supports_csv_and_json(tmp_path):
+def test_local_file_loader_supports_csv_and_json(tmp_path, monkeypatch):
+    monkeypatch.setenv("DATASET_ALLOWED_DIRS", str(tmp_path))
     frame = pd.DataFrame({"id": [1, 2], "status": ["ok", "warn"]})
     csv_path = tmp_path / "events.csv"
     json_path = tmp_path / "events.json"
@@ -47,7 +48,8 @@ def test_sql_loader_rejects_multi_statement_select_queries():
         load_sql_query("sqlite://", "SELECT 1; DELETE FROM events")
 
 
-def test_sources_endpoint_reports_success_and_partial_failure(tmp_path):
+def test_sources_endpoint_reports_success_and_partial_failure(tmp_path, monkeypatch):
+    monkeypatch.setenv("DATASET_ALLOWED_DIRS", str(tmp_path))
     path = tmp_path / "events.csv"
     pd.DataFrame({"id": [1], "status": ["ok"]}).to_csv(path, index=False)
 
@@ -66,6 +68,82 @@ def test_sources_endpoint_reports_success_and_partial_failure(tmp_path):
     assert body["success"] is False
     assert body["sources"][0]["rows"] == 1
     assert body["failed"][0]["type"] == "unsupported"
+
+
+def test_sources_endpoint_restricts_local_paths_and_file_types(tmp_path, monkeypatch):
+    allowed_dir = tmp_path / "allowed"
+    outside_dir = tmp_path / "outside"
+    allowed_dir.mkdir()
+    outside_dir.mkdir()
+    allowed_csv = allowed_dir / "events.csv"
+    outside_csv = outside_dir / "private.csv"
+    unsupported_file = allowed_dir / "private.py"
+    allowed_csv.write_text("value\n1\n", encoding="utf-8")
+    outside_csv.write_text("secret\nprivate-data\n", encoding="utf-8")
+    unsupported_file.write_text("private-data", encoding="utf-8")
+    monkeypatch.setenv("DATASET_ALLOWED_DIRS", str(allowed_dir))
+
+    valid = client.post(
+        "/api/sources/analyze",
+        json={"sources": [{"type": "csv", "path": str(allowed_csv)}]},
+    )
+    assert valid.status_code == 200
+    assert valid.json()["sources"][0]["rows"] == 1
+
+    traversal = client.post(
+        "/api/sources/analyze",
+        json={
+            "sources": [{
+                "type": "csv",
+                "path": str(allowed_dir / ".." / "outside" / "private.csv"),
+            }]
+        },
+    )
+    assert traversal.status_code == 400
+
+    absolute_outside = client.post(
+        "/api/sources/analyze",
+        json={"sources": [{"type": "csv", "path": str(outside_csv)}]},
+    )
+    assert absolute_outside.status_code == 400
+
+    wrong_extension = client.post(
+        "/api/sources/analyze",
+        json={"sources": [{"type": "csv", "path": str(unsupported_file)}]},
+    )
+    assert wrong_extension.status_code == 400
+
+    mismatched_type = client.post(
+        "/api/sources/analyze",
+        json={
+            "sources": [{
+                "type": "json",
+                "file_type": "json",
+                "path": str(allowed_csv),
+            }]
+        },
+    )
+    assert mismatched_type.status_code == 400
+
+
+def test_sources_endpoint_rejects_symlink_escape(tmp_path, monkeypatch):
+    allowed_dir = tmp_path / "allowed"
+    allowed_dir.mkdir()
+    outside_file = tmp_path / "private.csv"
+    outside_file.write_text("secret\nprivate-data\n", encoding="utf-8")
+    link = allowed_dir / "linked.csv"
+    try:
+        link.symlink_to(outside_file)
+    except OSError as error:
+        pytest.skip(f"Symlinks are unavailable in this test environment: {error}")
+    monkeypatch.setenv("DATASET_ALLOWED_DIRS", str(allowed_dir))
+
+    response = client.post(
+        "/api/sources/analyze",
+        json={"sources": [{"type": "csv", "path": str(link)}]},
+    )
+
+    assert response.status_code == 400
 
 
 def test_sources_endpoint_rejects_empty_source_list():
@@ -146,6 +224,7 @@ def test_monitoring_agent_runs_selected_forecast_tool():
 
 
 def test_monitoring_agent_loads_source_and_sends_requested_notification(monkeypatch, tmp_path):
+    monkeypatch.setenv("DATASET_ALLOWED_DIRS", str(tmp_path))
     source_path = tmp_path / "events.csv"
     pd.DataFrame({"value": [1, None]}).to_csv(source_path, index=False)
     sent_alerts = []
