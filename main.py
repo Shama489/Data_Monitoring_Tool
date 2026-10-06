@@ -1,5 +1,8 @@
+import asyncio
 import json
 import io
+import math
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +24,7 @@ from profiler import (
 from notifications import (
     ALERT_RULES,
     NotificationError,
+    SUPPORTED_CHANNELS,
     SUPPORTED_OPERATORS,
     evaluate_alert_rules,
     get_persisted_alert_rules,
@@ -42,6 +46,10 @@ from monitoring_store import (
     save_dataset,
     set_configuration,
     set_configurations,
+    create_monitoring_schedule,
+    delete_monitoring_schedule,
+    list_monitoring_schedules,
+    set_monitoring_schedule_enabled,
 )
 from tools.data_tools import load_dataset
 from auth_security import (
@@ -63,8 +71,20 @@ from monitoring_store import (
     record_login_failure,
     update_user,
 )
+from scheduled_monitoring import scheduler_loop
 
-app = FastAPI(title="Data Monitoring Tool")
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    worker = asyncio.create_task(scheduler_loop(), name="scheduled-monitoring")
+    try:
+        yield
+    finally:
+        worker.cancel()
+        with suppress(asyncio.CancelledError):
+            await worker
+
+
+app = FastAPI(title="Data Monitoring Tool", lifespan=lifespan)
 app.middleware("http")(authentication_middleware)
 app.add_middleware(RequestBodyLimitMiddleware)
 MAX_DATASET_ROWS = 100_000
@@ -612,6 +632,140 @@ def get_monitoring_result_endpoint(result_id: str):
     if result is None:
         raise HTTPException(status_code=404, detail="Monitoring result was not found")
     return result
+
+
+@app.get("/api/schedules")
+def list_monitoring_schedules_endpoint():
+    return {
+        "schedules": list_monitoring_schedules(owner_id=current_user_scope())
+    }
+
+
+@app.post("/api/schedules", status_code=201)
+def create_monitoring_schedule_endpoint(payload: dict[str, Any]):
+    dataset_id = payload.get("dataset_id")
+    if not isinstance(dataset_id, str) or not dataset_id.strip():
+        _bad_request("dataset_id is required")
+    dataset = get_dataset(dataset_id, owner_id=current_user_scope())
+    if dataset is None:
+        raise HTTPException(status_code=404, detail="Dataset was not found")
+
+    try:
+        interval_seconds = int(payload.get("interval_seconds", 3600))
+    except (TypeError, ValueError):
+        _bad_request("interval_seconds must be an integer")
+    if not 60 <= interval_seconds <= 31 * 24 * 60 * 60:
+        _bad_request("interval_seconds must be between 60 and 2,678,400")
+
+    checks = payload.get("checks", ["quality"])
+    allowed_checks = {"quality", "drift", "anomalies", "forecast", "explain"}
+    if (
+        not isinstance(checks, list)
+        or not checks
+        or not all(isinstance(check, str) and check in allowed_checks for check in checks)
+    ):
+        _bad_request(
+            "checks must be a non-empty list containing quality, drift, anomalies, forecast, and explain"
+        )
+    checks = list(dict.fromkeys(checks))
+
+    baseline_id = payload.get("baseline_dataset_id")
+    if "drift" in checks:
+        if not isinstance(baseline_id, str) or not baseline_id.strip():
+            _bad_request("baseline_dataset_id is required when drift is selected")
+        if get_dataset(baseline_id, owner_id=current_user_scope()) is None:
+            raise HTTPException(status_code=404, detail="Baseline dataset was not found")
+    elif baseline_id is not None:
+        _bad_request("baseline_dataset_id can only be set when drift is selected")
+
+    columns = {str(column) for column in pd.DataFrame(dataset["data"]).columns}
+    timestamp_column = payload.get("timestamp_column")
+    max_age_hours = payload.get("max_age_hours")
+    if (timestamp_column is None) != (max_age_hours is None):
+        _bad_request("timestamp_column and max_age_hours must be provided together")
+    if timestamp_column is not None:
+        if not isinstance(timestamp_column, str) or timestamp_column not in columns:
+            _bad_request("timestamp_column must name a column in the selected dataset")
+        try:
+            max_age_hours = float(max_age_hours)
+        except (TypeError, ValueError):
+            _bad_request("max_age_hours must be a positive number")
+        if not math.isfinite(max_age_hours) or max_age_hours <= 0:
+            _bad_request("max_age_hours must be a positive number")
+        if "quality" not in checks:
+            checks.append("quality")
+
+    quality_options = _quality_options(payload)
+    quality_options["timestamp_column"] = timestamp_column
+    quality_options["max_age_hours"] = max_age_hours
+
+    schedule: dict[str, Any] = {
+        "checks": checks,
+        "quality_options": quality_options,
+    }
+    if baseline_id is not None:
+        schedule["baseline_dataset_id"] = baseline_id
+    for key in ("date_column", "value_column", "metric", "target_column"):
+        value = payload.get(key)
+        if value is not None:
+            if not isinstance(value, str) or value not in columns:
+                _bad_request(f"{key} must name a column in the selected dataset")
+            schedule[key] = value
+    if "forecast" in checks and not schedule.get("date_column"):
+        _bad_request("date_column is required when forecast is selected")
+    if "explain" in checks and not schedule.get("target_column"):
+        _bad_request("target_column is required when explain is selected")
+    for key, default in (("periods", 4), ("frequency", "W"), ("method", "auto"),
+                         ("task", "classification"), ("test_size", 0.2)):
+        if key in payload:
+            schedule[key] = payload[key]
+        else:
+            schedule[key] = default
+
+    channels = _notification_channels(payload)
+    if not isinstance(channels, list):
+        _bad_request("alert_channels must be a list of notification channels")
+    validated_channels = []
+    for channel in channels:
+        if isinstance(channel, str):
+            channel_name = channel.strip().lower()
+            if channel_name not in SUPPORTED_CHANNELS:
+                _bad_request(f"unsupported alert channel: {channel_name}")
+            validated_channels.append(channel_name)
+        elif isinstance(channel, dict):
+            channel_name = str(channel.get("channel", "")).strip().lower()
+            recipient = channel.get("recipient", "")
+            if channel_name not in SUPPORTED_CHANNELS or not isinstance(recipient, str):
+                _bad_request("alert_channels entries must contain a supported channel and string recipient")
+            validated_channels.append({"channel": channel_name, "recipient": recipient})
+        else:
+            _bad_request("alert_channels entries must be channel names or objects")
+    schedule["alert_channels"] = validated_channels
+
+    saved = create_monitoring_schedule(
+        current_user_id(),
+        dataset_id,
+        schedule,
+        interval_seconds,
+    )
+    return saved
+
+
+@app.patch("/api/schedules/{schedule_id}")
+def update_monitoring_schedule_endpoint(schedule_id: str, payload: dict[str, Any]):
+    enabled = payload.get("enabled")
+    if not isinstance(enabled, bool):
+        _bad_request("enabled must be a boolean")
+    if not set_monitoring_schedule_enabled(schedule_id, enabled):
+        raise HTTPException(status_code=404, detail="Monitoring schedule was not found")
+    return {"id": schedule_id, "enabled": enabled}
+
+
+@app.delete("/api/schedules/{schedule_id}")
+def delete_monitoring_schedule_endpoint(schedule_id: str):
+    if not delete_monitoring_schedule(schedule_id):
+        raise HTTPException(status_code=404, detail="Monitoring schedule was not found")
+    return {"deleted": True, "id": schedule_id}
 
 
 @app.get("/api/configurations")

@@ -94,6 +94,22 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             window_started REAL NOT NULL,
             blocked_until REAL NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS monitoring_schedules (
+            id TEXT PRIMARY KEY,
+            owner_id TEXT NOT NULL,
+            dataset_id TEXT NOT NULL REFERENCES datasets(id) ON DELETE CASCADE,
+            schedule TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            next_run_at REAL NOT NULL,
+            last_started_at REAL,
+            last_run_at REAL,
+            last_status TEXT NOT NULL DEFAULT 'pending',
+            last_error TEXT,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_monitoring_schedules_due
+            ON monitoring_schedules(enabled, next_run_at);
         CREATE INDEX IF NOT EXISTS idx_audit_records_timestamp
             ON audit_records(timestamp DESC);
         CREATE TABLE IF NOT EXISTS alerts (
@@ -260,6 +276,201 @@ def clear_login_failures(client_key: str) -> None:
     with connect_database() as connection:
         connection.execute(
             "DELETE FROM login_attempts WHERE client_key = ?", (client_key,)
+        )
+
+
+def create_monitoring_schedule(
+    owner_id: str,
+    dataset_id: str,
+    schedule: dict[str, Any],
+    interval_seconds: int,
+) -> dict[str, Any]:
+    now = time.time()
+    schedule_id = uuid.uuid4().hex
+    with connect_database() as connection:
+        connection.execute(
+            "INSERT INTO monitoring_schedules "
+            "(id, owner_id, dataset_id, schedule, enabled, next_run_at, "
+            "created_at, updated_at) VALUES (?, ?, ?, ?, 1, ?, ?, ?)",
+            (
+                schedule_id,
+                owner_id,
+                dataset_id,
+                _encode(schedule),
+                now + interval_seconds,
+                now,
+                now,
+            ),
+        )
+        _audit(
+            connection,
+            "created",
+            "monitoring_schedule",
+            schedule_id,
+            {"dataset_id": dataset_id, "interval_seconds": interval_seconds},
+            owner_id,
+        )
+    return get_monitoring_schedule(schedule_id, owner_id)
+
+
+def get_monitoring_schedule(
+    schedule_id: str, owner_id: str | None = None
+) -> dict[str, Any] | None:
+    with connect_database() as connection:
+        if owner_id is None:
+            row = connection.execute(
+                "SELECT * FROM monitoring_schedules WHERE id = ?", (schedule_id,)
+            ).fetchone()
+        else:
+            row = connection.execute(
+                "SELECT * FROM monitoring_schedules WHERE id = ? AND owner_id = ?",
+                (schedule_id, owner_id),
+            ).fetchone()
+    return _schedule_record(row) if row is not None else None
+
+
+def _schedule_record(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "owner_id": row["owner_id"],
+        "dataset_id": row["dataset_id"],
+        "schedule": _decode(row["schedule"], {}),
+        "enabled": bool(row["enabled"]),
+        "next_run_at": row["next_run_at"],
+        "last_started_at": row["last_started_at"],
+        "last_run_at": row["last_run_at"],
+        "last_status": row["last_status"],
+        "last_error": row["last_error"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def list_monitoring_schedules(owner_id: str | None = None) -> list[dict[str, Any]]:
+    with connect_database() as connection:
+        if owner_id is None:
+            rows = connection.execute(
+                "SELECT * FROM monitoring_schedules ORDER BY created_at DESC"
+            ).fetchall()
+        else:
+            rows = connection.execute(
+                "SELECT * FROM monitoring_schedules WHERE owner_id = ? "
+                "ORDER BY created_at DESC",
+                (owner_id,),
+            ).fetchall()
+    return [_schedule_record(row) for row in rows]
+
+
+def set_monitoring_schedule_enabled(
+    schedule_id: str, enabled: bool, owner_id: str | None = None
+) -> bool:
+    now = time.time()
+    with connect_database() as connection:
+        if owner_id is None:
+            cursor = connection.execute(
+                "UPDATE monitoring_schedules SET enabled = ?, "
+                "last_status = CASE WHEN ? THEN 'pending' ELSE 'paused' END, "
+                "updated_at = ? WHERE id = ?",
+                (int(enabled), int(enabled), now, schedule_id),
+            )
+        else:
+            cursor = connection.execute(
+                "UPDATE monitoring_schedules SET enabled = ?, "
+                "last_status = CASE WHEN ? THEN 'pending' ELSE 'paused' END, "
+                "updated_at = ? WHERE id = ? AND owner_id = ?",
+                (int(enabled), int(enabled), now, schedule_id, owner_id),
+            )
+        if cursor.rowcount:
+            _audit(
+                connection,
+                "enabled" if enabled else "paused",
+                "monitoring_schedule",
+                schedule_id,
+                {},
+                owner_id,
+            )
+    return cursor.rowcount > 0
+
+
+def delete_monitoring_schedule(
+    schedule_id: str, owner_id: str | None = None
+) -> bool:
+    with connect_database() as connection:
+        if owner_id is None:
+            cursor = connection.execute(
+                "DELETE FROM monitoring_schedules WHERE id = ?", (schedule_id,)
+            )
+        else:
+            cursor = connection.execute(
+                "DELETE FROM monitoring_schedules WHERE id = ? AND owner_id = ?",
+                (schedule_id, owner_id),
+            )
+        if cursor.rowcount:
+            _audit(
+                connection,
+                "deleted",
+                "monitoring_schedule",
+                schedule_id,
+                {},
+                owner_id,
+            )
+    return cursor.rowcount > 0
+
+
+def claim_due_monitoring_schedules(
+    now: float | None = None, limit: int = 20
+) -> list[dict[str, Any]]:
+    current_time = time.time() if now is None else now
+    claimed = []
+    with connect_database() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        rows = connection.execute(
+            "SELECT * FROM monitoring_schedules "
+            "WHERE enabled = 1 AND next_run_at <= ? "
+            "ORDER BY next_run_at LIMIT ?",
+            (current_time, limit),
+        ).fetchall()
+        for row in rows:
+            schedule = _schedule_record(row)
+            interval = int(schedule["schedule"]["interval_seconds"])
+            next_run = max(float(row["next_run_at"]), current_time) + interval
+            connection.execute(
+                "UPDATE monitoring_schedules SET next_run_at = ?, "
+                "last_started_at = ?, last_status = 'running', last_error = NULL, "
+                "updated_at = ? WHERE id = ? AND enabled = 1 AND next_run_at <= ?",
+                (next_run, current_time, current_time, row["id"], current_time),
+            )
+            claimed.append(schedule)
+    return claimed
+
+
+def finish_monitoring_schedule(
+    schedule_id: str,
+    succeeded: bool,
+    error: str | None = None,
+    finished_at: float | None = None,
+) -> None:
+    now = time.time() if finished_at is None else finished_at
+    status = "succeeded" if succeeded else "failed"
+    with connect_database() as connection:
+        row = connection.execute(
+            "SELECT owner_id FROM monitoring_schedules WHERE id = ?",
+            (schedule_id,),
+        ).fetchone()
+        if row is None:
+            return
+        connection.execute(
+            "UPDATE monitoring_schedules SET last_run_at = ?, last_status = ?, "
+            "last_error = ?, updated_at = ? WHERE id = ?",
+            (now, status, error[:1000] if error else None, now, schedule_id),
+        )
+        _audit(
+            connection,
+            "run_succeeded" if succeeded else "run_failed",
+            "monitoring_schedule",
+            schedule_id,
+            {"error": error[:1000] if error else None},
+            row["owner_id"],
         )
 
 
