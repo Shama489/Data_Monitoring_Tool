@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import pandas as pd
@@ -217,6 +218,212 @@ def _render_history(
             st.info("No alerts have been recorded.")
 
 
+def _render_schedules(
+    api_base_url: str,
+    headers: dict[str, str],
+    role: str,
+    datasets: list[dict[str, Any]],
+    schedules: list[dict[str, Any]],
+) -> None:
+    st.subheader("Recurring monitoring schedules")
+    if schedules:
+        schedule_rows = [
+            {
+                "schedule_id": item["id"],
+                "dataset_id": item["dataset_id"],
+                "checks": ", ".join(item["schedule"].get("checks", [])),
+                "interval_minutes": item["schedule"].get("interval_seconds", 0) // 60,
+                "enabled": item["enabled"],
+                "next_run": pd.to_datetime(item["next_run_at"], unit="s", utc=True),
+                "last_run": (
+                    pd.to_datetime(item["last_run_at"], unit="s", utc=True)
+                    if item["last_run_at"] is not None else None
+                ),
+                "last_status": item["last_status"],
+                "last_error": item["last_error"],
+            }
+            for item in schedules
+        ]
+        st.dataframe(pd.DataFrame(schedule_rows), use_container_width=True, hide_index=True)
+        for item in schedules:
+            with st.expander(f"{item['id']} · {item['last_status']}"):
+                left, right = st.columns(2)
+                action = "Pause" if item["enabled"] else "Resume"
+                if left.button(action, key=f"schedule-toggle-{item['id']}"):
+                    try:
+                        response = requests.patch(
+                            f"{api_base_url}/api/schedules/{item['id']}",
+                            headers=headers,
+                            json={"enabled": not item["enabled"]},
+                            timeout=20,
+                        )
+                    except requests.RequestException as error:
+                        st.error(f"Could not update schedule: {error}")
+                    else:
+                        if response.status_code == 200:
+                            st.rerun()
+                        else:
+                            st.error(response.json().get("detail", "Could not update schedule."))
+                if right.button("Delete", key=f"schedule-delete-{item['id']}"):
+                    try:
+                        response = requests.delete(
+                            f"{api_base_url}/api/schedules/{item['id']}",
+                            headers=headers,
+                            timeout=20,
+                        )
+                    except requests.RequestException as error:
+                        st.error(f"Could not delete schedule: {error}")
+                    else:
+                        if response.status_code == 200:
+                            st.rerun()
+                        else:
+                            st.error(response.json().get("detail", "Could not delete schedule."))
+    else:
+        st.info("No recurring schedules are configured.")
+
+    if role == "viewer":
+        st.info("Viewer access is read-only; an analyst or administrator can create schedules.")
+        return
+    if not datasets:
+        st.info("Save a dataset before creating a recurring schedule.")
+        return
+
+    with st.expander("Create a recurring monitoring schedule", expanded=not schedules):
+        dataset_options = {
+            f"{item['name']} · {item['id']}": item for item in datasets
+        }
+        selected_label = st.selectbox(
+            "Scheduled dataset", list(dataset_options), key="schedule-dataset"
+        )
+        selected_dataset = dataset_options[selected_label]
+        dataset_response = _get(
+            api_base_url,
+            headers,
+            f"/api/datasets/{selected_dataset['id']}",
+        )
+        frame = (
+            pd.DataFrame(dataset_response.get("data", []))
+            if dataset_response is not None else pd.DataFrame()
+        )
+        columns = [str(column) for column in frame.columns]
+        date_columns = [
+            column for column in columns
+            if "date" in column.lower() or "time" in column.lower()
+        ]
+        numeric_columns = list(frame.select_dtypes(include="number").columns)
+        selected_checks = st.multiselect(
+            "Recurring checks",
+            ["quality", "drift", "anomalies", "forecast", "explain"],
+            default=["quality"],
+            key="schedule-checks",
+        )
+        interval_minutes = st.number_input(
+            "Run every (minutes)",
+            min_value=1,
+            max_value=44_640,
+            value=60,
+            step=1,
+            key="schedule-interval",
+        )
+        timestamp_column = st.selectbox(
+            "Freshness timestamp column",
+            ["None"] + columns,
+            key="schedule-timestamp",
+        )
+        max_age_hours = None
+        if timestamp_column != "None":
+            max_age_hours = st.number_input(
+                "Maximum data age (hours)",
+                min_value=0.01,
+                value=24.0,
+                step=1.0,
+                key="schedule-max-age",
+            )
+        baseline_id = None
+        if "drift" in selected_checks:
+            baselines = {
+                f"{item['name']} · {item['id']}": item
+                for item in datasets if item["id"] != selected_dataset["id"]
+            }
+            if baselines:
+                baseline_label = st.selectbox(
+                    "Drift baseline", list(baselines), key="schedule-baseline"
+                )
+                baseline_id = baselines[baseline_label]["id"]
+            else:
+                st.warning("Add a second dataset to schedule drift checks.")
+        date_column = None
+        value_column = None
+        if "forecast" in selected_checks and date_columns:
+            date_column = st.selectbox(
+                "Forecast date column", date_columns, key="schedule-date-column"
+            )
+            value_column = st.selectbox(
+                "Forecast metric",
+                ["Row volume"] + numeric_columns,
+                key="schedule-value-column",
+            )
+        elif "forecast" in selected_checks:
+            st.warning("This dataset has no detected date/time column.")
+        target_column = None
+        if "explain" in selected_checks and columns:
+            target_column = st.selectbox(
+                "XAI target column", columns, key="schedule-target-column"
+            )
+        channels_json = st.text_input(
+            "Alert channels JSON (optional)",
+            value="[]",
+            help='Examples: ["email"] or [{"channel":"email","recipient":"alerts@example.com"}]',
+            key="schedule-alert-channels",
+        )
+        st.caption(
+            "Alerts are sent only when at least one channel is configured and the run detects a finding."
+        )
+        if st.button("Save schedule", type="primary", key="save-schedule"):
+            if not selected_checks:
+                st.error("Select at least one monitoring check.")
+            elif "drift" in selected_checks and baseline_id is None:
+                st.error("Select a baseline dataset for drift monitoring.")
+            elif "forecast" in selected_checks and date_column is None:
+                st.error("Select a date column for forecast monitoring.")
+            else:
+                try:
+                    channels = json.loads(channels_json)
+                    if not isinstance(channels, list):
+                        raise ValueError("Alert channels must be a JSON list.")
+                    payload: dict[str, Any] = {
+                        "dataset_id": selected_dataset["id"],
+                        "interval_seconds": int(interval_minutes * 60),
+                        "checks": selected_checks,
+                        "alert_channels": channels,
+                    }
+                    if timestamp_column != "None":
+                        payload["timestamp_column"] = timestamp_column
+                        payload["max_age_hours"] = max_age_hours
+                    if baseline_id is not None:
+                        payload["baseline_dataset_id"] = baseline_id
+                    if date_column:
+                        payload["date_column"] = date_column
+                    if value_column:
+                        payload["value_column"] = None if value_column == "Row volume" else value_column
+                    if target_column:
+                        payload["target_column"] = target_column
+                    response = requests.post(
+                        f"{api_base_url}/api/schedules",
+                        headers=headers,
+                        json=payload,
+                        timeout=30,
+                    )
+                except (requests.RequestException, ValueError) as error:
+                    st.error(f"Could not create schedule: {error}")
+                else:
+                    if response.status_code == 201:
+                        st.success(f"Schedule created: `{response.json()['id']}`")
+                        st.rerun()
+                    else:
+                        st.error(response.json().get("detail", "Could not create schedule."))
+
+
 def render_monitoring_dashboard(
     api_base_url: str,
     headers: dict[str, str],
@@ -235,9 +442,13 @@ def render_monitoring_dashboard(
     if results_payload is None:
         return
     results = results_payload.get("results") or []
+    schedules_payload = _get(api_base_url, headers, "/api/schedules")
+    if schedules_payload is None:
+        return
+    schedules = schedules_payload.get("schedules") or []
 
-    overview_tab, run_tab, history_tab = st.tabs(
-        ["Overview", "Run monitoring", "History & alerts"]
+    overview_tab, run_tab, schedules_tab, history_tab = st.tabs(
+        ["Overview", "Run monitoring", "Schedules", "History & alerts"]
     )
     with overview_tab:
         _render_overview(results)
@@ -341,6 +552,15 @@ def render_monitoring_dashboard(
                         st.rerun()
         if st.session_state.get("dashboard_latest_run_id"):
             st.caption(f"Most recent run: `{st.session_state['dashboard_latest_run_id']}`")
+
+    with schedules_tab:
+        _render_schedules(
+            api_base_url,
+            headers,
+            role,
+            datasets,
+            schedules,
+        )
 
     with history_tab:
         _render_history(api_base_url, headers, results, role)

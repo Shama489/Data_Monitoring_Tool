@@ -287,6 +287,7 @@ def create_monitoring_schedule(
 ) -> dict[str, Any]:
     now = time.time()
     schedule_id = uuid.uuid4().hex
+    persisted_schedule = {**schedule, "interval_seconds": interval_seconds}
     with connect_database() as connection:
         connection.execute(
             "INSERT INTO monitoring_schedules "
@@ -296,7 +297,7 @@ def create_monitoring_schedule(
                 schedule_id,
                 owner_id,
                 dataset_id,
-                _encode(schedule),
+                _encode(persisted_schedule),
                 now + interval_seconds,
                 now,
                 now,
@@ -427,8 +428,9 @@ def claim_due_monitoring_schedules(
         rows = connection.execute(
             "SELECT * FROM monitoring_schedules "
             "WHERE enabled = 1 AND next_run_at <= ? "
+            "AND (last_status != 'running' OR last_started_at <= ?) "
             "ORDER BY next_run_at LIMIT ?",
-            (current_time, limit),
+            (current_time, current_time - 3600, limit),
         ).fetchall()
         for row in rows:
             schedule = _schedule_record(row)
@@ -437,10 +439,19 @@ def claim_due_monitoring_schedules(
             connection.execute(
                 "UPDATE monitoring_schedules SET next_run_at = ?, "
                 "last_started_at = ?, last_status = 'running', last_error = NULL, "
-                "updated_at = ? WHERE id = ? AND enabled = 1 AND next_run_at <= ?",
-                (next_run, current_time, current_time, row["id"], current_time),
+                "updated_at = ? WHERE id = ? AND enabled = 1 AND next_run_at <= ? "
+                "AND (last_status != 'running' OR last_started_at <= ?)",
+                (
+                    next_run,
+                    current_time,
+                    current_time,
+                    row["id"],
+                    current_time,
+                    current_time - 3600,
+                ),
             )
-            claimed.append(schedule)
+            if connection.execute("SELECT changes()").fetchone()[0]:
+                claimed.append(schedule)
     return claimed
 
 
@@ -593,12 +604,13 @@ def get_dataset(dataset_id: str, owner_id: str | None = None) -> dict[str, Any] 
     with connect_database() as connection:
         if owner_id is None:
             row = connection.execute(
-                "SELECT id, name, source, data, created_at FROM datasets WHERE id = ?",
+                "SELECT id, name, source, data, created_at, owner_id "
+                "FROM datasets WHERE id = ?",
                 (dataset_id,),
             ).fetchone()
         else:
             row = connection.execute(
-                "SELECT id, name, source, data, created_at FROM datasets "
+                "SELECT id, name, source, data, created_at, owner_id FROM datasets "
                 "WHERE id = ? AND owner_id = ?",
                 (dataset_id, owner_id),
             ).fetchone()
@@ -610,6 +622,7 @@ def get_dataset(dataset_id: str, owner_id: str | None = None) -> dict[str, Any] 
         "source": _decode(row["source"], {}),
         "data": decrypt_data(row["data"]),
         "created_at": row["created_at"],
+        "owner_id": row["owner_id"],
     }
 
 

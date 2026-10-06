@@ -83,6 +83,24 @@ Monitoring workflows automatically persist their input datasets and result.
 Saved datasets can be monitored again by passing their `dataset_id` to
 `POST /api/monitoring/analyze`.
 
+## Real-time and scheduled monitoring
+
+The API runs a persistent scheduler worker during application startup. Create a
+recurring check with `POST /api/schedules` using an owned `dataset_id`,
+`interval_seconds` (60 seconds to 31 days), selected checks, and optional
+freshness settings (`timestamp_column` plus `max_age_hours`). A freshness
+schedule always includes the quality check. Drift schedules also require an
+owned `baseline_dataset_id`; forecasts and explanations require the date and
+target columns. Add `alert_channels` (for example
+`[{"channel":"email","recipient":"ops@example.com"}]`) to deliver notifications
+when a scheduled run finds an issue. Every run is persisted in monitoring
+history; `GET /api/schedules` reports the next run and most recent status. Pause
+or resume with `PATCH /api/schedules/{id}` and remove a job with
+`DELETE /api/schedules/{id}`. Administrators can manage all schedules; analysts
+can manage the schedules they own. Due jobs are claimed transactionally in
+SQLite so multiple API workers do not normally launch the same run at once.
+The dashboard's **Schedules** tab provides the same controls.
+
 ## Run the Monitoring Dashboard
 
 Start the interactive dashboard in a second terminal:

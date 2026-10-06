@@ -173,6 +173,9 @@ def run_monitoring(
         "root_cause": root_cause,
         "notifications": notifications,
     }
+    if payload.get("scheduled") is True and isinstance(payload.get("schedule_id"), str):
+        response["schedule_id"] = payload["schedule_id"]
+        response["scheduled"] = True
     dataset_name = payload.get("dataset_name") or payload.get("name")
     if not isinstance(dataset_name, str) or not dataset_name.strip():
         source = payload.get("source")

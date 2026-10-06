@@ -1,6 +1,6 @@
 Fully missing Features
 
-- Data freshness alerts and scheduled freshness monitoring
+- ✅ Scheduled recurring quality, drift, anomaly, forecast, and XAI checks with freshness monitoring and alert delivery
 - Natural-language querying
 - AutoML model selection
 - Root-cause analysis

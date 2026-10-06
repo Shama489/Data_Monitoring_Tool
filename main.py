@@ -74,14 +74,16 @@ from monitoring_store import (
 from scheduled_monitoring import scheduler_loop
 
 @asynccontextmanager
-async def lifespan(_app: FastAPI):
+async def lifespan(app: FastAPI):
     worker = asyncio.create_task(scheduler_loop(), name="scheduled-monitoring")
+    app.state.scheduler_task = worker
     try:
         yield
     finally:
         worker.cancel()
         with suppress(asyncio.CancelledError):
             await worker
+        del app.state.scheduler_task
 
 
 app = FastAPI(title="Data Monitoring Tool", lifespan=lifespan)
@@ -673,8 +675,11 @@ def create_monitoring_schedule_endpoint(payload: dict[str, Any]):
     if "drift" in checks:
         if not isinstance(baseline_id, str) or not baseline_id.strip():
             _bad_request("baseline_dataset_id is required when drift is selected")
-        if get_dataset(baseline_id, owner_id=current_user_scope()) is None:
+        baseline_dataset = get_dataset(baseline_id, owner_id=current_user_scope())
+        if baseline_dataset is None:
             raise HTTPException(status_code=404, detail="Baseline dataset was not found")
+        if baseline_dataset.get("owner_id") != dataset.get("owner_id"):
+            _bad_request("Current and baseline datasets must have the same owner")
     elif baseline_id is not None:
         _bad_request("baseline_dataset_id can only be set when drift is selected")
 
@@ -702,6 +707,7 @@ def create_monitoring_schedule_endpoint(payload: dict[str, Any]):
     schedule: dict[str, Any] = {
         "checks": checks,
         "quality_options": quality_options,
+        "run_owner_id": dataset.get("owner_id"),
     }
     if baseline_id is not None:
         schedule["baseline_dataset_id"] = baseline_id
@@ -715,12 +721,35 @@ def create_monitoring_schedule_endpoint(payload: dict[str, Any]):
         _bad_request("date_column is required when forecast is selected")
     if "explain" in checks and not schedule.get("target_column"):
         _bad_request("target_column is required when explain is selected")
-    for key, default in (("periods", 4), ("frequency", "W"), ("method", "auto"),
-                         ("task", "classification"), ("test_size", 0.2)):
-        if key in payload:
-            schedule[key] = payload[key]
-        else:
-            schedule[key] = default
+    try:
+        periods = int(payload.get("periods", 4))
+        test_size = float(payload.get("test_size", 0.2))
+    except (TypeError, ValueError):
+        _bad_request("periods and test_size must be valid numbers")
+    frequency = payload.get("frequency", "W")
+    method = payload.get("method", "auto")
+    task = payload.get("task", "classification")
+    if not 1 <= periods <= 365:
+        _bad_request("periods must be between 1 and 365")
+    if not isinstance(frequency, str) or not frequency.strip():
+        _bad_request("frequency must be a non-empty string")
+    try:
+        pd.tseries.frequencies.to_offset(frequency)
+    except ValueError:
+        _bad_request("frequency is not a supported pandas offset")
+    if method not in {"auto", "arima", "linear", "prophet", "lstm"}:
+        _bad_request("method must be auto, arima, linear, prophet, or lstm")
+    if task not in {"classification", "regression"}:
+        _bad_request("task must be classification or regression")
+    if not math.isfinite(test_size) or not 0.1 <= test_size <= 0.5:
+        _bad_request("test_size must be between 0.1 and 0.5")
+    schedule.update({
+        "periods": periods,
+        "frequency": frequency,
+        "method": method,
+        "task": task,
+        "test_size": test_size,
+    })
 
     channels = _notification_channels(payload)
     if not isinstance(channels, list):
@@ -756,14 +785,18 @@ def update_monitoring_schedule_endpoint(schedule_id: str, payload: dict[str, Any
     enabled = payload.get("enabled")
     if not isinstance(enabled, bool):
         _bad_request("enabled must be a boolean")
-    if not set_monitoring_schedule_enabled(schedule_id, enabled):
+    if not set_monitoring_schedule_enabled(
+        schedule_id, enabled, owner_id=current_user_scope()
+    ):
         raise HTTPException(status_code=404, detail="Monitoring schedule was not found")
     return {"id": schedule_id, "enabled": enabled}
 
 
 @app.delete("/api/schedules/{schedule_id}")
 def delete_monitoring_schedule_endpoint(schedule_id: str):
-    if not delete_monitoring_schedule(schedule_id):
+    if not delete_monitoring_schedule(
+        schedule_id, owner_id=current_user_scope()
+    ):
         raise HTTPException(status_code=404, detail="Monitoring schedule was not found")
     return {"deleted": True, "id": schedule_id}
 
