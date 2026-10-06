@@ -41,6 +41,7 @@ _WRITE_PATHS = {
     "/api/notifications/send",
     "/api/datasets",
     "/api/datasets/upload",
+    "/api/schedules",
     "/api/data-quality/analyze",
     "/api/data-quality/analyze-csv",
     "/api/drift/analyze",
@@ -302,6 +303,11 @@ async def authentication_middleware(request: Request, call_next):
         elif any(path == prefix or path.startswith(prefix + "/") for prefix in _ADMIN_ONLY_PATHS):
             if user["role"] != "admin":
                 return JSONResponse(status_code=403, content={"detail": "Admin role required"})
+        elif (
+            method in {"PUT", "PATCH", "DELETE"}
+            and path.startswith("/api/schedules/")
+        ):
+            pass
         elif method in {"PUT", "PATCH", "DELETE"} and user["role"] != "admin":
             return JSONResponse(status_code=403, content={"detail": "Admin role required"})
         elif method == "POST" and user["role"] == "viewer" and path not in _READ_ONLY_POST_PATHS:

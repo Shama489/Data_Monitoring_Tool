@@ -6,6 +6,7 @@ from agents.root_cause_agent import investigate
 from monitoring_store import persist_monitoring_run
 from profiler import answer_monitoring_question
 from tools.data_tools import dataframe_from_value, load_dataset
+from tools.anomaly_tools import analyze_anomalies
 from tools.drift_tools import analyze_drift
 from tools.ml_tools import forecast_data
 from tools.notification_tools import send_monitoring_notification
@@ -43,6 +44,7 @@ def build_tool_registry() -> ToolRegistry:
     registry.register("data.load", "Load a dataset from inline records or a configured source.", load_dataset)
     registry.register("quality.analyze", "Run deterministic data quality, schema, freshness, and rule checks.", analyze_quality)
     registry.register("drift.analyze", "Compare current data with a baseline and calculate feature drift.", analyze_drift)
+    registry.register("anomalies.analyze", "Detect anomalous rows in numeric features.", analyze_anomalies)
     registry.register("forecast.run", "Forecast a selected metric using the existing forecasting methods.", forecast_data)
     registry.register("xai.explain", "Train and explain a model with holdout evaluation and optional SHAP output.", explain_model)
     registry.register("assistant.answer", "Answer natural-language questions about data quality, missing values, anomalies, drift, and monitoring results.", answer_monitoring_question)
@@ -67,8 +69,8 @@ def run_monitoring(
             checks.append("drift")
     if not isinstance(checks, list) or not checks or not all(isinstance(check, str) for check in checks):
         raise ValueError("checks must be a non-empty list containing quality and/or drift")
-    if any(check not in {"quality", "drift", "forecast", "explain"} for check in checks):
-        raise ValueError("checks may contain only quality, drift, forecast, and explain")
+    if any(check not in {"quality", "drift", "anomalies", "forecast", "explain"} for check in checks):
+        raise ValueError("checks may contain only quality, drift, anomalies, forecast, and explain")
     checks = list(dict.fromkeys(checks))
 
     registry = build_tool_registry()
@@ -102,6 +104,10 @@ def run_monitoring(
             baseline = dataframe_from_value(baseline_data, "Baseline dataset")
         results["drift"] = registry.run("drift.analyze", baseline=baseline, current=frame)
         trace.append({"tool": "drift.analyze", "status": "completed"})
+
+    if "anomalies" in checks:
+        results["anomalies"] = registry.run("anomalies.analyze", frame=frame)
+        trace.append({"tool": "anomalies.analyze", "status": "completed"})
 
     if "forecast" in checks:
         results["forecast"] = registry.run(
@@ -167,6 +173,9 @@ def run_monitoring(
         "root_cause": root_cause,
         "notifications": notifications,
     }
+    if payload.get("scheduled") is True and isinstance(payload.get("schedule_id"), str):
+        response["schedule_id"] = payload["schedule_id"]
+        response["scheduled"] = True
     dataset_name = payload.get("dataset_name") or payload.get("name")
     if not isinstance(dataset_name, str) or not dataset_name.strip():
         source = payload.get("source")
