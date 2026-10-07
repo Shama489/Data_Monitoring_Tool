@@ -62,8 +62,13 @@ def _result_rows(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
         result = item.get("result") or {}
         checks = result.get("results") or {}
         quality = checks.get("quality") or {}
+        comparison_quality = (result.get("quality") or {}).get("current") or {}
         score = (quality.get("quality_score") or {}).get("overall_score")
+        if score is None:
+            score = comparison_quality.get("quality_score")
         drift = checks.get("drift") or {}
+        if not drift and isinstance(result.get("distribution_drift"), dict):
+            drift = result["distribution_drift"]
         anomaly = checks.get("anomalies") or {}
         rows.append(
             {
@@ -169,38 +174,41 @@ def _render_history(
         )
         if detail is not None:
             report = detail.get("result") or {}
-            checks = report.get("results") or {}
-            quality, drift, anomalies, forecasts, xai = st.tabs(
-                ["Quality", "Drift", "Anomalies", "Forecasts", "XAI"]
-            )
-            with quality:
-                st.json(checks.get("quality", {}))
-            with drift:
-                st.json(checks.get("drift", {}))
-            with anomalies:
-                st.json(checks.get("anomalies", {}))
-            with forecasts:
-                forecast = checks.get("forecast")
-                if isinstance(forecast, dict) and "forecast" in forecast:
-                    frame = pd.DataFrame(forecast["history"] + forecast["forecast"])
-                    frame["kind"] = ["History"] * len(forecast["history"]) + ["Forecast"] * len(forecast["forecast"])
-                    figure = px.line(
-                        frame,
-                        x="date",
-                        y="value",
-                        color="kind",
-                        markers=True,
-                        title=f"Forecast · {forecast.get('metric', 'row_volume')}",
-                    )
-                    st.plotly_chart(figure, use_container_width=True)
-                    if forecast.get("fallback_reason"):
-                        st.warning(forecast["fallback_reason"])
-                else:
-                    st.info("This result has no forecast output.")
-                st.json(forecast or {})
-            with xai:
-                st.json(checks.get("explanation", {}))
-            st.json(report.get("root_cause", {}))
+            if "schema" in report and "quality" in report:
+                st.json(report)
+            else:
+                checks = report.get("results") or {}
+                quality, drift, anomalies, forecasts, xai = st.tabs(
+                    ["Quality", "Drift", "Anomalies", "Forecasts", "XAI"]
+                )
+                with quality:
+                    st.json(checks.get("quality", {}))
+                with drift:
+                    st.json(checks.get("drift", {}))
+                with anomalies:
+                    st.json(checks.get("anomalies", {}))
+                with forecasts:
+                    forecast = checks.get("forecast")
+                    if isinstance(forecast, dict) and "forecast" in forecast:
+                        frame = pd.DataFrame(forecast["history"] + forecast["forecast"])
+                        frame["kind"] = ["History"] * len(forecast["history"]) + ["Forecast"] * len(forecast["forecast"])
+                        figure = px.line(
+                            frame,
+                            x="date",
+                            y="value",
+                            color="kind",
+                            markers=True,
+                            title=f"Forecast · {forecast.get('metric', 'row_volume')}",
+                        )
+                        st.plotly_chart(figure, use_container_width=True)
+                        if forecast.get("fallback_reason"):
+                            st.warning(forecast["fallback_reason"])
+                    else:
+                        st.info("This result has no forecast output.")
+                    st.json(forecast or {})
+                with xai:
+                    st.json(checks.get("explanation", {}))
+                st.json(report.get("root_cause", {}))
     else:
         st.info("No saved results are available yet.")
 
@@ -216,6 +224,150 @@ def _render_history(
             st.dataframe(pd.DataFrame(alert_rows), use_container_width=True, hide_index=True)
         else:
             st.info("No alerts have been recorded.")
+
+
+def _render_lineage_versions(
+    api_base_url: str,
+    headers: dict[str, str],
+    datasets: list[dict[str, Any]],
+    role: str,
+) -> None:
+    st.subheader("Dataset lineage and versions")
+    if not datasets:
+        st.info("Save a dataset to inspect its lineage or create versions.")
+        return
+    dataset_by_label = {
+        f"{item['name']} · v{item.get('version_number', 1)} · {item['id']}": item
+        for item in datasets
+    }
+    selected_label = st.selectbox(
+        "Dataset",
+        list(dataset_by_label),
+        key="lineage_dataset",
+    )
+    selected = dataset_by_label[selected_label]
+    lineage = _get(
+        api_base_url,
+        headers,
+        f"/api/datasets/{selected['id']}/lineage",
+    )
+    if lineage is None:
+        return
+    versions = lineage.get("versions") or []
+    events = lineage.get("events") or []
+    if events:
+        st.caption("Source, transformations, monitoring runs, and recorded failures")
+        st.dataframe(
+            pd.DataFrame([
+                {
+                    "time": pd.to_datetime(event.get("created_at"), unit="s", utc=True),
+                    "dataset": event.get("dataset_id"),
+                    "pipeline": event.get("pipeline"),
+                    "event": event.get("event_type"),
+                    "status": event.get("status"),
+                    "inputs": ", ".join(event.get("input_dataset_ids") or []),
+                    "result": event.get("result_id"),
+                    "error": event.get("error"),
+                }
+                for event in events
+            ]),
+            use_container_width=True,
+            hide_index=True,
+        )
+    else:
+        st.info("No lineage events are recorded for this dataset.")
+
+    st.caption("Immutable dataset version history")
+    st.dataframe(pd.DataFrame(versions), use_container_width=True, hide_index=True)
+    if len(versions) >= 2:
+        version_by_label = {
+            f"v{version['version_number']} · {version['id']}": version
+            for version in versions
+        }
+        version_labels = list(version_by_label)
+        baseline_label = st.selectbox(
+            "Baseline version",
+            version_labels,
+            index=0,
+            key="comparison_baseline_version",
+        )
+        current_label = st.selectbox(
+            "Compare with version",
+            version_labels,
+            index=len(version_labels) - 1,
+            key="comparison_current_version",
+        )
+        if st.button(
+            "Compare selected versions",
+            disabled=baseline_label == current_label,
+        ):
+            try:
+                response = requests.post(
+                    f"{api_base_url}/api/datasets/compare",
+                    headers=headers,
+                    json={
+                        "baseline_dataset_id": version_by_label[baseline_label]["id"],
+                        "current_dataset_id": version_by_label[current_label]["id"],
+                    },
+                    timeout=60,
+                )
+            except requests.RequestException as error:
+                st.error(f"Dataset comparison failed: {error}")
+            else:
+                if response.status_code != 200:
+                    st.error(response.json().get("detail", "Dataset comparison failed."))
+                else:
+                    st.json(response.json())
+
+    if role != "viewer":
+        with st.expander("Create a new version"):
+            detail = _get(
+                api_base_url,
+                headers,
+                f"/api/datasets/{selected['id']}",
+            )
+            if detail is not None:
+                version_data = st.text_area(
+                    "New version data (JSON records)",
+                    value=json.dumps(detail.get("data", []), indent=2, default=str),
+                    height=220,
+                    key=f"version_data_{selected['id']}",
+                )
+                change_summary = st.text_input(
+                    "Change summary",
+                    max_chars=1000,
+                    key=f"version_summary_{selected['id']}",
+                )
+                if st.button("Save dataset version"):
+                    try:
+                        parsed_data = json.loads(version_data)
+                    except json.JSONDecodeError as error:
+                        st.error(f"Version data must be valid JSON: {error}")
+                    else:
+                        try:
+                            response = requests.post(
+                                f"{api_base_url}/api/datasets/{selected['id']}/versions",
+                                headers=headers,
+                                json={
+                                    "data": parsed_data,
+                                    "change_summary": change_summary,
+                                },
+                                timeout=60,
+                            )
+                        except requests.RequestException as error:
+                            st.error(f"Could not create dataset version: {error}")
+                        else:
+                            if response.status_code == 201:
+                                st.success(
+                                    f"Created version v{response.json()['version_number']}."
+                                )
+                                st.rerun()
+                            else:
+                                st.error(
+                                    response.json().get(
+                                        "detail", "Could not create dataset version."
+                                    )
+                                )
 
 
 def _render_schedules(
@@ -447,8 +599,8 @@ def render_monitoring_dashboard(
         return
     schedules = schedules_payload.get("schedules") or []
 
-    overview_tab, run_tab, schedules_tab, history_tab = st.tabs(
-        ["Overview", "Run monitoring", "Schedules", "History & alerts"]
+    overview_tab, run_tab, lineage_tab, schedules_tab, history_tab = st.tabs(
+        ["Overview", "Run monitoring", "Lineage & versions", "Schedules", "History & alerts"]
     )
     with overview_tab:
         _render_overview(results)
@@ -561,6 +713,9 @@ def render_monitoring_dashboard(
             datasets,
             schedules,
         )
+
+    with lineage_tab:
+        _render_lineage_versions(api_base_url, headers, datasets, role)
 
     with history_tab:
         _render_history(api_base_url, headers, results, role)

@@ -10,6 +10,7 @@ from agents.monitoring_agent import run_monitoring
 from monitoring_store import (
     claim_due_monitoring_schedules,
     finish_monitoring_schedule,
+    record_lineage_event,
 )
 
 logger = logging.getLogger(__name__)
@@ -57,6 +58,21 @@ def run_due_schedules(now: float | None = None, limit: int = 20) -> int:
                 succeeded=False,
                 error=f"{type(error).__name__}: {error}",
             )
+            try:
+                record_lineage_event(
+                    item["dataset_id"],
+                    "monitoring_run",
+                    "scheduled_monitoring",
+                    "failed",
+                    input_dataset_ids=[item["dataset_id"]],
+                    details={"schedule_id": item["id"]},
+                    error=f"{type(error).__name__}: {error}"[:500],
+                )
+            except ValueError:
+                logger.warning(
+                    "Could not record lineage for failed schedule %s because its dataset is unavailable",
+                    item["id"],
+                )
         else:
             finish_monitoring_schedule(item["id"], succeeded=True)
     return len(schedules)

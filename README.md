@@ -83,6 +83,30 @@ Monitoring workflows automatically persist their input datasets and result.
 Saved datasets can be monitored again by passing their `dataset_id` to
 `POST /api/monitoring/analyze`.
 
+## Dataset lineage, versions, and comparison
+
+Datasets are immutable after creation. Create a new version with
+`POST /api/datasets/{id}/versions`, providing replacement `data` and an optional
+`change_summary`; each version links to its parent and is encrypted like any
+other saved dataset. List the full version chain with
+`GET /api/datasets/{id}/versions`.
+
+Compare two same-owner datasets or versions with
+`POST /api/datasets/compare` and `baseline_dataset_id` /
+`current_dataset_id`. The persisted comparison includes added, removed, and
+type-changed columns; row counts, missing values, duplicate rows, quality
+scores, and per-column distribution drift where shared columns are available.
+Comparisons appear in monitoring history.
+
+Dataset ingestion, version creation, successful monitoring and comparisons,
+and failed monitoring attempts are recorded in the lineage event store. Use
+`GET /api/datasets/{id}/lineage` to inspect the dataset's version family,
+provenance, pipeline stages, inputs, results, and failures. Events and versions
+are scoped to the dataset owner; analysts can create versions of their own
+datasets, while viewers have read-only access. The dashboard's **Lineage &
+versions** tab supports history inspection, side-by-side comparisons, and
+version creation.
+
 ## Real-time and scheduled monitoring
 
 The API runs a persistent scheduler worker during application startup. Create a
@@ -113,8 +137,8 @@ streamlit run xai_dashboard.py
 Sign in with the bootstrap administrator or an account created by an
 administrator. The default workspace combines quality scores, drift trends,
 anomaly counts, configurable monitoring runs, forecasts, XAI results, alert
-history, and saved historical reports. Users can upload or select datasets
-permitted by their role. The **Explainable AI** workspace retains the
+history, saved historical reports, and dataset lineage/version comparisons.
+Users can upload or select datasets permitted by their role. The **Explainable AI** workspace retains the
 standalone classification/regression workflow, target selection, holdout
 evaluation, feature importance, per-row SHAP explanations, and JSON download.
 
@@ -129,6 +153,8 @@ evaluation, feature importance, per-row SHAP explanations, and JSON download.
 - **Enterprise Source Monitoring**: Analyze multiple local files, SQL databases, MongoDB collections, and cloud objects in one request.
 - **Persistent Monitoring State**: Store datasets, analysis results, alert rules and history, configuration, and audit records in SQLite.
 - **Advanced Monitoring Dashboard**: Unified authenticated workspace for quality scores, drift and anomaly trends, configurable monitoring runs, forecasts, XAI reports, alerts, and historical results.
+- **Data Lineage & Pipeline Monitoring**: Owner-scoped provenance, immutable version links, monitoring/comparison pipeline stages, and recorded failures.
+- **Dataset Comparison & Versioning**: Create linked dataset versions and compare schema, types, quality, missing values, duplicates, and statistical drift.
 - **Authentication, RBAC & Security**: Multi-user bearer-token login, admin/analyst/viewer permissions, account administration, user-scoped datasets and results, password hashing, encrypted stored uploads, and request-size limits.
 - **AI-Powered Features**: Generate AI-style summaries, risk assessments, and recommended actions from the observed data quality issues.  
 - **Statistical Insights**: Generate descriptive statistics for numeric and categorical columns.  

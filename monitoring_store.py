@@ -46,7 +46,10 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             source TEXT NOT NULL,
             data TEXT NOT NULL,
             created_at REAL NOT NULL,
-            owner_id TEXT
+            owner_id TEXT,
+            parent_dataset_id TEXT REFERENCES datasets(id) ON DELETE SET NULL,
+            version_number INTEGER NOT NULL DEFAULT 1,
+            change_summary TEXT
         );
         CREATE TABLE IF NOT EXISTS monitoring_results (
             id TEXT PRIMARY KEY,
@@ -108,6 +111,23 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             created_at REAL NOT NULL,
             updated_at REAL NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS lineage_events (
+            id TEXT PRIMARY KEY,
+            dataset_id TEXT REFERENCES datasets(id) ON DELETE CASCADE,
+            event_type TEXT NOT NULL,
+            pipeline TEXT NOT NULL,
+            status TEXT NOT NULL,
+            input_dataset_ids TEXT NOT NULL,
+            result_id TEXT,
+            details TEXT NOT NULL,
+            error TEXT,
+            created_at REAL NOT NULL,
+            owner_id TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_lineage_events_dataset
+            ON lineage_events(dataset_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_lineage_events_owner
+            ON lineage_events(owner_id, created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_monitoring_schedules_due
             ON monitoring_schedules(enabled, next_run_at);
         CREATE INDEX IF NOT EXISTS idx_audit_records_timestamp
@@ -137,6 +157,16 @@ def _create_schema(connection: sqlite3.Connection) -> None:
         }
         if "owner_id" not in columns:
             connection.execute(f"ALTER TABLE {table} ADD COLUMN owner_id TEXT")
+        if table == "datasets":
+            for column, declaration in (
+                ("parent_dataset_id", "TEXT"),
+                ("version_number", "INTEGER NOT NULL DEFAULT 1"),
+                ("change_summary", "TEXT"),
+            ):
+                if column not in columns:
+                    connection.execute(
+                        f"ALTER TABLE datasets ADD COLUMN {column} {declaration}"
+                    )
 
 
 def _migrate_stored_content(connection: sqlite3.Connection) -> None:
@@ -572,23 +602,138 @@ def _audit(
     )
 
 
+def _record_lineage_event(
+    connection: sqlite3.Connection,
+    dataset_id: str,
+    event_type: str,
+    pipeline: str,
+    status: str,
+    input_dataset_ids: list[str] | None = None,
+    result_id: str | None = None,
+    details: Any = None,
+    error: str | None = None,
+    owner_id: str | None = None,
+) -> str:
+    dataset = connection.execute(
+        "SELECT owner_id FROM datasets WHERE id = ?", (dataset_id,)
+    ).fetchone()
+    if dataset is None or (
+        owner_id is not None and dataset["owner_id"] != owner_id
+    ):
+        raise ValueError(f"Stored dataset was not found: {dataset_id}")
+    event_id = uuid.uuid4().hex
+    connection.execute(
+        "INSERT INTO lineage_events "
+        "(id, dataset_id, event_type, pipeline, status, input_dataset_ids, "
+        "result_id, details, error, created_at, owner_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            event_id,
+            dataset_id,
+            event_type,
+            pipeline,
+            status,
+            _encode(input_dataset_ids or []),
+            result_id,
+            _encode(details or {}),
+            error,
+            time.time(),
+            dataset["owner_id"],
+        ),
+    )
+    return event_id
+
+
 def _insert_dataset(
     connection: sqlite3.Connection,
     name: str,
     data: Any,
     source: Any = None,
     owner_id: str | None = None,
+    parent_dataset_id: str | None = None,
+    version_number: int = 1,
+    change_summary: str | None = None,
 ) -> str:
     from auth_security import encrypt_data
 
     dataset_id = uuid.uuid4().hex
     connection.execute(
-        "INSERT INTO datasets (id, name, source, data, created_at, owner_id) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (dataset_id, name, _encode(source or {}), encrypt_data(data), time.time(), owner_id),
+        "INSERT INTO datasets "
+        "(id, name, source, data, created_at, owner_id, parent_dataset_id, "
+        "version_number, change_summary) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            dataset_id,
+            name,
+            _encode(source or {}),
+            encrypt_data(data),
+            time.time(),
+            owner_id,
+            parent_dataset_id,
+            version_number,
+            change_summary,
+        ),
     )
     _audit(connection, "created", "dataset", dataset_id, {"name": name}, owner_id)
+    if parent_dataset_id is None:
+        _record_lineage_event(
+            connection,
+            dataset_id,
+            "dataset_ingested",
+            "dataset_ingestion",
+            "succeeded",
+            details={"source": source or {"type": "inline"}},
+            owner_id=owner_id,
+        )
+    else:
+        _record_lineage_event(
+            connection,
+            dataset_id,
+            "dataset_version_created",
+            "dataset_versioning",
+            "succeeded",
+            input_dataset_ids=[parent_dataset_id],
+            details={"version_number": version_number, "change_summary": change_summary},
+            owner_id=owner_id,
+        )
     return dataset_id
+
+
+def create_dataset_version(
+    dataset_id: str,
+    name: str,
+    data: Any,
+    change_summary: str | None,
+    owner_id: str | None = None,
+) -> str | None:
+    with connect_database() as connection:
+        if owner_id is None:
+            parent = connection.execute(
+                "SELECT id, name, source, owner_id, version_number "
+                "FROM datasets WHERE id = ?",
+                (dataset_id,),
+            ).fetchone()
+        else:
+            parent = connection.execute(
+                "SELECT id, name, source, owner_id, version_number "
+                "FROM datasets WHERE id = ? AND owner_id = ?",
+                (dataset_id, owner_id),
+            ).fetchone()
+        if parent is None:
+            return None
+        return _insert_dataset(
+            connection,
+            name,
+            data,
+            {
+                "type": "dataset_version",
+                "parent_dataset_id": dataset_id,
+                "name": name,
+            },
+            parent["owner_id"],
+            parent_dataset_id=dataset_id,
+            version_number=parent["version_number"] + 1,
+            change_summary=change_summary,
+        )
 
 
 def save_dataset(
@@ -604,13 +749,15 @@ def get_dataset(dataset_id: str, owner_id: str | None = None) -> dict[str, Any] 
     with connect_database() as connection:
         if owner_id is None:
             row = connection.execute(
-                "SELECT id, name, source, data, created_at, owner_id "
+                "SELECT id, name, source, data, created_at, owner_id, "
+                "parent_dataset_id, version_number, change_summary "
                 "FROM datasets WHERE id = ?",
                 (dataset_id,),
             ).fetchone()
         else:
             row = connection.execute(
-                "SELECT id, name, source, data, created_at, owner_id FROM datasets "
+                "SELECT id, name, source, data, created_at, owner_id, "
+                "parent_dataset_id, version_number, change_summary FROM datasets "
                 "WHERE id = ? AND owner_id = ?",
                 (dataset_id, owner_id),
             ).fetchone()
@@ -623,7 +770,122 @@ def get_dataset(dataset_id: str, owner_id: str | None = None) -> dict[str, Any] 
         "data": decrypt_data(row["data"]),
         "created_at": row["created_at"],
         "owner_id": row["owner_id"],
+        "parent_dataset_id": row["parent_dataset_id"],
+        "version_number": row["version_number"],
+        "change_summary": row["change_summary"],
     }
+
+
+def list_dataset_versions(
+    dataset_id: str, owner_id: str | None = None
+) -> list[dict[str, Any]] | None:
+    with connect_database() as connection:
+        query = """
+            WITH RECURSIVE ancestors(id, parent_dataset_id) AS (
+                SELECT id, parent_dataset_id FROM datasets
+                WHERE id = ? AND (? IS NULL OR owner_id = ?)
+                UNION ALL
+                SELECT parent.id, parent.parent_dataset_id
+                FROM datasets AS parent
+                JOIN ancestors ON ancestors.parent_dataset_id = parent.id
+                WHERE (? IS NULL OR parent.owner_id = ?)
+            ),
+            family(id) AS (
+                SELECT id FROM ancestors WHERE parent_dataset_id IS NULL
+                UNION ALL
+                SELECT child.id FROM datasets AS child
+                JOIN family ON child.parent_dataset_id = family.id
+                WHERE (? IS NULL OR child.owner_id = ?)
+            )
+            SELECT datasets.id, datasets.name, datasets.created_at,
+                   datasets.parent_dataset_id, datasets.version_number,
+                   datasets.change_summary, datasets.source
+            FROM datasets JOIN family ON family.id = datasets.id
+            ORDER BY datasets.version_number, datasets.created_at, datasets.id
+        """
+        rows = connection.execute(
+            query,
+            (dataset_id, owner_id, owner_id, owner_id, owner_id, owner_id, owner_id),
+        ).fetchall()
+    if not rows:
+        return None
+    return [
+        {
+            "id": row["id"],
+            "name": row["name"],
+            "created_at": row["created_at"],
+            "parent_dataset_id": row["parent_dataset_id"],
+            "version_number": row["version_number"],
+            "change_summary": row["change_summary"],
+            "source": _decode(row["source"], {}),
+        }
+        for row in rows
+    ]
+
+
+def get_dataset_lineage(
+    dataset_id: str, owner_id: str | None = None
+) -> dict[str, Any] | None:
+    versions = list_dataset_versions(dataset_id, owner_id=owner_id)
+    if versions is None:
+        return None
+    ids = [version["id"] for version in versions]
+    placeholders = ",".join("?" for _ in ids)
+    query = (
+        "SELECT id, dataset_id, event_type, pipeline, status, input_dataset_ids, "
+        "result_id, details, error, created_at FROM lineage_events "
+        f"WHERE dataset_id IN ({placeholders})"
+    )
+    with connect_database() as connection:
+        rows = connection.execute(
+            query + " ORDER BY created_at, id",
+            ids,
+        ).fetchall()
+    return {
+        "dataset_id": dataset_id,
+        "versions": versions,
+        "events": [
+            {
+                "id": row["id"],
+                "dataset_id": row["dataset_id"],
+                "event_type": row["event_type"],
+                "pipeline": row["pipeline"],
+                "status": row["status"],
+                "input_dataset_ids": _decode(row["input_dataset_ids"], []),
+                "result_id": row["result_id"],
+                "details": _decode(row["details"], {}),
+                "error": row["error"],
+                "created_at": row["created_at"],
+            }
+            for row in rows
+        ],
+    }
+
+
+def record_lineage_event(
+    dataset_id: str,
+    event_type: str,
+    pipeline: str,
+    status: str,
+    input_dataset_ids: list[str] | None = None,
+    result_id: str | None = None,
+    details: Any = None,
+    error: str | None = None,
+    owner_id: str | None = None,
+) -> str:
+    with connect_database() as connection:
+        return _record_lineage_event(
+            connection,
+            dataset_id,
+            event_type,
+            pipeline,
+            status,
+            input_dataset_ids,
+            result_id,
+            details,
+            error,
+            owner_id,
+        )
 
 
 def list_datasets(
@@ -632,13 +894,15 @@ def list_datasets(
     with connect_database() as connection:
         if owner_id is None:
             rows = connection.execute(
-                "SELECT id, name, source, created_at FROM datasets "
+                "SELECT id, name, source, created_at, parent_dataset_id, "
+                "version_number, change_summary FROM datasets "
                 "ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
                 (limit, offset),
             ).fetchall()
         else:
             rows = connection.execute(
-                "SELECT id, name, source, created_at FROM datasets WHERE owner_id = ? "
+                "SELECT id, name, source, created_at, parent_dataset_id, "
+                "version_number, change_summary FROM datasets WHERE owner_id = ? "
                 "ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
                 (owner_id, limit, offset),
             ).fetchall()
@@ -648,6 +912,9 @@ def list_datasets(
             "name": row["name"],
             "source": _decode(row["source"], {}),
             "created_at": row["created_at"],
+            "parent_dataset_id": row["parent_dataset_id"],
+            "version_number": row["version_number"],
+            "change_summary": row["change_summary"],
         }
         for row in rows
     ]
@@ -666,6 +933,10 @@ def delete_dataset(dataset_id: str, owner_id: str | None = None) -> bool:
             ).fetchone()
         if row is None:
             return False
+        connection.execute(
+            "UPDATE datasets SET parent_dataset_id = NULL WHERE parent_dataset_id = ?",
+            (dataset_id,),
+        )
         connection.execute("DELETE FROM datasets WHERE id = ?", (dataset_id,))
         _audit(connection, "deleted", "dataset", dataset_id, {"name": row["name"]}, owner_id)
     return True
@@ -724,6 +995,27 @@ def persist_monitoring_run(
             {"check_type": check_type, "dataset_id": current_dataset_id},
             owner_id,
         )
+        if current_dataset_id is not None:
+            input_ids = [
+                dataset_id
+                for key, dataset_id in ids.items()
+                if key != "current"
+            ]
+            _record_lineage_event(
+                connection,
+                current_dataset_id,
+                "dataset_comparison" if check_type == "dataset_comparison" else "monitoring_run",
+                "dataset_comparison" if check_type == "dataset_comparison" else "monitoring",
+                "succeeded",
+                input_dataset_ids=input_ids,
+                result_id=result_id,
+                details={
+                    "check_type": check_type,
+                    "checks": result.get("checks", []) if isinstance(result, dict) else [],
+                    "tool_trace": result.get("tool_trace", []) if isinstance(result, dict) else [],
+                },
+                owner_id=owner_id,
+            )
     return ids, result_id
 
 
