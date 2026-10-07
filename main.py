@@ -1,6 +1,7 @@
 import asyncio
 import json
 import io
+import logging
 import math
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
@@ -9,7 +10,11 @@ from typing import Any
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Query, Request
 
-from agents.monitoring_agent import build_tool_registry, run_monitoring
+from agents.monitoring_agent import (
+    MonitoringStageError,
+    build_tool_registry,
+    run_monitoring,
+)
 from profiler import (
     analyze_dataset_drift,
     analyze_trends,
@@ -36,13 +41,17 @@ from data_sources import DataSourceError, load_source, source_capabilities, summ
 from monitoring_store import (
     delete_configuration,
     delete_dataset,
+    create_dataset_version,
+    get_dataset_lineage,
     get_audit_records,
     get_configurations,
     get_dataset,
     get_monitoring_result,
     list_datasets,
+    list_dataset_versions,
     list_monitoring_results,
     persist_monitoring_run,
+    record_lineage_event,
     save_dataset,
     set_configuration,
     set_configurations,
@@ -89,6 +98,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Data Monitoring Tool", lifespan=lifespan)
 app.middleware("http")(authentication_middleware)
 app.add_middleware(RequestBodyLimitMiddleware)
+logger = logging.getLogger(__name__)
 MAX_DATASET_ROWS = 100_000
 MAX_DATASET_COLUMNS = 1_000
 
@@ -436,7 +446,49 @@ def monitoring_analyze_endpoint(payload: dict[str, Any]):
             use_llm=_use_llm_quality_summary(payload),
             owner_id=current_user_scope(),
         )
+    except MonitoringStageError as error:
+        dataset_id = payload.get("dataset_id")
+        if isinstance(dataset_id, str) and dataset_id.strip():
+            dataset = get_dataset(dataset_id, owner_id=current_user_scope())
+            if dataset is not None:
+                record_lineage_event(
+                    dataset_id,
+                    "monitoring_run",
+                    "monitoring",
+                    "failed",
+                    input_dataset_ids=[dataset_id],
+                    details={
+                        "checks": payload.get("checks", ["quality"]),
+                        "failed_stage": error.stage,
+                    },
+                    error=f"{error.stage}: {type(error.cause).__name__}"[:500],
+                    owner_id=current_user_scope(),
+                )
+        if isinstance(error.cause, (DataSourceError, TypeError, ValueError)):
+            _bad_request(str(error.cause))
+        logger.exception("Monitoring pipeline failed at stage %s", error.stage)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Monitoring pipeline stage '{error.stage}' failed",
+        ) from error.cause
     except (DataSourceError, TypeError, ValueError) as error:
+        dataset_id = payload.get("dataset_id")
+        if isinstance(dataset_id, str) and dataset_id.strip():
+            dataset = get_dataset(dataset_id, owner_id=current_user_scope())
+            if dataset is not None:
+                record_lineage_event(
+                    dataset_id,
+                    "monitoring_run",
+                    "monitoring",
+                    "failed",
+                    input_dataset_ids=[dataset_id],
+                    details={
+                        "checks": payload.get("checks", ["quality"]),
+                        "failed_stage": "validation",
+                    },
+                    error=f"{type(error).__name__}: {error}"[:500],
+                    owner_id=current_user_scope(),
+                )
         _bad_request(str(error))
 
 
@@ -567,7 +619,7 @@ def create_dataset_endpoint(payload: dict[str, Any]):
         _dataset_source(payload),
         owner_id=current_user_id(),
     )
-    return {"id": dataset_id, "name": name}
+    return {"id": dataset_id, "name": name, "version_number": 1}
 
 
 @app.post("/api/datasets/upload", status_code=201)
@@ -595,6 +647,176 @@ async def upload_dataset_file_endpoint(request: Request, name: str = Query(min_l
         owner_id=current_user_id(),
     )
     return {"id": dataset_id, "name": safe_name}
+
+
+@app.post("/api/datasets/compare")
+def compare_datasets_endpoint(payload: dict[str, Any]):
+    baseline_id = payload.get("baseline_dataset_id")
+    current_id = payload.get("current_dataset_id")
+    if not isinstance(baseline_id, str) or not baseline_id.strip():
+        _bad_request("baseline_dataset_id is required")
+    if not isinstance(current_id, str) or not current_id.strip():
+        _bad_request("current_dataset_id is required")
+
+    baseline = get_dataset(baseline_id, owner_id=current_user_scope())
+    current = get_dataset(current_id, owner_id=current_user_scope())
+    if baseline is None or current is None:
+        raise HTTPException(status_code=404, detail="Dataset was not found")
+    if baseline.get("owner_id") != current.get("owner_id"):
+        _bad_request("Datasets must have the same owner to be compared")
+
+    baseline_frame = pd.DataFrame(baseline["data"])
+    current_frame = pd.DataFrame(current["data"])
+    baseline_columns = [str(column) for column in baseline_frame.columns]
+    current_columns = [str(column) for column in current_frame.columns]
+    shared_columns = [column for column in baseline_columns if column in current_columns]
+    added_columns = [column for column in current_columns if column not in baseline_columns]
+    removed_columns = [column for column in baseline_columns if column not in current_columns]
+    type_changes = [
+        {
+            "column": column,
+            "baseline": str(baseline_frame[column].dtype),
+            "current": str(current_frame[column].dtype),
+        }
+        for column in shared_columns
+        if str(baseline_frame[column].dtype) != str(current_frame[column].dtype)
+    ]
+
+    def quality_summary(frame: pd.DataFrame) -> dict[str, Any]:
+        missing_by_column = {
+            str(column): int(count)
+            for column, count in frame.isna().sum().items()
+        }
+        return {
+            "rows": int(len(frame.index)),
+            "columns": int(len(frame.columns)),
+            "missing_values": {
+                "total": sum(missing_by_column.values()),
+                "by_column": missing_by_column,
+            },
+            "duplicate_rows": int(frame.duplicated().sum()),
+            "quality_score": calculate_data_quality_score(frame)["overall_score"],
+        }
+
+    drift = None
+    if shared_columns and not baseline_frame.empty and not current_frame.empty:
+        drift = analyze_dataset_drift(
+            baseline_frame[shared_columns],
+            current_frame[shared_columns],
+        )
+    elif not shared_columns:
+        drift = {"available": False, "reason": "No shared columns to compare"}
+    else:
+        drift = {"available": False, "reason": "Both datasets need at least one row"}
+
+    comparison = {
+        "baseline": {
+            "id": baseline["id"],
+            "name": baseline["name"],
+            "version_number": baseline["version_number"],
+        },
+        "current": {
+            "id": current["id"],
+            "name": current["name"],
+            "version_number": current["version_number"],
+        },
+        "schema": {
+            "baseline_columns": baseline_columns,
+            "current_columns": current_columns,
+            "shared_columns": shared_columns,
+            "added_columns": added_columns,
+            "removed_columns": removed_columns,
+            "type_changes": type_changes,
+        },
+        "quality": {
+            "baseline": quality_summary(baseline_frame),
+            "current": quality_summary(current_frame),
+        },
+        "distribution_drift": drift,
+    }
+    _, result_id = persist_monitoring_run(
+        [
+            {
+                "key": "current",
+                "id": current_id,
+                "name": current["name"],
+                "data": current["data"],
+            },
+            {
+                "key": "baseline",
+                "id": baseline_id,
+                "name": baseline["name"],
+                "data": baseline["data"],
+            },
+        ],
+        "dataset_comparison",
+        comparison,
+        owner_id=current_user_scope(),
+    )
+    return {
+        **comparison,
+        "dataset_id": current_id,
+        "baseline_dataset_id": baseline_id,
+        "result_id": result_id,
+    }
+
+
+@app.post("/api/datasets/{dataset_id}/versions", status_code=201)
+def create_dataset_version_endpoint(dataset_id: str, payload: dict[str, Any]):
+    if "data" not in payload:
+        _bad_request("data is required to create a dataset version")
+    parent = get_dataset(dataset_id, owner_id=current_user_scope())
+    if parent is None:
+        raise HTTPException(status_code=404, detail="Dataset was not found")
+    try:
+        frame = pd.DataFrame(payload["data"])
+    except (TypeError, ValueError):
+        _bad_request("Dataset payload must be list-of-records or column-oriented JSON")
+    if frame.empty:
+        _bad_request("Dataset must not be empty")
+    _validate_dataset_dimensions(frame)
+
+    change_summary = payload.get("change_summary")
+    if change_summary is not None and (
+        not isinstance(change_summary, str) or len(change_summary) > 1000
+    ):
+        _bad_request("change_summary must be a string of at most 1,000 characters")
+    name = payload.get("name", parent["name"])
+    if not isinstance(name, str) or not name.strip() or len(name) > 255:
+        _bad_request("name must contain 1 to 255 characters")
+    version_id = create_dataset_version(
+        dataset_id,
+        name.strip(),
+        _frame_records(frame),
+        change_summary,
+        owner_id=current_user_scope(),
+    )
+    if version_id is None:
+        raise HTTPException(status_code=404, detail="Dataset was not found")
+    version = get_dataset(version_id, owner_id=current_user_scope())
+    return {
+        "id": version_id,
+        "name": version["name"],
+        "parent_dataset_id": dataset_id,
+        "version_number": version["version_number"],
+        "change_summary": version["change_summary"],
+    }
+
+
+@app.get("/api/datasets/{dataset_id}/versions")
+def list_dataset_versions_endpoint(dataset_id: str):
+    versions = list_dataset_versions(dataset_id, owner_id=current_user_scope())
+    if versions is None:
+        raise HTTPException(status_code=404, detail="Dataset was not found")
+    return {"versions": versions}
+
+
+@app.get("/api/datasets/{dataset_id}/lineage")
+def get_dataset_lineage_endpoint(dataset_id: str):
+    lineage = get_dataset_lineage(dataset_id, owner_id=current_user_scope())
+    if lineage is None:
+        raise HTTPException(status_code=404, detail="Dataset was not found")
+    return lineage
 
 
 @app.get("/api/datasets/{dataset_id}")

@@ -40,6 +40,7 @@ _WRITE_PATHS = {
     "/api/sources/analyze",
     "/api/notifications/send",
     "/api/datasets",
+    "/api/datasets/compare",
     "/api/datasets/upload",
     "/api/schedules",
     "/api/data-quality/analyze",
@@ -308,11 +309,26 @@ async def authentication_middleware(request: Request, call_next):
             and path.startswith("/api/schedules/")
         ):
             pass
+        elif (
+            method == "POST"
+            and path.startswith("/api/datasets/")
+            and path.endswith("/versions")
+            and user["role"] == "viewer"
+        ):
+            return JSONResponse(status_code=403, content={"detail": "Analyst role required"})
         elif method in {"PUT", "PATCH", "DELETE"} and user["role"] != "admin":
             return JSONResponse(status_code=403, content={"detail": "Admin role required"})
         elif method == "POST" and user["role"] == "viewer" and path not in _READ_ONLY_POST_PATHS:
             return JSONResponse(status_code=403, content={"detail": "Analyst role required"})
-        elif method == "POST" and user["role"] == "analyst" and path not in _WRITE_PATHS | _READ_ONLY_POST_PATHS | {"/api/auth/users"}:
+        elif (
+            method == "POST"
+            and user["role"] == "analyst"
+            and path not in _WRITE_PATHS | _READ_ONLY_POST_PATHS | {"/api/auth/users"}
+            and not (
+                path.startswith("/api/datasets/")
+                and path.endswith("/versions")
+            )
+        ):
             return JSONResponse(status_code=403, content={"detail": "Admin role required"})
 
         token_context = _current_user.set(user)

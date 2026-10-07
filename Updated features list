@@ -21,9 +21,9 @@ Fully missing Features
 - Predictive maintenance
 - Chatbot assistant
 - Voice commands
-- Data lineage visualization
-- Pipeline monitoring
-- Dataset comparison tool
+- ✅ Dataset lineage and pipeline event tracking for ingestion, versions, comparisons, and monitoring failures
+- ✅ Immutable dataset version history with owner-scoped access
+- ✅ Dataset comparison for schema, type, quality, missing-value, duplicate, and drift changes
 - Real-time monitoring
 - ✅ Unified advanced monitoring dashboard for quality, drift, anomaly, alert, forecast, XAI, and historical-result views
 
@@ -67,4 +67,4 @@ Partially implemented
 - Basic API endpoints
 - Authentication, RBAC, encrypted stored datasets/results, and bounded CSV uploads
 
-The biggest remaining implementation gaps are pipeline monitoring, lineage, chatbot, dataset comparison, and advanced ML workflows.
+The biggest remaining implementation gaps are chatbot and advanced ML workflows.

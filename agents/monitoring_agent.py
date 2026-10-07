@@ -1,6 +1,6 @@
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from agents.root_cause_agent import investigate
 from monitoring_store import persist_monitoring_run
@@ -13,6 +13,33 @@ from tools.notification_tools import send_monitoring_notification
 from tools.quality_tools import analyze_quality
 from tools.registry import ToolRegistry
 from tools.xai_tools import explain_model
+
+
+class MonitoringStageError(Exception):
+    def __init__(self, stage: str, cause: Exception):
+        self.stage = stage
+        self.cause = cause
+        super().__init__(f"Monitoring stage '{stage}' failed ({type(cause).__name__})")
+
+
+def _run_stage(
+    trace: list[dict[str, str]],
+    stage: str,
+    operation: Callable[[], Any],
+    include_success: bool = True,
+) -> Any:
+    try:
+        result = operation()
+    except Exception as error:
+        trace.append({
+            "tool": stage,
+            "status": "failed",
+            "error": type(error).__name__,
+        })
+        raise MonitoringStageError(stage, error) from error
+    if include_success:
+        trace.append({"tool": stage, "status": "completed"})
+    return result
 
 
 def _dataset_spec(
@@ -74,20 +101,26 @@ def run_monitoring(
     checks = list(dict.fromkeys(checks))
 
     registry = build_tool_registry()
-    trace = []
-    frame = load_dataset(payload, owner_id=owner_id)
-    trace.append({"tool": "data.load", "status": "completed"})
+    trace: list[dict[str, str]] = []
+    frame = _run_stage(
+        trace,
+        "data.load",
+        lambda: load_dataset(payload, owner_id=owner_id),
+    )
 
     results = {}
     baseline = None
     if "quality" in checks:
-        results["quality"] = registry.run(
+        results["quality"] = _run_stage(
+            trace,
             "quality.analyze",
-            frame=frame,
-            options=quality_options,
-            use_llm=use_llm,
+            lambda: registry.run(
+                "quality.analyze",
+                frame=frame,
+                options=quality_options,
+                use_llm=use_llm,
+            ),
         )
-        trace.append({"tool": "quality.analyze", "status": "completed"})
 
     if "drift" in checks:
         baseline_data = payload.get("baseline")
@@ -99,40 +132,65 @@ def run_monitoring(
         if baseline_id is not None:
             if not isinstance(baseline_id, str) or not baseline_id.strip():
                 raise ValueError("baseline_dataset_id must be a non-empty string")
-            baseline = load_dataset({"dataset_id": baseline_id}, owner_id=owner_id)
+            baseline = _run_stage(
+                trace,
+                "drift.baseline.load",
+                lambda: load_dataset({"dataset_id": baseline_id}, owner_id=owner_id),
+            )
         else:
-            baseline = dataframe_from_value(baseline_data, "Baseline dataset")
-        results["drift"] = registry.run("drift.analyze", baseline=baseline, current=frame)
-        trace.append({"tool": "drift.analyze", "status": "completed"})
+            baseline = _run_stage(
+                trace,
+                "drift.baseline.load",
+                lambda: dataframe_from_value(baseline_data, "Baseline dataset"),
+            )
+        results["drift"] = _run_stage(
+            trace,
+            "drift.analyze",
+            lambda: registry.run("drift.analyze", baseline=baseline, current=frame),
+        )
 
     if "anomalies" in checks:
-        results["anomalies"] = registry.run("anomalies.analyze", frame=frame)
-        trace.append({"tool": "anomalies.analyze", "status": "completed"})
+        results["anomalies"] = _run_stage(
+            trace,
+            "anomalies.analyze",
+            lambda: registry.run("anomalies.analyze", frame=frame),
+        )
 
     if "forecast" in checks:
-        results["forecast"] = registry.run(
+        results["forecast"] = _run_stage(
+            trace,
             "forecast.run",
-            frame=frame,
-            date_column=payload.get("date_column"),
-            value_column=payload.get("value_column"),
-            periods=int(payload.get("periods", 4)),
-            frequency=str(payload.get("frequency", "W")),
-            method=str(payload.get("method", "auto")),
-            metric=payload.get("metric"),
+            lambda: registry.run(
+                "forecast.run",
+                frame=frame,
+                date_column=payload.get("date_column"),
+                value_column=payload.get("value_column"),
+                periods=int(payload.get("periods", 4)),
+                frequency=str(payload.get("frequency", "W")),
+                method=str(payload.get("method", "auto")),
+                metric=payload.get("metric"),
+            ),
         )
-        trace.append({"tool": "forecast.run", "status": "completed"})
 
     if "explain" in checks:
-        results["explanation"] = registry.run(
+        results["explanation"] = _run_stage(
+            trace,
             "xai.explain",
-            frame=frame,
-            target_column=payload.get("target_column"),
-            task=payload.get("task", "classification"),
-            test_size=payload.get("test_size", 0.2),
+            lambda: registry.run(
+                "xai.explain",
+                frame=frame,
+                target_column=payload.get("target_column"),
+                task=payload.get("task", "classification"),
+                test_size=payload.get("test_size", 0.2),
+            ),
         )
-        trace.append({"tool": "xai.explain", "status": "completed"})
 
-    root_cause = investigate(results)
+    root_cause = _run_stage(
+        trace,
+        "root_cause.investigate",
+        lambda: investigate(results),
+        include_success=False,
+    )
     notifications = {"status": "skipped", "reason": "notifications not requested"}
     notify = payload.get("notify", False)
     if not isinstance(notify, bool):
@@ -155,13 +213,17 @@ def run_monitoring(
                 else "warning"
             )
             summary = "; ".join(finding["signal"] for finding in root_cause["findings"])
-            notifications = registry.run(
+            notifications = _run_stage(
+                trace,
                 "notification.send",
-                message=f"Monitoring findings detected: {summary}",
-                channels=channels,
-                severity=severity,
+                lambda: registry.run(
+                    "notification.send",
+                    message=f"Monitoring findings detected: {summary}",
+                    channels=channels,
+                    severity=severity,
+                ),
             )
-            trace.append({"tool": "notification.send", "status": notifications.get("status", "unknown")})
+            trace[-1]["status"] = notifications.get("status", "unknown")
         else:
             notifications = {"status": "skipped", "reason": "no monitoring findings"}
 
@@ -201,8 +263,13 @@ def run_monitoring(
             )
         )
 
-    dataset_ids, result_id = persist_monitoring_run(
-        datasets, "monitoring", response, owner_id=owner_id
+    dataset_ids, result_id = _run_stage(
+        trace,
+        "monitoring.persist",
+        lambda: persist_monitoring_run(
+            datasets, "monitoring", response, owner_id=owner_id
+        ),
+        include_success=False,
     )
     response["dataset_id"] = dataset_ids.get("current")
     response["result_id"] = result_id
