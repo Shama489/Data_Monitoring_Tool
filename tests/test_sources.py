@@ -56,6 +56,17 @@ def test_sql_loader_accepts_multiline_select_queries():
     pd.testing.assert_frame_equal(frame, pd.DataFrame({"value": [1, 2]}))
 
 
+def test_sql_loader_accepts_commented_select_queries_with_embedded_semicolons():
+    frame = load_sql_query(
+        "sqlite://",
+        "-- leading comment\nSELECT 'alpha;beta' AS value UNION ALL SELECT 'gamma;delta' AS value",
+    )
+    pd.testing.assert_frame_equal(
+        frame,
+        pd.DataFrame({"value": ["alpha;beta", "gamma;delta"]}),
+    )
+
+
 def test_sources_endpoint_reports_success_and_partial_failure(tmp_path, monkeypatch):
     monkeypatch.setenv("DATASET_ALLOWED_DIRS", str(tmp_path))
     path = tmp_path / "events.csv"

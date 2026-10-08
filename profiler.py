@@ -11,9 +11,31 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
-from sklearn.ensemble import IsolationForest, RandomForestClassifier, RandomForestRegressor
-from sklearn.metrics import accuracy_score, confusion_matrix, mean_absolute_error, mean_squared_error, precision_recall_fscore_support, r2_score
+from sklearn.ensemble import (
+    ExtraTreesClassifier,
+    ExtraTreesRegressor,
+    GradientBoostingClassifier,
+    GradientBoostingRegressor,
+    HistGradientBoostingClassifier,
+    HistGradientBoostingRegressor,
+    IsolationForest,
+    RandomForestClassifier,
+    RandomForestRegressor,
+)
+from sklearn.linear_model import LinearRegression, LogisticRegression, Ridge
+from sklearn.metrics import (
+    accuracy_score,
+    confusion_matrix,
+    f1_score,
+    mean_absolute_error,
+    mean_squared_error,
+    mean_squared_log_error,
+    precision_recall_fscore_support,
+    r2_score,
+)
 from sklearn.model_selection import train_test_split
+from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
+from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor
 
 try:
     from statsmodels.tsa.arima.model import ARIMA
@@ -1134,6 +1156,211 @@ def forecast_data_health(df, date_column, periods=4, frequency="W"):
         "missing_values": forecast_metric(working, date_column, "missing_values", periods, frequency),
         "quality_score": forecast_metric(working, date_column, "quality_score", periods, frequency),
     }
+
+
+def _model_candidates(task: str):
+    if task == "classification":
+        return {
+            "logistic_regression": LogisticRegression(max_iter=1000, random_state=42),
+            "random_forest": RandomForestClassifier(n_estimators=200, random_state=42),
+            "gradient_boosting": GradientBoostingClassifier(random_state=42),
+            "extra_trees": ExtraTreesClassifier(n_estimators=200, random_state=42),
+            "decision_tree": DecisionTreeClassifier(random_state=42),
+            "k_nearest_neighbors": KNeighborsClassifier(n_neighbors=5),
+        }
+    return {
+        "linear_regression": LinearRegression(),
+        "ridge_regression": Ridge(alpha=1.0),
+        "random_forest": RandomForestRegressor(n_estimators=200, random_state=42),
+        "gradient_boosting": GradientBoostingRegressor(random_state=42),
+        "extra_trees": ExtraTreesRegressor(n_estimators=200, random_state=42),
+        "decision_tree": DecisionTreeRegressor(random_state=42),
+        "k_nearest_neighbors": KNeighborsRegressor(n_neighbors=5),
+    }
+
+
+def _feature_importance_for_model(model, feature_names):
+    if hasattr(model, "feature_importances_"):
+        raw_scores = model.feature_importances_
+    elif hasattr(model, "coef_"):
+        raw_scores = np.abs(model.coef_)
+        if raw_scores.ndim > 1:
+            raw_scores = np.mean(np.abs(raw_scores), axis=1)
+    else:
+        return []
+
+    if np.isscalar(raw_scores):
+        raw_scores = np.full(len(feature_names), float(raw_scores))
+    scores = [
+        {"feature": name, "importance": round(float(value), 6)}
+        for name, value in zip(feature_names, raw_scores)
+    ]
+    return sorted(scores, key=lambda item: item["importance"], reverse=True)
+
+
+def _metric_value(y_true, y_pred, task: str, metric: str):
+    metric_name = str(metric).lower().replace(" ", "_")
+    if task == "classification":
+        if metric_name in {"accuracy", "acc"}:
+            return accuracy_score(y_true, y_pred)
+        if metric_name in {"precision", "precision_weighted", "weighted_precision"}:
+            _, _, _, _ = precision_recall_fscore_support(y_true, y_pred, average="weighted", zero_division=0)
+            return precision_recall_fscore_support(y_true, y_pred, average="weighted", zero_division=0)[0]
+        if metric_name in {"recall", "recall_weighted", "weighted_recall"}:
+            return precision_recall_fscore_support(y_true, y_pred, average="weighted", zero_division=0)[1]
+        if metric_name in {"f1", "f1_weighted", "weighted_f1"}:
+            return f1_score(y_true, y_pred, average="weighted", zero_division=0)
+        if metric_name in {"f1_macro", "macro_f1"}:
+            return f1_score(y_true, y_pred, average="macro", zero_division=0)
+        return accuracy_score(y_true, y_pred)
+
+    if metric_name in {"r2", "r2_score"}:
+        return r2_score(y_true, y_pred)
+    if metric_name in {"mse", "mean_squared_error"}:
+        return mean_squared_error(y_true, y_pred)
+    if metric_name in {"rmse", "root_mean_squared_error"}:
+        return mean_squared_error(y_true, y_pred, squared=False)
+    if metric_name in {"mae", "mean_absolute_error"}:
+        return mean_absolute_error(y_true, y_pred)
+    if metric_name in {"msle", "mean_squared_log_error"}:
+        return mean_squared_log_error(y_true, y_pred)
+    return r2_score(y_true, y_pred)
+
+
+def _metric_direction(task: str, metric: str) -> str:
+    metric_name = str(metric).lower().replace(" ", "_")
+    if task == "classification":
+        if metric_name in {"accuracy", "acc", "precision", "recall", "f1", "f1_weighted", "f1_macro"}:
+            return "higher"
+        return "higher"
+    if metric_name in {"mae", "mse", "rmse", "msle"}:
+        return "lower"
+    return "higher"
+
+
+def compare_models(df, target_column, task="classification", metric=None, test_size=0.2, model_names=None):
+    """Compare a shortlist of candidate models and return the best performer."""
+    if target_column not in df.columns:
+        raise ValueError(f"Target column '{target_column}' was not found in the dataset.")
+    if task not in {"classification", "regression"}:
+        raise ValueError("task must be classification or regression.")
+
+    try:
+        test_size = float(test_size)
+    except (TypeError, ValueError) as error:
+        raise ValueError("test_size must be a number between 0.1 and 0.5.") from error
+    if not 0.1 <= test_size <= 0.5:
+        raise ValueError("test_size must be between 0.1 and 0.5.")
+
+    working = df.dropna(subset=[target_column]).copy()
+    if len(working) < 5:
+        raise ValueError("At least five labeled rows are required for model comparison.")
+    target = working.pop(target_column)
+    for column_name in working.columns:
+        if pd.api.types.is_datetime64_any_dtype(working[column_name]):
+            working[column_name] = working[column_name].astype("int64") / 10**9
+    features = pd.get_dummies(working, dummy_na=True).replace([np.inf, -np.inf], np.nan).fillna(0)
+    if features.shape[1] == 0:
+        raise ValueError("At least one usable feature is required for model comparison.")
+
+    stratify = None
+    if task == "classification":
+        class_counts = target.value_counts()
+        test_rows = math.ceil(len(target) * test_size)
+        train_rows = len(target) - test_rows
+        if class_counts.min() >= 2 and test_rows >= len(class_counts) and train_rows >= len(class_counts):
+            stratify = target
+    try:
+        train_features, test_features, train_target, test_target = train_test_split(
+            features,
+            target,
+            test_size=test_size,
+            random_state=42,
+            stratify=stratify,
+        )
+    except ValueError as error:
+        raise ValueError(f"Could not create a holdout split: {error}") from error
+
+    default_metric = "accuracy" if task == "classification" else "r2"
+    chosen_metric = default_metric if metric is None else str(metric)
+    candidate_names = _model_candidates(task)
+    if model_names:
+        requested = []
+        for name in model_names:
+            if str(name) in candidate_names:
+                requested.append(str(name))
+        if not requested:
+            raise ValueError(f"Unsupported model names for {task}: {model_names}")
+        candidate_names = {key: candidate_names[key] for key in requested}
+
+    model_results = []
+    for name, model in candidate_names.items():
+        try:
+            fitted = model.fit(train_features, train_target)
+            predictions = fitted.predict(test_features)
+            metric_value = _metric_value(test_target, predictions, task, chosen_metric)
+            model_results.append({
+                "model": name,
+                "score": float(metric_value),
+                "metrics": {
+                    "accuracy": accuracy_score(test_target, predictions) if task == "classification" else None,
+                    "precision_weighted": precision_recall_fscore_support(test_target, predictions, average="weighted", zero_division=0)[0] if task == "classification" else None,
+                    "recall_weighted": precision_recall_fscore_support(test_target, predictions, average="weighted", zero_division=0)[1] if task == "classification" else None,
+                    "f1_weighted": f1_score(test_target, predictions, average="weighted", zero_division=0) if task == "classification" else None,
+                    "mae": mean_absolute_error(test_target, predictions) if task == "regression" else None,
+                    "rmse": mean_squared_error(test_target, predictions, squared=False) if task == "regression" else None,
+                    "r2": r2_score(test_target, predictions) if task == "regression" else None,
+                    chosen_metric: float(metric_value),
+                },
+                "feature_importance": _feature_importance_for_model(fitted, features.columns.tolist())[:10],
+            })
+        except Exception:
+            continue
+
+    if not model_results:
+        raise ValueError(f"No candidate model could be trained for the {task} task.")
+
+    direction = _metric_direction(task, chosen_metric)
+    best_entry = max(model_results, key=lambda item: item["score"]) if direction == "higher" else min(model_results, key=lambda item: item["score"])
+    ranking = sorted(
+        model_results,
+        key=lambda item: item["score"],
+        reverse=(direction == "higher"),
+    )
+
+    return {
+        "task": task,
+        "target": target_column,
+        "metric": chosen_metric,
+        "direction": direction,
+        "selected_model": best_entry["model"],
+        "best_score": round(float(best_entry["score"]), 6),
+        "models": [
+            {
+                "model": item["model"],
+                "score": round(float(item["score"]), 6),
+                "metrics": item["metrics"],
+                "feature_importance": item["feature_importance"],
+            }
+            for item in ranking
+        ],
+        "ranked_models": [item["model"] for item in ranking],
+        "best_model_summary": {
+            "model": best_entry["model"],
+            "score": round(float(best_entry["score"]), 6),
+            "feature_importance": best_entry["feature_importance"],
+        },
+    }
+
+
+def select_best_model(df, target_column, task="classification", metric=None, test_size=0.2, model_names=None):
+    """Shortcut wrapper for AutoML model selection and ranking."""
+    return compare_models(df, target_column, task=task, metric=metric, test_size=test_size, model_names=model_names)
+
+
+def automl_model_selection(df, target_column, task="classification", metric=None, test_size=0.2, model_names=None):
+    """Compatibility alias for model-selection workflows."""
+    return compare_models(df, target_column, task=task, metric=metric, test_size=test_size, model_names=model_names)
 
 
 def train_and_explain_model(df, target_column, task="classification", test_size=0.2):
