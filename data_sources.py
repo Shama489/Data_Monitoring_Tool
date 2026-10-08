@@ -121,9 +121,10 @@ def load_sql_query(database_url: str, query: str, params: dict[str, Any] | None 
     if not database_url.strip():
         raise DataSourceError("database_url is required")
     normalized_query = query.strip().rstrip(";").strip()
+    lowered_query = normalized_query.lower()
     if (
         not normalized_query
-        or not normalized_query.lower().startswith("select ")
+        or not lowered_query.startswith("select")
         or ";" in normalized_query
     ):
         raise DataSourceError("Only SELECT queries are allowed")

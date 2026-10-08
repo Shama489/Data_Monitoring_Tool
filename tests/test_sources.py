@@ -48,6 +48,14 @@ def test_sql_loader_rejects_multi_statement_select_queries():
         load_sql_query("sqlite://", "SELECT 1; DELETE FROM events")
 
 
+def test_sql_loader_accepts_multiline_select_queries():
+    frame = load_sql_query(
+        "sqlite://",
+        "SELECT\n  1 AS value\nUNION ALL\nSELECT\n  2 AS value",
+    )
+    pd.testing.assert_frame_equal(frame, pd.DataFrame({"value": [1, 2]}))
+
+
 def test_sources_endpoint_reports_success_and_partial_failure(tmp_path, monkeypatch):
     monkeypatch.setenv("DATASET_ALLOWED_DIRS", str(tmp_path))
     path = tmp_path / "events.csv"
