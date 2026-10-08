@@ -117,17 +117,108 @@ def load_local_file(path: str, file_type: str = "", sheet_name: str | int | None
     return _read_file_bytes(file_path.read_bytes(), extension, file_path.name, sheet_name)
 
 
+def _strip_sql_leading_comments(query: str) -> str:
+    cleaned = query.lstrip()
+    while True:
+        if cleaned.startswith("--"):
+            newline_index = cleaned.find("\n")
+            if newline_index == -1:
+                return ""
+            cleaned = cleaned[newline_index + 1 :].lstrip()
+            continue
+        if cleaned.startswith("/*"):
+            comment_end = cleaned.find("*/")
+            if comment_end == -1:
+                return ""
+            cleaned = cleaned[comment_end + 2 :].lstrip()
+            continue
+        return cleaned
+
+
+def _find_sql_statement_terminator(query: str) -> int | None:
+    in_single_quote = False
+    in_double_quote = False
+    in_line_comment = False
+    in_block_comment = False
+    index = 0
+    while index < len(query):
+        character = query[index]
+        next_character = query[index + 1] if index + 1 < len(query) else ""
+
+        if in_line_comment:
+            if character == "\n":
+                in_line_comment = False
+            index += 1
+            continue
+
+        if in_block_comment:
+            if character == "*" and next_character == "/":
+                in_block_comment = False
+                index += 2
+                continue
+            index += 1
+            continue
+
+        if in_single_quote:
+            if character == "'" and next_character == "'":
+                index += 2
+                continue
+            if character == "'":
+                in_single_quote = False
+            index += 1
+            continue
+
+        if in_double_quote:
+            if character == '"' and next_character == '"':
+                index += 2
+                continue
+            if character == '"':
+                in_double_quote = False
+            index += 1
+            continue
+
+        if character == "-" and next_character == "-":
+            in_line_comment = True
+            index += 2
+            continue
+        if character == "/" and next_character == "*":
+            in_block_comment = True
+            index += 2
+            continue
+        if character == "'":
+            in_single_quote = True
+            index += 1
+            continue
+        if character == '"':
+            in_double_quote = True
+            index += 1
+            continue
+        if character == ";":
+            return index
+        index += 1
+    return None
+
+
 def load_sql_query(database_url: str, query: str, params: dict[str, Any] | None = None) -> pd.DataFrame:
     if not database_url.strip():
         raise DataSourceError("database_url is required")
-    normalized_query = query.strip().rstrip(";").strip()
+
+    normalized_query = _strip_sql_leading_comments(query).strip()
     lowered_query = normalized_query.lower()
-    if (
-        not normalized_query
-        or not lowered_query.startswith("select")
-        or ";" in normalized_query
-    ):
+    if not normalized_query:
         raise DataSourceError("Only SELECT queries are allowed")
+    if not (lowered_query.startswith("select") or lowered_query.startswith("with")):
+        raise DataSourceError("Only SELECT queries are allowed")
+
+    statement_terminator = _find_sql_statement_terminator(normalized_query)
+    if statement_terminator is not None:
+        suffix = normalized_query[statement_terminator + 1 :].lstrip()
+        if suffix:
+            raise DataSourceError("Only SELECT queries are allowed")
+        normalized_query = normalized_query[:statement_terminator].rstrip()
+        if not normalized_query:
+            raise DataSourceError("Only SELECT queries are allowed")
+
     engine = create_engine(database_url, pool_pre_ping=True)
     try:
         with engine.connect() as connection:
