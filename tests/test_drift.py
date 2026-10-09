@@ -13,6 +13,7 @@ from profiler import (
     calculate_data_quality_score,
     check_data_quality,
     classify_drift_severity,
+    compare_models,
     detect_anomalies_isolation_forest,
     forecast_data_health,
     forecast_metric,
@@ -290,6 +291,47 @@ def test_model_explanations_reject_invalid_holdout_share():
 
     with pytest.raises(ValueError, match="test_size"):
         train_and_explain_model(df, "target", test_size=0.8)
+
+
+def test_automl_regression_supports_current_sklearn_rmse_api():
+    df = pd.DataFrame({
+        "signal": list(range(20)),
+        "target": [value * 2 + 1 for value in range(20)],
+    })
+
+    report = compare_models(
+        df,
+        "target",
+        task="regression",
+        metric="mean_squared_error",
+        model_names=["linear_regression"],
+    )
+
+    assert report["direction"] == "lower"
+    assert report["models"][0]["metrics"]["rmse"] >= 0
+    assert report["model_failures"] == []
+
+
+def test_automl_rejects_unknown_metric():
+    df = pd.DataFrame({"signal": list(range(10)), "target": [0, 1] * 5})
+
+    with pytest.raises(ValueError, match="Unsupported classification metric"):
+        compare_models(df, "target", metric="unknown")
+
+
+def test_multiclass_linear_feature_importance_matches_feature_names():
+    from sklearn.linear_model import LogisticRegression
+
+    from profiler import _feature_importance_for_model
+
+    model = LogisticRegression(max_iter=1000).fit(
+        [[0, 0], [1, 0], [2, 0], [0, 1], [1, 1], [2, 1]],
+        ["a", "b", "c", "a", "b", "c"],
+    )
+
+    importance = _feature_importance_for_model(model, ["first", "second"])
+
+    assert {item["feature"] for item in importance} == {"first", "second"}
 
 
 def test_get_table_data_rejects_invalid_table_names():
