@@ -1185,7 +1185,7 @@ def _feature_importance_for_model(model, feature_names):
     elif hasattr(model, "coef_"):
         raw_scores = np.abs(model.coef_)
         if raw_scores.ndim > 1:
-            raw_scores = np.mean(np.abs(raw_scores), axis=1)
+            raw_scores = np.mean(np.abs(raw_scores), axis=0)
     else:
         return []
 
@@ -1198,41 +1198,74 @@ def _feature_importance_for_model(model, feature_names):
     return sorted(scores, key=lambda item: item["importance"], reverse=True)
 
 
-def _metric_value(y_true, y_pred, task: str, metric: str):
+def _normalize_metric_name(task: str, metric: str) -> str:
     metric_name = str(metric).lower().replace(" ", "_")
     if task == "classification":
-        if metric_name in {"accuracy", "acc"}:
-            return accuracy_score(y_true, y_pred)
-        if metric_name in {"precision", "precision_weighted", "weighted_precision"}:
-            _, _, _, _ = precision_recall_fscore_support(y_true, y_pred, average="weighted", zero_division=0)
-            return precision_recall_fscore_support(y_true, y_pred, average="weighted", zero_division=0)[0]
-        if metric_name in {"recall", "recall_weighted", "weighted_recall"}:
-            return precision_recall_fscore_support(y_true, y_pred, average="weighted", zero_division=0)[1]
-        if metric_name in {"f1", "f1_weighted", "weighted_f1"}:
-            return f1_score(y_true, y_pred, average="weighted", zero_division=0)
-        if metric_name in {"f1_macro", "macro_f1"}:
-            return f1_score(y_true, y_pred, average="macro", zero_division=0)
-        return accuracy_score(y_true, y_pred)
+        aliases = {
+            "accuracy": "accuracy",
+            "acc": "accuracy",
+            "precision": "precision_weighted",
+            "precision_weighted": "precision_weighted",
+            "weighted_precision": "precision_weighted",
+            "recall": "recall_weighted",
+            "recall_weighted": "recall_weighted",
+            "weighted_recall": "recall_weighted",
+            "f1": "f1_weighted",
+            "f1_weighted": "f1_weighted",
+            "weighted_f1": "f1_weighted",
+            "f1_macro": "f1_macro",
+            "macro_f1": "f1_macro",
+        }
+    elif task == "regression":
+        aliases = {
+            "r2": "r2",
+            "r2_score": "r2",
+            "mse": "mse",
+            "mean_squared_error": "mse",
+            "rmse": "rmse",
+            "root_mean_squared_error": "rmse",
+            "mae": "mae",
+            "mean_absolute_error": "mae",
+            "msle": "msle",
+            "mean_squared_log_error": "msle",
+        }
+    else:
+        raise ValueError("task must be classification or regression.")
 
-    if metric_name in {"r2", "r2_score"}:
+    if metric_name not in aliases:
+        raise ValueError(f"Unsupported {task} metric: {metric}")
+    return aliases[metric_name]
+
+
+def _metric_value(y_true, y_pred, task: str, metric: str):
+    metric_name = _normalize_metric_name(task, metric)
+    if task == "classification":
+        if metric_name == "accuracy":
+            return accuracy_score(y_true, y_pred)
+        if metric_name in {"precision_weighted", "recall_weighted"}:
+            scores = precision_recall_fscore_support(
+                y_true, y_pred, average="weighted", zero_division=0
+            )
+            return scores[0 if metric_name == "precision_weighted" else 1]
+        if metric_name == "f1_weighted":
+            return f1_score(y_true, y_pred, average="weighted", zero_division=0)
+        if metric_name == "f1_macro":
+            return f1_score(y_true, y_pred, average="macro", zero_division=0)
+
+    if metric_name == "r2":
         return r2_score(y_true, y_pred)
-    if metric_name in {"mse", "mean_squared_error"}:
+    if metric_name == "mse":
         return mean_squared_error(y_true, y_pred)
-    if metric_name in {"rmse", "root_mean_squared_error"}:
-        return mean_squared_error(y_true, y_pred, squared=False)
-    if metric_name in {"mae", "mean_absolute_error"}:
+    if metric_name == "rmse":
+        return np.sqrt(mean_squared_error(y_true, y_pred))
+    if metric_name == "mae":
         return mean_absolute_error(y_true, y_pred)
-    if metric_name in {"msle", "mean_squared_log_error"}:
+    if metric_name == "msle":
         return mean_squared_log_error(y_true, y_pred)
-    return r2_score(y_true, y_pred)
 
 
 def _metric_direction(task: str, metric: str) -> str:
-    metric_name = str(metric).lower().replace(" ", "_")
-    if task == "classification":
-        if metric_name in {"accuracy", "acc", "precision", "recall", "f1", "f1_weighted", "f1_macro"}:
-            return "higher"
-        return "higher"
+    metric_name = _normalize_metric_name(task, metric)
     if metric_name in {"mae", "mse", "rmse", "msle"}:
         return "lower"
     return "higher"
@@ -1283,17 +1316,18 @@ def compare_models(df, target_column, task="classification", metric=None, test_s
 
     default_metric = "accuracy" if task == "classification" else "r2"
     chosen_metric = default_metric if metric is None else str(metric)
+    _normalize_metric_name(task, chosen_metric)
     candidate_names = _model_candidates(task)
     if model_names:
-        requested = []
-        for name in model_names:
-            if str(name) in candidate_names:
-                requested.append(str(name))
-        if not requested:
-            raise ValueError(f"Unsupported model names for {task}: {model_names}")
+        requested = [str(name) for name in model_names]
+        unsupported = [name for name in requested if name not in candidate_names]
+        if unsupported:
+            raise ValueError(f"Unsupported model names for {task}: {unsupported}")
+        requested = list(dict.fromkeys(requested))
         candidate_names = {key: candidate_names[key] for key in requested}
 
     model_results = []
+    model_failures = []
     for name, model in candidate_names.items():
         try:
             fitted = model.fit(train_features, train_target)
@@ -1308,17 +1342,24 @@ def compare_models(df, target_column, task="classification", metric=None, test_s
                     "recall_weighted": precision_recall_fscore_support(test_target, predictions, average="weighted", zero_division=0)[1] if task == "classification" else None,
                     "f1_weighted": f1_score(test_target, predictions, average="weighted", zero_division=0) if task == "classification" else None,
                     "mae": mean_absolute_error(test_target, predictions) if task == "regression" else None,
-                    "rmse": mean_squared_error(test_target, predictions, squared=False) if task == "regression" else None,
+                    "rmse": float(np.sqrt(mean_squared_error(test_target, predictions))) if task == "regression" else None,
                     "r2": r2_score(test_target, predictions) if task == "regression" else None,
                     chosen_metric: float(metric_value),
                 },
                 "feature_importance": _feature_importance_for_model(fitted, features.columns.tolist())[:10],
             })
-        except Exception:
+        except Exception as error:
+            model_failures.append({"model": name, "error": str(error)})
             continue
 
     if not model_results:
-        raise ValueError(f"No candidate model could be trained for the {task} task.")
+        failure_details = "; ".join(
+            f"{failure['model']}: {failure['error']}" for failure in model_failures
+        )
+        raise ValueError(
+            f"No candidate model could be trained for the {task} task. "
+            f"Model failures: {failure_details}"
+        )
 
     direction = _metric_direction(task, chosen_metric)
     best_entry = max(model_results, key=lambda item: item["score"]) if direction == "higher" else min(model_results, key=lambda item: item["score"])
@@ -1333,6 +1374,7 @@ def compare_models(df, target_column, task="classification", metric=None, test_s
         "target": target_column,
         "metric": chosen_metric,
         "direction": direction,
+        "model_failures": model_failures,
         "selected_model": best_entry["model"],
         "best_score": round(float(best_entry["score"]), 6),
         "models": [
