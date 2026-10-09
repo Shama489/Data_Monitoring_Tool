@@ -72,6 +72,8 @@ use. Available management endpoints include:
 
 - `POST /api/datasets`, `GET /api/datasets`, and `GET`/`DELETE /api/datasets/{id}`
 - `POST /api/datasets/upload?name=events.csv` for bounded raw CSV uploads
+- `POST /api/assistant/ask` for text or voice-transcribed monitoring questions;
+  `language` supports `en`, `es`, `fr`, and `hi`
 - `GET /api/monitoring/results` and `GET /api/monitoring/results/{id}`
 - `GET`/`POST`/`DELETE /api/alerts/rules` and `GET /api/alerts/history`
 - `GET`/`PUT /api/configurations` and `DELETE /api/configurations/{key}`
@@ -82,6 +84,16 @@ use. Available management endpoints include:
 Monitoring workflows automatically persist their input datasets and result.
 Saved datasets can be monitored again by passing their `dataset_id` to
 `POST /api/monitoring/analyze`.
+
+The dashboard's **Voice assistant** tab accepts typed questions or browser
+speech recognition for English, Spanish, French, and Hindi, and can read its
+answer aloud where browser speech synthesis is available. Voice input requires
+a browser with Web Speech API support and microphone permission; typed questions
+remain available when speech recognition is unsupported or denied. Recognition
+is handled by the browser's speech service, whose audio-processing and privacy
+behavior depends on the browser/provider. The transcript is sent to this API
+only after recognition. The assistant analyzes the selected saved dataset
+snapshot; “today” does not imply a separate time-filtered query.
 
 ## Dataset lineage, versions, and comparison
 

@@ -332,6 +332,30 @@ def test_quality_endpoint_rejects_non_boolean_llm_flag():
     assert response.json()["detail"] == "use_llm must be a boolean"
 
 
+def test_assistant_endpoint_returns_answer_in_requested_language():
+    response = client.post(
+        "/api/assistant/ask",
+        json={
+            "question": "¿Cuál es la puntuación de calidad de datos de hoy?",
+            "language": "es",
+            "data": [{"value": 1}, {"value": 2}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["category"] == "quality"
+    assert "/100" in response.json()["answer"]
+
+
+def test_assistant_endpoint_rejects_invalid_language_type():
+    response = client.post(
+        "/api/assistant/ask",
+        json={"question": "show anomalies", "language": [], "data": [{"value": 1}]},
+    )
+
+    assert response.status_code == 400
+
+
 def test_advanced_ml_endpoint_runs_clustering_and_persists_report():
     response = client.post(
         "/api/analytics/advanced-ml",

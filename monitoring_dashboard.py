@@ -3,12 +3,19 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
 import plotly.express as px
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
+
+_voice_command_component = components.declare_component(
+    "monitoring_voice_commands",
+    path=str(Path(__file__).parent / "voice_component"),
+)
 
 
 def _get(
@@ -54,6 +61,115 @@ def _run_monitoring(
     result = response.json()
     st.session_state["dashboard_latest_run_id"] = result["result_id"]
     st.success(f"Monitoring completed · result `{result['result_id']}`")
+
+
+def _render_voice_assistant(
+    api_base_url: str,
+    headers: dict[str, str],
+    datasets: list[dict[str, Any]],
+) -> None:
+    st.subheader("Ask monitoring by voice or text")
+    language_labels = {
+        "English": ("en", "en-US"),
+        "Español": ("es", "es-ES"),
+        "Français": ("fr", "fr-FR"),
+        "हिन्दी": ("hi", "hi-IN"),
+    }
+    selected_language = st.selectbox(
+        "Query and response language",
+        list(language_labels),
+        key="assistant_language",
+    )
+    language_code, speech_locale = language_labels[selected_language]
+
+    if not datasets:
+        st.info("Save or upload a dataset before asking monitoring questions.")
+        return
+
+    dataset_by_label = {
+        f"{item['name']} · {item['id']}": item for item in datasets
+    }
+    selected_label = st.selectbox(
+        "Dataset snapshot",
+        list(dataset_by_label),
+        key="assistant_dataset",
+    )
+    st.caption(
+        "Quality questions, including “today’s score,” use the selected saved dataset snapshot."
+    )
+
+    voice_value = _voice_command_component(
+        language=speech_locale,
+        speech_text=st.session_state.get("assistant_last_answer", ""),
+        key="monitoring_voice_command",
+        default=None,
+    )
+    new_voice_command = False
+    if isinstance(voice_value, dict):
+        nonce = voice_value.get("nonce")
+        transcript = voice_value.get("transcript")
+        if (
+            nonce is not None
+            and nonce != st.session_state.get("assistant_voice_nonce")
+            and isinstance(transcript, str)
+            and transcript.strip()
+        ):
+            st.session_state["assistant_voice_nonce"] = nonce
+            st.session_state["assistant_question"] = transcript.strip()
+            new_voice_command = True
+
+    question = st.text_input(
+        "Monitoring question",
+        placeholder="Show anomaly report, today's quality score, or columns with missing values",
+        key="assistant_question",
+    )
+    previous_answer = st.session_state.get("assistant_last_response")
+    if isinstance(previous_answer, dict):
+        st.markdown(previous_answer.get("answer", ""))
+        st.caption(
+            f"Category: {previous_answer.get('category', 'unknown')} · "
+            f"Confidence: {previous_answer.get('confidence', 'unknown')}"
+        )
+        if isinstance(previous_answer.get("context"), dict):
+            st.json(previous_answer["context"])
+
+    submit = st.button("Ask", type="primary", key="assistant_ask_button")
+    if not (submit or new_voice_command):
+        return
+    if not question.strip():
+        st.warning("Enter a question or use the microphone to speak one.")
+        return
+
+    dataset_id = dataset_by_label[selected_label]["id"]
+    dataset_response = _get(
+        api_base_url,
+        headers,
+        f"/api/datasets/{dataset_id}",
+    )
+    if dataset_response is None:
+        return
+
+    try:
+        response = requests.post(
+            f"{api_base_url}/api/assistant/ask",
+            headers=headers,
+            json={
+                "question": question,
+                "language": language_code,
+                "data": dataset_response.get("data", []),
+            },
+            timeout=60,
+        )
+    except requests.RequestException as error:
+        st.error(f"Assistant request failed: {error}")
+        return
+    if response.status_code != 200:
+        st.error(response.json().get("detail", "The assistant could not answer."))
+        return
+    answer = response.json()
+    st.session_state["assistant_last_answer"] = answer["answer"]
+    st.session_state["assistant_last_response"] = answer
+    st.rerun()
 
 
 def _result_rows(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -599,8 +715,15 @@ def render_monitoring_dashboard(
         return
     schedules = schedules_payload.get("schedules") or []
 
-    overview_tab, run_tab, lineage_tab, schedules_tab, history_tab = st.tabs(
-        ["Overview", "Run monitoring", "Lineage & versions", "Schedules", "History & alerts"]
+    overview_tab, run_tab, lineage_tab, schedules_tab, history_tab, assistant_tab = st.tabs(
+        [
+            "Overview",
+            "Run monitoring",
+            "Lineage & versions",
+            "Schedules",
+            "History & alerts",
+            "Voice assistant",
+        ]
     )
     with overview_tab:
         _render_overview(results)
@@ -719,3 +842,6 @@ def render_monitoring_dashboard(
 
     with history_tab:
         _render_history(api_base_url, headers, results, role)
+
+    with assistant_tab:
+        _render_voice_assistant(api_base_url, headers, datasets)

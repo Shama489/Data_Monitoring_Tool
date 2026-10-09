@@ -407,6 +407,9 @@ def assistant_ask_endpoint(payload: dict[str, Any]):
     question = payload.get("question")
     if not isinstance(question, str) or not question.strip():
         _bad_request("question must be a non-empty string")
+    language = payload.get("language", "en")
+    if not isinstance(language, str) or language not in {"en", "es", "fr", "hi"}:
+        _bad_request("language must be one of: en, es, fr, hi")
 
     df_value = payload.get("data") or payload.get("dataset") or payload.get("records")
     df = None
@@ -437,6 +440,7 @@ def assistant_ask_endpoint(payload: dict[str, Any]):
         quality_report=quality_report,
         drift_report=drift_report,
         anomaly_report=anomaly_report,
+        language=language,
     )
     return {"question": question, **response}
 
