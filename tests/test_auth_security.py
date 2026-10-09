@@ -71,6 +71,15 @@ def test_users_have_role_permissions_and_isolated_encrypted_datasets():
     )
     assert saved.status_code == 201
     dataset_id = saved.json()["id"]
+    advanced_analysis = analyst.post(
+        "/api/analytics/advanced-ml",
+        json={
+            "analysis": "clustering",
+            "n_clusters": 2,
+            "data": [{"value": 0}, {"value": 1}, {"value": 10}, {"value": 11}],
+        },
+    )
+    assert advanced_analysis.status_code == 200
 
     connection = sqlite3.connect(database_path())
     try:
@@ -102,8 +111,15 @@ def test_users_have_role_permissions_and_isolated_encrypted_datasets():
     assert viewer.post(
         "/api/datasets", json={"name": "denied", "data": [{"x": 1}]}
     ).status_code == 403
+    assert viewer.post(
+        "/api/analytics/advanced-ml",
+        json={"analysis": "clustering", "data": [{"value": 1}, {"value": 2}, {"value": 3}]},
+    ).status_code == 403
     assert analyst.post("/api/auth/users", json={}).status_code == 403
-    assert analyst.get("/api/datasets").json()["datasets"][0]["id"] == dataset_id
+    analyst_dataset_ids = {
+        dataset["id"] for dataset in analyst.get("/api/datasets").json()["datasets"]
+    }
+    assert dataset_id in analyst_dataset_ids
 
     uploaded = analyst.post(
         "/api/datasets/upload",

@@ -50,6 +50,7 @@ _WRITE_PATHS = {
     "/api/analytics/trends",
     "/api/analytics/forecast",
     "/api/analytics/explain",
+    "/api/analytics/advanced-ml",
 }
 MAX_PASSWORD_LENGTH = 1024
 

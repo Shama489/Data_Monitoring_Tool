@@ -13,11 +13,15 @@ from profiler import (
     calculate_data_quality_score,
     check_data_quality,
     classify_drift_severity,
+    analyze_clusters,
+    analyze_predictive_maintenance,
     compare_models,
+    detect_fraud_patterns,
     detect_anomalies_isolation_forest,
     forecast_data_health,
     forecast_metric,
     generate_ai_quality_summary,
+    recommend_items,
     train_and_explain_model,
 )
 
@@ -332,6 +336,86 @@ def test_multiclass_linear_feature_importance_matches_feature_names():
     importance = _feature_importance_for_model(model, ["first", "second"])
 
     assert {item["feature"] for item in importance} == {"first", "second"}
+
+
+def test_advanced_clustering_reports_assignments_and_cluster_profiles():
+    df = pd.DataFrame({
+        "temperature": [10, 10.2, 9.8, 10.1, 10.3, 9.9, 90, 90.2, 89.8, 90.1, 90.3, 89.9],
+        "machine": ["A"] * 6 + ["B"] * 6,
+    })
+
+    report = analyze_clusters(df, n_clusters=2)
+
+    assert report["analysis"] == "clustering"
+    assert report["actual_clusters"] == 2
+    assert sum(cluster["rows"] for cluster in report["clusters"]) == len(df)
+    assert len(report["assignments"]) == len(df)
+    assert report["silhouette_score"] > 0
+
+
+def test_fraud_detection_flags_outlier_and_describes_caveat():
+    df = pd.DataFrame({
+        "amount": list(range(39)) + [10000],
+        "duration": [1] * 39 + [100],
+    })
+
+    report = detect_fraud_patterns(df, contamination=0.05)
+
+    assert report["analysis"] == "fraud_detection"
+    assert report["total_flagged"] >= 1
+    assert any(row["row_index"] == "39" for row in report["flagged_rows"])
+    assert "not confirmed fraud" in report["interpretation"]
+
+
+def test_predictive_maintenance_uses_automl_model_selection():
+    df = pd.DataFrame({
+        "temperature": list(range(30)),
+        "failure": [int(value >= 20) for value in range(30)],
+    })
+
+    report = analyze_predictive_maintenance(
+        df,
+        "failure",
+        model_names=["decision_tree"],
+    )
+
+    assert report["analysis"] == "predictive_maintenance"
+    assert report["selected_model"] == "decision_tree"
+    assert report["target_interpretation"] == "Failure/event classification"
+    assert report["models"][0]["metrics"]["accuracy"] >= 0
+
+
+def test_recommendations_exclude_seen_items_and_use_item_similarity():
+    df = pd.DataFrame({
+        "user": ["u1", "u1", "u2", "u2", "u2", "u3", "u3"],
+        "item": ["book-a", "book-b", "book-a", "book-b", "book-c", "book-b", "book-c"],
+        "rating": [5, 4, 5, 4, 5, 5, 5],
+    })
+
+    report = recommend_items(
+        df,
+        "user",
+        "item",
+        rating_column="rating",
+        user_id="u1",
+    )
+
+    assert report["method"] == "item_similarity"
+    assert report["recommendations"]
+    assert all(item["item"] not in {"book-a", "book-b"} for item in report["recommendations"])
+    assert report["recommendations"][0]["item"] == "book-c"
+
+
+def test_recommendations_use_popularity_for_cold_start():
+    df = pd.DataFrame({
+        "user": ["u1", "u2", "u3"],
+        "item": ["popular", "popular", "other"],
+    })
+
+    report = recommend_items(df, "user", "item", user_id="u-new")
+
+    assert report["method"] == "popularity"
+    assert report["recommendations"][0]["item"] == "popular"
 
 
 def test_get_table_data_rejects_invalid_table_names():
