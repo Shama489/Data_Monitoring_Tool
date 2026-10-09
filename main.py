@@ -16,14 +16,18 @@ from agents.monitoring_agent import (
     run_monitoring,
 )
 from profiler import (
+    analyze_clusters,
     analyze_dataset_drift,
+    analyze_predictive_maintenance,
     analyze_trends,
     answer_monitoring_question,
     calculate_data_quality_score,
     check_data_quality,
+    detect_fraud_patterns,
     forecast_data_health,
     forecast_metric,
     generate_ai_quality_summary,
+    recommend_items,
     train_and_explain_model,
 )
 from notifications import (
@@ -1363,4 +1367,68 @@ def explain_model_endpoint(payload: dict[str, Any]):
         _bad_request(str(error))
     response = {"report": report}
     response.update(_persist_endpoint_result(payload, frame, "explanation", response))
+    return response
+
+
+@app.post("/api/analytics/advanced-ml")
+def advanced_ml_endpoint(payload: dict[str, Any]):
+    dataset = payload.get("data") or payload.get("dataset") or payload.get("records")
+    analysis = payload.get("analysis")
+    if dataset is None:
+        _bad_request("Dataset is required.")
+    if analysis not in {
+        "clustering",
+        "fraud_detection",
+        "predictive_maintenance",
+        "recommendation",
+    }:
+        _bad_request(
+            "analysis must be clustering, fraud_detection, "
+            "predictive_maintenance, or recommendation."
+        )
+
+    try:
+        frame = pd.DataFrame(dataset)
+        if analysis == "clustering":
+            report = analyze_clusters(
+                frame,
+                payload.get("n_clusters", 3),
+                payload.get("feature_columns"),
+            )
+        elif analysis == "fraud_detection":
+            report = detect_fraud_patterns(
+                frame,
+                payload.get("feature_columns"),
+                payload.get("contamination", 0.05),
+            )
+        elif analysis == "predictive_maintenance":
+            target_column = payload.get("target_column")
+            if not isinstance(target_column, str) or not target_column:
+                _bad_request("target_column is required for predictive maintenance.")
+            report = analyze_predictive_maintenance(
+                frame,
+                target_column,
+                payload.get("task", "classification"),
+                payload.get("metric"),
+                payload.get("test_size", 0.2),
+                payload.get("model_names"),
+            )
+        else:
+            user_column = payload.get("user_column")
+            item_column = payload.get("item_column")
+            if not isinstance(user_column, str) or not isinstance(item_column, str):
+                _bad_request("user_column and item_column are required for recommendations.")
+            report = recommend_items(
+                frame,
+                user_column,
+                item_column,
+                payload.get("rating_column"),
+                payload.get("user_id"),
+                payload.get("top_n", 10),
+            )
+    except (TypeError, ValueError) as error:
+        _bad_request(str(error))
+
+    response = {"report": report}
+    response.update(_persist_endpoint_result(payload, frame, f"advanced_ml_{analysis}", response))
     return response

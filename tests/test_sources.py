@@ -332,6 +332,39 @@ def test_quality_endpoint_rejects_non_boolean_llm_flag():
     assert response.json()["detail"] == "use_llm must be a boolean"
 
 
+def test_advanced_ml_endpoint_runs_clustering_and_persists_report():
+    response = client.post(
+        "/api/analytics/advanced-ml",
+        json={
+            "analysis": "clustering",
+            "n_clusters": 2,
+            "data": [
+                {"temperature": 10.0},
+                {"temperature": 10.2},
+                {"temperature": 90.0},
+                {"temperature": 90.2},
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["report"]["analysis"] == "clustering"
+    assert len(body["report"]["assignments"]) == 4
+    stored = client.get(f"/api/monitoring/results/{body['result_id']}")
+    assert stored.status_code == 200
+    assert stored.json()["result"]["report"] == body["report"]
+
+
+def test_advanced_ml_endpoint_rejects_unknown_analysis():
+    response = client.post(
+        "/api/analytics/advanced-ml",
+        json={"analysis": "unknown", "data": [{"value": 1}]},
+    )
+
+    assert response.status_code == 400
+
+
 def test_quality_endpoint_triggers_notifications_when_requested(monkeypatch):
     seen = {}
 

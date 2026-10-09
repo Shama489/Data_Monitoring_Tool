@@ -32,9 +32,13 @@ from sklearn.metrics import (
     mean_squared_log_error,
     precision_recall_fscore_support,
     r2_score,
+    silhouette_score,
 )
+from sklearn.cluster import KMeans
 from sklearn.model_selection import train_test_split
 from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.preprocessing import StandardScaler
 from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor
 
 try:
@@ -1403,6 +1407,336 @@ def select_best_model(df, target_column, task="classification", metric=None, tes
 def automl_model_selection(df, target_column, task="classification", metric=None, test_size=0.2, model_names=None):
     """Compatibility alias for model-selection workflows."""
     return compare_models(df, target_column, task=task, metric=metric, test_size=test_size, model_names=model_names)
+
+
+def _advanced_feature_matrix(df, feature_columns=None, exclude_columns=()):
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        raise ValueError("A non-empty dataframe is required.")
+
+    if feature_columns is None:
+        selected_columns = [
+            column for column in df.columns if column not in set(exclude_columns)
+        ]
+    else:
+        if not isinstance(feature_columns, (list, tuple)) or not feature_columns:
+            raise ValueError("feature_columns must be a non-empty list when provided.")
+        missing_columns = [column for column in feature_columns if column not in df.columns]
+        if missing_columns:
+            raise ValueError(f"Feature columns were not found: {missing_columns}")
+        selected_columns = list(dict.fromkeys(feature_columns))
+
+    if not selected_columns:
+        raise ValueError("At least one feature column is required.")
+
+    working = df.loc[:, selected_columns].copy()
+    for column in working.columns:
+        if pd.api.types.is_datetime64_any_dtype(working[column]):
+            parsed_dates = pd.to_datetime(working[column], errors="coerce")
+            working[column] = parsed_dates.astype("int64").where(
+                parsed_dates.notna(), np.nan
+            ) / 10**9
+        elif not pd.api.types.is_numeric_dtype(working[column]):
+            working[column] = working[column].astype("string").fillna("__missing__")
+
+    features = pd.get_dummies(working, dummy_na=True, dtype=float)
+    features = features.replace([np.inf, -np.inf], np.nan)
+    features = features.fillna(features.median(numeric_only=True)).fillna(0.0)
+    varying_columns = features.columns[features.nunique(dropna=False) > 1]
+    features = features.loc[:, varying_columns].astype(float)
+    if features.shape[1] == 0:
+        raise ValueError("At least one non-constant usable feature is required.")
+    return features
+
+
+def _json_safe_value(value):
+    if value is None or value is pd.NA:
+        return None
+    if isinstance(value, (pd.Timestamp, pd.Timedelta)):
+        return value.isoformat()
+    if isinstance(value, np.generic):
+        return value.item()
+    if pd.isna(value):
+        return None
+    return value
+
+
+def analyze_clusters(df, n_clusters=3, feature_columns=None):
+    """Cluster rows and report assignments, cluster sizes, and separation quality."""
+    if isinstance(n_clusters, bool):
+        raise ValueError("n_clusters must be an integer of at least 2.")
+    try:
+        n_clusters = int(n_clusters)
+    except (TypeError, ValueError) as error:
+        raise ValueError("n_clusters must be an integer of at least 2.") from error
+    if n_clusters < 2:
+        raise ValueError("n_clusters must be at least 2.")
+    if len(df) <= n_clusters:
+        raise ValueError("n_clusters must be smaller than the number of rows.")
+
+    features = _advanced_feature_matrix(df, feature_columns=feature_columns)
+    scaler = StandardScaler()
+    scaled_features = scaler.fit_transform(features)
+    model = KMeans(n_clusters=n_clusters, n_init=10, random_state=42)
+    labels = model.fit_predict(scaled_features)
+    cluster_counts = pd.Series(labels).value_counts().sort_index()
+
+    score = None
+    if 1 < len(cluster_counts) < len(labels):
+        score = float(silhouette_score(
+            scaled_features,
+            labels,
+            sample_size=min(2000, len(labels)),
+            random_state=42,
+        ))
+
+    centers = scaler.inverse_transform(model.cluster_centers_)
+    cluster_summaries = []
+    for cluster_id, count in cluster_counts.items():
+        center = centers[cluster_id]
+        representative_features = sorted(
+            zip(features.columns, center),
+            key=lambda item: abs(float(item[1])),
+            reverse=True,
+        )[:5]
+        cluster_summaries.append({
+            "cluster": int(cluster_id),
+            "rows": int(count),
+            "center": {
+                str(name): round(float(value), 6)
+                for name, value in zip(features.columns, center)
+            },
+            "representative_features": [
+                {"feature": str(name), "value": round(float(value), 6)}
+                for name, value in representative_features
+            ],
+        })
+
+    assignments = [
+        {"row_index": str(index), "cluster": int(label)}
+        for index, label in zip(df.index[:1000], labels[:1000])
+    ]
+    return {
+        "analysis": "clustering",
+        "rows": int(len(df)),
+        "feature_count": int(features.shape[1]),
+        "features": [str(column) for column in features.columns],
+        "requested_clusters": n_clusters,
+        "actual_clusters": int(len(cluster_counts)),
+        "silhouette_score": round(score, 6) if score is not None else None,
+        "clusters": cluster_summaries,
+        "assignments": assignments,
+        "assignments_truncated": len(df) > len(assignments),
+    }
+
+
+def detect_fraud_patterns(df, feature_columns=None, contamination=0.05):
+    """Flag anomalous transactions for fraud review; detections are not fraud verdicts."""
+    if isinstance(contamination, bool):
+        raise ValueError("contamination must be between 0.001 and 0.5.")
+    try:
+        contamination = float(contamination)
+    except (TypeError, ValueError) as error:
+        raise ValueError("contamination must be between 0.001 and 0.5.") from error
+    if not math.isfinite(contamination) or not 0.001 <= contamination <= 0.5:
+        raise ValueError("contamination must be between 0.001 and 0.5.")
+
+    features = _advanced_feature_matrix(df, feature_columns=feature_columns)
+    if len(features) < 2:
+        raise ValueError("At least two rows are required for fraud-pattern detection.")
+    scaled_features = StandardScaler().fit_transform(features)
+    model = IsolationForest(
+        contamination=contamination,
+        n_estimators=200,
+        random_state=42,
+    ).fit(scaled_features)
+    predictions = model.predict(scaled_features)
+    risk_scores = -model.decision_function(scaled_features)
+
+    suspicious = []
+    for position in np.flatnonzero(predictions == -1):
+        row = {
+            "row_index": str(df.index[position]),
+            "risk_score": round(float(risk_scores[position]), 6),
+            "top_signals": [
+                {"feature": str(features.columns[feature_index]), "deviation": round(float(scaled_features[position, feature_index]), 4)}
+                for feature_index in np.argsort(np.abs(scaled_features[position]))[::-1][:5]
+            ],
+        }
+        suspicious.append(row)
+
+    return {
+        "analysis": "fraud_detection",
+        "method": "isolation_forest",
+        "rows": int(len(df)),
+        "feature_count": int(features.shape[1]),
+        "contamination": contamination,
+        "total_flagged": len(suspicious),
+        "flagged_rows": suspicious[:1000],
+        "flagged_rows_truncated": len(suspicious) > 1000,
+        "interpretation": "Flags are unusual patterns for investigation, not confirmed fraud.",
+    }
+
+
+def analyze_predictive_maintenance(
+    df,
+    target_column,
+    task="classification",
+    metric=None,
+    test_size=0.2,
+    model_names=None,
+):
+    """Select and evaluate models for failure classification or remaining-life prediction."""
+    if task not in {"classification", "regression"}:
+        raise ValueError("task must be classification or regression.")
+    comparison = compare_models(
+        df,
+        target_column,
+        task=task,
+        metric=metric,
+        test_size=test_size,
+        model_names=model_names,
+    )
+    comparison["analysis"] = "predictive_maintenance"
+    comparison["target_interpretation"] = (
+        "Failure/event classification" if task == "classification"
+        else "Remaining useful life or another numeric maintenance outcome"
+    )
+    comparison["interpretation"] = (
+        "Model rankings estimate predictive performance on a held-out sample; "
+        "validate against time-based splits before operational use."
+    )
+    return comparison
+
+
+def recommend_items(
+    df,
+    user_column,
+    item_column,
+    rating_column=None,
+    user_id=None,
+    top_n=10,
+):
+    """Recommend unseen items using item similarity with a popularity fallback."""
+    required_columns = [user_column, item_column]
+    if rating_column:
+        required_columns.append(rating_column)
+    missing_columns = [column for column in required_columns if column not in df.columns]
+    if missing_columns:
+        raise ValueError(f"Recommendation columns were not found: {missing_columns}")
+    if isinstance(top_n, bool):
+        raise ValueError("top_n must be an integer between 1 and 100.")
+    try:
+        top_n = int(top_n)
+    except (TypeError, ValueError) as error:
+        raise ValueError("top_n must be an integer between 1 and 100.") from error
+    if not 1 <= top_n <= 100:
+        raise ValueError("top_n must be between 1 and 100.")
+
+    selected = df[required_columns].dropna(subset=[user_column, item_column]).copy()
+    if selected.empty:
+        raise ValueError("At least one user-item interaction is required.")
+    if rating_column:
+        selected["_rating"] = pd.to_numeric(selected[rating_column], errors="coerce")
+        selected = selected.dropna(subset=["_rating"])
+        if selected.empty:
+            raise ValueError("The rating column must contain numeric ratings.")
+    else:
+        selected["_rating"] = 1.0
+
+    users = pd.Index(pd.unique(selected[user_column]))
+    items = pd.Index(pd.unique(selected[item_column]))
+    user_lookup = {value: index for index, value in enumerate(users)}
+    item_lookup = {value: index for index, value in enumerate(items)}
+    selected["_user_code"] = selected[user_column].map(user_lookup)
+    selected["_item_code"] = selected[item_column].map(item_lookup)
+    interactions = selected.groupby(
+        ["_user_code", "_item_code"], sort=False
+    )["_rating"].mean()
+    item_popularity = selected.groupby("_item_code", sort=False).size().reindex(
+        range(len(items)), fill_value=0
+    ).to_numpy(dtype=float)
+    popular_codes = np.argsort(-item_popularity, kind="stable")
+
+    selected_user_code = None
+    if user_id is not None:
+        try:
+            selected_user_code = user_lookup.get(user_id)
+        except TypeError:
+            selected_user_code = None
+        if selected_user_code is None:
+            fallback_reason = "User was not found in interactions; returning popular items."
+
+    seen_codes = set()
+    scoring = None
+    recommendation_method = "popularity"
+    fallback_reason = None
+    if selected_user_code is not None:
+        seen_codes = set(
+            selected.loc[
+                selected["_user_code"] == selected_user_code, "_item_code"
+            ].astype(int).tolist()
+        )
+        if len(items) <= 2000 and len(users) * len(items) <= 4_000_000:
+            interaction_matrix = interactions.unstack(fill_value=0).reindex(
+                index=range(len(users)),
+                columns=range(len(items)),
+                fill_value=0,
+            )
+            user_ratings = interaction_matrix.iloc[selected_user_code].to_numpy(dtype=float)
+            similarity = cosine_similarity(interaction_matrix.to_numpy(dtype=float).T)
+            weights = (user_ratings != 0).astype(float)
+            denominator = np.abs(similarity) @ weights
+            scoring = np.divide(
+                similarity @ user_ratings,
+                denominator,
+                out=np.zeros(len(items), dtype=float),
+                where=denominator > 0,
+            )
+            scoring[list(seen_codes)] = -np.inf
+            recommendation_method = "item_similarity"
+        else:
+            fallback_reason = "Interaction matrix exceeded the item-similarity size limit."
+
+    if scoring is not None and np.any(np.isfinite(scoring) & (scoring != 0)):
+        candidate_codes = sorted(
+            (code for code in range(len(items)) if code not in seen_codes),
+            key=lambda code: (-float(scoring[code]), -item_popularity[code], code),
+        )
+        candidate_reason = "similarity to items already used by this user"
+    else:
+        candidate_codes = [
+            int(code) for code in popular_codes if int(code) not in seen_codes
+        ]
+        if selected_user_code is not None and not fallback_reason:
+            fallback_reason = "No usable item-similarity scores were available."
+        if fallback_reason:
+            recommendation_method = "popularity_fallback"
+        candidate_reason = "overall interaction popularity"
+
+    recommendations = []
+    for code in candidate_codes[:top_n]:
+        score = (
+            float(scoring[code])
+            if scoring is not None and np.isfinite(scoring[code])
+            else float(item_popularity[code])
+        )
+        recommendations.append({
+            "item": _json_safe_value(items[code]),
+            "score": round(score, 6),
+            "interaction_count": int(item_popularity[code]),
+            "reason": candidate_reason,
+        })
+
+    return {
+        "analysis": "recommendation",
+        "user_id": _json_safe_value(user_id),
+        "method": recommendation_method,
+        "users": int(len(users)),
+        "items": int(len(items)),
+        "interactions": int(len(selected)),
+        "recommendations": recommendations,
+        "fallback_reason": fallback_reason,
+    }
 
 
 def train_and_explain_model(df, target_column, task="classification", test_size=0.2):

@@ -142,6 +142,30 @@ Users can upload or select datasets permitted by their role. The **Explainable A
 standalone classification/regression workflow, target selection, holdout
 evaluation, feature importance, per-row SHAP explanations, and JSON download.
 
+## Advanced ML analytics
+
+Authenticated analysts can submit specialized workflows to
+`POST /api/analytics/advanced-ml`. Every successful analysis persists its input
+dataset and report. Set `analysis` to one of:
+
+- `clustering`: K-means segments rows; supports `n_clusters` and optional
+  `feature_columns`, and reports cluster profiles, row assignments, and a
+  sampled silhouette score.
+- `fraud_detection`: Isolation Forest ranks unusual records for review; supports
+  `contamination` and optional `feature_columns`. Flags indicate anomalies, not
+  confirmed fraud.
+- `predictive_maintenance`: compares supervised models for a failure/event
+  target (`task: "classification"`) or remaining-useful-life/numeric target
+  (`task: "regression"`); accepts `target_column`, `metric`, `test_size`, and
+  optional `model_names`. Validate time-based splits before operational use.
+- `recommendation`: returns item-similarity recommendations for a user, with a
+  popularity fallback for new users or large interaction matrices. Provide
+  `user_column`, `item_column`, optional `rating_column`, `user_id`, and
+  `top_n`. When `user_id` is omitted, it returns globally popular items.
+
+For example, cluster a dataset with
+`{"analysis":"clustering","n_clusters":2,"data":[{"temperature":18},{"temperature":19},{"temperature":41},{"temperature":42}]}`.
+
 ---
 
 ## Key Features
@@ -164,6 +188,7 @@ evaluation, feature importance, per-row SHAP explanations, and JSON download.
 - **Cardinality Analysis**: Analyze unique values in each column for better feature understanding.  
 - **Memory Profiling**: Monitor memory usage of each column and optimize dataset performance.  
 - **Model Evaluation**: Train ML models (Random Forest) and evaluate metrics like precision, recall, F1-score, and accuracy with interactive tables and charts.
+- **Advanced ML Analytics**: Run K-means clustering, anomaly-based fraud review, predictive-maintenance model selection, and item recommendations through an authenticated API.
 - **Explainable AI Dashboard**: Explore Random Forest feature importance and optional SHAP explanations through an interactive Streamlit workflow.
 
 ---
