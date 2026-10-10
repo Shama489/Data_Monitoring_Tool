@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body {
+      color: #e8edf2;
+      background: transparent;
+      font: 14px system-ui, sans-serif;
+      margin: 0;
+    }
+    .controls {
+      align-items: center;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.6rem;
+    }
+    button {
+      background: #126e66;
+      border: 0;
+      border-radius: 0.45rem;
+      color: white;
+      cursor: pointer;
+      font: inherit;
+      padding: 0.55rem 0.85rem;
+    }
+    button:disabled {
+      cursor: not-allowed;
+      opacity: 0.55;
+    }
+    #status {
+      color: #b8c2cc;
+    }
+  </style>
+</head>
+<body>
+  <div class="controls">
+    <button id="listen" type="button">🎙️ Speak a question</button>
+    <button id="speak" type="button" hidden>🔊 Read answer aloud</button>
+    <span id="status" aria-live="polite">Microphone use requires browser permission.</span>
+  </div>
+  <script>
+    (() => {
+      const listenButton = document.getElementById("listen");
+      const speakButton = document.getElementById("speak");
+      const status = document.getElementById("status");
+      const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+      let language = "en-US";
+      let speechText = "";
+      let requestId = 0;
+
+      function streamlitMessage(type, values = {}) {
+        window.parent.postMessage({
+          isStreamlitMessage: true,
+          type,
+          ...values,
+        }, "*");
+      }
+
+      function updateFrameHeight() {
+        streamlitMessage("streamlit:setFrameHeight", { height: document.body.scrollHeight });
+      }
+
+      listenButton.addEventListener("click", () => {
+        if (!SpeechRecognition) {
+          status.textContent = "Voice input is unavailable in this browser. Type your question instead.";
+          return;
+        }
+        const recognition = new SpeechRecognition();
+        recognition.lang = language;
+        recognition.interimResults = false;
+        recognition.maxAlternatives = 1;
+        listenButton.disabled = true;
+        status.textContent = "Listening…";
+
+        recognition.onresult = (event) => {
+          const transcript = event.results[0][0].transcript.trim();
+          status.textContent = transcript ? `Heard: ${transcript}` : "No speech was recognized.";
+          if (transcript) {
+            streamlitMessage("streamlit:setComponentValue", {
+              dataType: "json",
+              value: { transcript, nonce: `${Date.now()}-${++requestId}` },
+            });
+          }
+        };
+        recognition.onerror = (event) => {
+          const messages = {
+            "not-allowed": "Microphone permission was denied. Type your question instead.",
+            "service-not-allowed": "Speech recognition is blocked by the browser. Type your question instead.",
+            "no-speech": "No speech was detected. Try again or type your question.",
+          };
+          status.textContent = messages[event.error] || `Voice input failed: ${event.error}.`;
+        };
+        recognition.onend = () => {
+          listenButton.disabled = false;
+        };
+        recognition.start();
+      });
+
+      speakButton.addEventListener("click", () => {
+        if (!speechText || !("speechSynthesis" in window)) {
+          status.textContent = "Spoken responses are unavailable in this browser.";
+          return;
+        }
+        window.speechSynthesis.cancel();
+        const utterance = new SpeechSynthesisUtterance(speechText);
+        utterance.lang = language;
+        window.speechSynthesis.speak(utterance);
+      });
+
+      window.addEventListener("message", (event) => {
+        if (event.data?.type !== "streamlit:render") {
+          return;
+        }
+        const args = event.data.args || {};
+        language = args.language || "en-US";
+        speechText = args.speech_text || "";
+        speakButton.hidden = !speechText;
+        updateFrameHeight();
+      });
+
+      streamlitMessage("streamlit:componentReady", { apiVersion: 1 });
+      updateFrameHeight();
+    })();
+  </script>
+</body>
+</html>

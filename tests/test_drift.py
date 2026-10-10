@@ -134,6 +134,38 @@ def test_monitoring_assistant_answers_quality_and_drift_questions():
     assert "yes" in drift_answer["answer"].lower() or "drift detected" in drift_answer["answer"].lower()
 
 
+@pytest.mark.parametrize(
+    ("language", "question", "intent", "expected"),
+    [
+        ("es", "¿Cuál es la puntuación de calidad de datos de hoy?", "quality", "/100"),
+        ("es", "Muestra las columnas con valores faltantes", "quality", "faltantes"),
+        ("fr", "Montre le rapport d'anomalies", "anomaly", "anomalies"),
+        ("fr", "Affiche les colonnes avec des valeurs manquantes", "quality", "manquantes"),
+        ("hi", "आज डेटा गुणवत्ता स्कोर क्या है?", "quality", "/100"),
+        ("hi", "खाली मान वाले कॉलम दिखाएं", "quality", "कॉलम"),
+    ],
+)
+def test_monitoring_assistant_answers_supported_languages(language, question, intent, expected):
+    df = pd.DataFrame({
+        "sensor": [1, None, 3],
+        "status": ["ok", "bad", None],
+    })
+    result = answer_monitoring_question(
+        question,
+        df=df,
+        anomaly_report={"total_anomalies": 1, "anomaly_percentage": 33.3},
+        language=language,
+    )
+
+    assert result["category"] == intent
+    assert expected in result["answer"]
+
+
+def test_monitoring_assistant_rejects_unsupported_language():
+    with pytest.raises(ValueError, match="language must be one of"):
+        answer_monitoring_question("show anomalies", language="de")
+
+
 def test_generate_ai_quality_summary_uses_llm_when_available(monkeypatch):
     df = pd.DataFrame({"age": [20, None, 30], "score": [10, 12, None]})
     report = check_data_quality(df)

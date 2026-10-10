@@ -69,3 +69,6 @@ scipy==1.14.1
 statsmodels==0.14.4
 tensorflow>=2.16,<3
 cryptography>=44.0.0
+matplotlib>=3.8,<4
+python-pptx>=1.0,<2
+reportlab>=4.2,<5

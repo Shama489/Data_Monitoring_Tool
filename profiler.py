@@ -487,11 +487,110 @@ def answer_monitoring_question(
     drift_report=None,
     anomaly_report=None,
     monitoring_results=None,
+    language="en",
 ):
     if not isinstance(question, str) or not question.strip():
         raise ValueError("question must be a non-empty string")
 
     normalized_question = question.strip().lower()
+    language = str(language).lower()
+    supported_languages = {"en", "es", "fr", "hi"}
+    if language not in supported_languages:
+        raise ValueError(f"language must be one of: {', '.join(sorted(supported_languages))}")
+
+    phrases = {
+        "en": {
+            "missing": ("missing", "null", "blank", "na"),
+            "quality": ("quality", "score", "health", "good", "bad"),
+            "anomaly": ("anomaly", "outlier", "abnormal"),
+            "drift": ("drift", "shift", "distribution"),
+            "summary": ("summary", "overall", "status", "monitor"),
+        },
+        "es": {
+            "missing": ("faltante", "faltantes", "nulo", "nulos", "vacío", "vacio"),
+            "quality": ("calidad", "puntuación", "puntuacion", "puntaje", "salud"),
+            "anomaly": ("anomalía", "anomalia", "atípico", "atipico", "anómalo", "anomalo"),
+            "drift": ("deriva", "cambio", "distribución", "distribucion"),
+            "summary": ("resumen", "general", "estado", "supervisión", "supervision"),
+        },
+        "fr": {
+            "missing": ("manquant", "manquants", "manquante", "manquantes", "nul", "nulle", "vide"),
+            "quality": ("qualité", "qualite", "score", "santé", "sante"),
+            "anomaly": ("anomalie", "anomalies", "aberrant", "anormal"),
+            "drift": ("dérive", "derive", "changement", "distribution"),
+            "summary": ("résumé", "resume", "global", "état", "etat", "surveillance"),
+        },
+        "hi": {
+            "missing": ("लापता", "गुम", "खाली", "शून्य"),
+            "quality": ("गुणवत्ता", "स्कोर", "अंक", "स्वास्थ्य"),
+            "anomaly": ("विसंगति", "विसंगतियां", "असामान्य", "आउटलायर"),
+            "drift": ("ड्रिफ्ट", "बदलाव", "वितरण"),
+            "summary": ("सारांश", "स्थिति", "निगरानी", "कुल"),
+        },
+    }
+    localized = {
+        "en": {
+            "missing_values": "There are {total} missing values across {count} columns.",
+            "no_missing": "There are no missing values in the current dataset.",
+            "impacted": " Impacted columns include: {columns}.",
+            "score": "The overall data quality score is {score:.1f}/100 ({profile} quality profile).",
+            "score_unavailable": "The data quality score is not available from the provided monitoring context.",
+            "anomalies": "I found {total} anomalies, which is {percent:.1f}% of the rows in the dataset.",
+            "anomalies_unavailable": "No anomaly summary was provided for the current dataset.",
+            "drift_yes": "Yes—drift was detected. The overall drift score is {score:.1f} ({severity} severity).",
+            "drift_no": "No material drift was detected. The overall drift score is {score:.1f} ({severity} severity).",
+            "drift_unavailable": "No drift report is available for the current monitoring context.",
+            "summary": "Overall quality is {quality:.1f}/100, drift is {drift:.1f}, and there are {anomalies} anomalies in the current monitoring snapshot.",
+            "help": "I can answer questions about quality scores, missing values, anomalies, drift, and monitoring status.",
+        },
+        "es": {
+            "missing_values": "Hay {total} valores faltantes en {count} columnas.",
+            "no_missing": "No hay valores faltantes en el conjunto de datos actual.",
+            "impacted": " Columnas afectadas: {columns}.",
+            "score": "La puntuación general de calidad de los datos es {score:.1f}/100 (calidad {profile}).",
+            "score_unavailable": "La puntuación de calidad no está disponible en el contexto de supervisión proporcionado.",
+            "anomalies": "Se encontraron {total} anomalías, que representan el {percent:.1f}% de las filas.",
+            "anomalies_unavailable": "No se proporcionó un informe de anomalías para el conjunto de datos actual.",
+            "drift_yes": "Sí, se detectó deriva. La puntuación general es {score:.1f} (severidad {severity}).",
+            "drift_no": "No se detectó deriva significativa. La puntuación es {score:.1f} (severidad {severity}).",
+            "drift_unavailable": "No hay un informe de deriva disponible en el contexto actual.",
+            "summary": "La calidad general es {quality:.1f}/100, la deriva es {drift:.1f} y hay {anomalies} anomalías en la supervisión actual.",
+            "help": "Puedo responder sobre calidad, valores faltantes, anomalías, deriva y estado de supervisión.",
+        },
+        "fr": {
+            "missing_values": "Il y a {total} valeurs manquantes dans {count} colonnes.",
+            "no_missing": "Il n’y a pas de valeurs manquantes dans le jeu de données actuel.",
+            "impacted": " Colonnes concernées : {columns}.",
+            "score": "Le score global de qualité des données est de {score:.1f}/100 (qualité {profile}).",
+            "score_unavailable": "Le score de qualité n’est pas disponible dans le contexte de surveillance fourni.",
+            "anomalies": "{total} anomalies ont été détectées, soit {percent:.1f}% des lignes.",
+            "anomalies_unavailable": "Aucun rapport d’anomalies n’a été fourni pour le jeu de données actuel.",
+            "drift_yes": "Oui, une dérive a été détectée. Le score global est de {score:.1f} (gravité {severity}).",
+            "drift_no": "Aucune dérive significative n’a été détectée. Le score est de {score:.1f} (gravité {severity}).",
+            "drift_unavailable": "Aucun rapport de dérive n’est disponible dans le contexte actuel.",
+            "summary": "La qualité globale est de {quality:.1f}/100, la dérive est de {drift:.1f} et il y a {anomalies} anomalies dans la surveillance actuelle.",
+            "help": "Je peux répondre sur la qualité, les valeurs manquantes, les anomalies, la dérive et l’état de surveillance.",
+        },
+        "hi": {
+            "missing_values": "{count} कॉलम में {total} मान अनुपलब्ध हैं।",
+            "no_missing": "वर्तमान डेटासेट में कोई अनुपलब्ध मान नहीं है।",
+            "impacted": " प्रभावित कॉलम: {columns}।",
+            "score": "डेटा गुणवत्ता का कुल स्कोर {score:.1f}/100 है (गुणवत्ता {profile})।",
+            "score_unavailable": "दिए गए निगरानी संदर्भ में डेटा गुणवत्ता स्कोर उपलब्ध नहीं है।",
+            "anomalies": "{total} विसंगतियां मिलीं, जो डेटासेट की {percent:.1f}% पंक्तियां हैं।",
+            "anomalies_unavailable": "वर्तमान डेटासेट के लिए विसंगति रिपोर्ट उपलब्ध नहीं है।",
+            "drift_yes": "हां, डेटा ड्रिफ्ट मिला। कुल स्कोर {score:.1f} है (गंभीरता {severity})।",
+            "drift_no": "कोई महत्वपूर्ण डेटा ड्रिफ्ट नहीं मिला। स्कोर {score:.1f} है (गंभीरता {severity})।",
+            "drift_unavailable": "वर्तमान निगरानी संदर्भ में ड्रिफ्ट रिपोर्ट उपलब्ध नहीं है।",
+            "summary": "कुल गुणवत्ता {quality:.1f}/100 है, ड्रिफ्ट {drift:.1f} है और वर्तमान निगरानी में {anomalies} विसंगतियां हैं।",
+            "help": "मैं गुणवत्ता स्कोर, अनुपलब्ध मान, विसंगतियों, ड्रिफ्ट और निगरानी स्थिति के बारे में उत्तर दे सकता हूं।",
+        },
+    }[language]
+    intent_phrases = phrases[language]
+
+    def has_intent(intent):
+        return any(token in normalized_question for token in intent_phrases[intent])
+
     if monitoring_results is None:
         monitoring_results = {}
 
@@ -517,14 +616,18 @@ def answer_monitoring_question(
             if value and int(value) > 0
         ]
 
-    if any(token in normalized_question for token in ["missing", "null", "blank", "na"]):
+    if has_intent("missing"):
         answer = (
-            f"There are {missing_total} missing values across {len(missing_columns)} columns."
+            localized["missing_values"].format(
+                total=missing_total, count=len(missing_columns)
+            )
             if missing_columns
-            else f"There are no missing values in the current dataset."
+            else localized["no_missing"]
         )
         if missing_columns:
-            answer += f" Impacted columns include: {', '.join(missing_columns[:5])}."
+            answer += localized["impacted"].format(
+                columns=", ".join(missing_columns[:5])
+            )
         return {
             "category": "quality",
             "answer": answer,
@@ -535,12 +638,21 @@ def answer_monitoring_question(
             },
         }
 
-    if any(token in normalized_question for token in ["quality", "score", "health", "good", "bad"]):
+    if has_intent("quality"):
         score = quality_score.get("overall_score", 0) if quality_score else 0
-        if score:
-            answer = f"The overall data quality score is {float(score):.1f}/100, which indicates a {('low' if score < 60 else 'moderate' if score < 85 else 'strong')} quality profile."
+        if score is not None:
+            profile = (
+                ("low" if score < 60 else "moderate" if score < 85 else "strong")
+                if language == "en"
+                else ("baja" if score < 60 else "moderada" if score < 85 else "alta")
+                if language == "es"
+                else ("faible" if score < 60 else "modérée" if score < 85 else "élevée")
+                if language == "fr"
+                else ("कम" if score < 60 else "मध्यम" if score < 85 else "अच्छी")
+            )
+            answer = localized["score"].format(score=float(score), profile=profile)
         else:
-            answer = "The dataset quality score is not available from the provided monitoring context."
+            answer = localized["score_unavailable"]
         return {
             "category": "quality",
             "answer": answer,
@@ -548,13 +660,13 @@ def answer_monitoring_question(
             "context": {"quality_score": score},
         }
 
-    if any(token in normalized_question for token in ["anomaly", "outlier", "abnormal"]):
+    if has_intent("anomaly"):
         if isinstance(anomaly_report, dict) and anomaly_report.get("total_anomalies") is not None:
             total = int(anomaly_report.get("total_anomalies", 0))
             pct = float(anomaly_report.get("anomaly_percentage", 0.0))
-            answer = f"I found {total} anomalies, which is {pct:.1f}% of the rows in the dataset."
+            answer = localized["anomalies"].format(total=total, percent=pct)
         else:
-            answer = "No anomaly summary was provided for the current dataset."
+            answer = localized["anomalies_unavailable"]
         return {
             "category": "anomaly",
             "answer": answer,
@@ -562,16 +674,16 @@ def answer_monitoring_question(
             "context": {"anomaly_report": anomaly_report},
         }
 
-    if any(token in normalized_question for token in ["drift", "shift", "distribution"]):
+    if has_intent("drift"):
         if isinstance(drift_report, dict):
             score = float(drift_report.get("overall_drift_score", 0.0))
             severity = drift_report.get("overall_severity", "unknown")
             if drift_report.get("drift_detected"):
-                answer = f"Yes—drift was detected. The overall drift score is {score:.1f} ({severity} severity)."
+                answer = localized["drift_yes"].format(score=score, severity=severity)
             else:
-                answer = f"No material drift was detected. The overall drift score is {score:.1f} ({severity} severity)."
+                answer = localized["drift_no"].format(score=score, severity=severity)
         else:
-            answer = "No drift report is available for the current monitoring context."
+            answer = localized["drift_unavailable"]
         return {
             "category": "drift",
             "answer": answer,
@@ -579,13 +691,14 @@ def answer_monitoring_question(
             "context": {"drift_report": drift_report},
         }
 
-    if any(token in normalized_question for token in ["summary", "overall", "status", "monitor"]):
+    if has_intent("summary"):
         quality_score_value = quality_score.get("overall_score", 0) if quality_score else 0
         drift_score = float(drift_report.get("overall_drift_score", 0.0)) if isinstance(drift_report, dict) else 0.0
         anomaly_total = int(anomaly_report.get("total_anomalies", 0)) if isinstance(anomaly_report, dict) else 0
-        answer = (
-            f"Overall quality is {float(quality_score_value):.1f}/100, drift is {drift_score:.1f}, and there are "
-            f"{anomaly_total} anomalies in the current monitoring snapshot."
+        answer = localized["summary"].format(
+            quality=float(quality_score_value),
+            drift=drift_score,
+            anomalies=anomaly_total,
         )
         return {
             "category": "monitoring",
@@ -598,10 +711,7 @@ def answer_monitoring_question(
             },
         }
 
-    answer = (
-        "I can answer questions about dataset quality, missing values, anomalies, drift, and current monitoring status. "
-        "Try asking about missing values, quality score, anomalies, or drift."
-    )
+    answer = localized["help"]
     return {
         "category": "general",
         "answer": answer,
