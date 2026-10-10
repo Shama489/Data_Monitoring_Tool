@@ -6,8 +6,10 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import os
 import secrets
+import sqlite3
 import time
 from contextvars import ContextVar
 from functools import lru_cache
@@ -22,19 +24,29 @@ from monitoring_store import (
     get_user_by_username,
     get_user_by_id,
     list_users,
+    consume_api_rate_limit,
 )
 
 _current_user: ContextVar[dict[str, Any] | None] = ContextVar("current_user", default=None)
 _ROLES = {"admin", "analyst", "viewer"}
-_PUBLIC_PATHS = {"/", "/api/health", "/api/auth/login", "/docs", "/openapi.json", "/redoc"}
+_PUBLIC_PATHS = {
+    "/",
+    "/api/health",
+    "/api/health/ready",
+    "/api/auth/login",
+    "/docs",
+    "/openapi.json",
+    "/redoc",
+}
 _ADMIN_ONLY_PATHS = (
     "/api/auth/users",
     "/api/configurations",
     "/api/alerts/rules",
     "/api/alerts/history",
     "/api/audit",
+    "/api/metrics",
 )
-_READ_ONLY_POST_PATHS = {"/api/assistant/ask"}
+_READ_ONLY_POST_PATHS = {"/api/assistant/ask", "/api/preferences"}
 _WRITE_PATHS = {
     "/api/monitoring/analyze",
     "/api/sources/analyze",
@@ -51,8 +63,11 @@ _WRITE_PATHS = {
     "/api/analytics/forecast",
     "/api/analytics/explain",
     "/api/analytics/advanced-ml",
+    "/api/reports",
+    "/api/preferences",
 }
 MAX_PASSWORD_LENGTH = 1024
+logger = logging.getLogger(__name__)
 
 
 class AuthenticationError(ValueError):
@@ -334,6 +349,33 @@ async def authentication_middleware(request: Request, call_next):
 
         token_context = _current_user.set(user)
         try:
+            remote_host = request.client.host if request.client is not None else "unknown"
+            client_key = hashlib.sha256(remote_host.encode("utf-8")).hexdigest()
+            try:
+                rate_limit = int(os.getenv("API_RATE_LIMIT_REQUESTS", "300"))
+                rate_window = int(os.getenv("API_RATE_LIMIT_WINDOW_SECONDS", "60"))
+                if rate_limit < 1 or rate_window < 1:
+                    raise ValueError("API rate-limit settings must be positive integers")
+                retry_after = consume_api_rate_limit(
+                    client_key,
+                    limit=rate_limit,
+                    window_seconds=rate_window,
+                )
+            except (ValueError, sqlite3.Error) as error:
+                logger.exception("API rate limiting could not be evaluated")
+                return JSONResponse(
+                    status_code=503,
+                    content={"detail": "API request protection is temporarily unavailable"},
+                )
+            if retry_after:
+                return JSONResponse(
+                    status_code=429,
+                    content={"detail": "API request limit exceeded"},
+                    headers={
+                        "Retry-After": str(retry_after),
+                        "X-RateLimit-Limit": str(rate_limit),
+                    },
+                )
             return await call_next(request)
         finally:
             _current_user.reset(token_context)

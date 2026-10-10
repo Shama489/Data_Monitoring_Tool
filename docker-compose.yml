@@ -1,0 +1,57 @@
+services:
+  api:
+    build: .
+    command:
+      - uvicorn
+      - main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --workers
+      - "${API_WORKERS:-2}"
+    environment:
+      AUTH_SECRET_KEY: ${AUTH_SECRET_KEY:?Set AUTH_SECRET_KEY}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:?Set ADMIN_USERNAME}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Set ADMIN_PASSWORD}
+      MONITORING_DB_PATH: /var/lib/data-monitoring/monitoring.db
+      MONITORING_SCHEDULER_ENABLED: "false"
+      API_RATE_LIMIT_REQUESTS: ${API_RATE_LIMIT_REQUESTS:-300}
+      API_RATE_LIMIT_WINDOW_SECONDS: ${API_RATE_LIMIT_WINDOW_SECONDS:-60}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    ports:
+      - "${API_PORT:-8000}:8000"
+    volumes:
+      - monitoring-data:/var/lib/data-monitoring
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health/ready', timeout=3)"
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 90s
+    restart: unless-stopped
+
+  worker:
+    build: .
+    command: ["python", "worker.py"]
+    environment:
+      AUTH_SECRET_KEY: ${AUTH_SECRET_KEY:?Set AUTH_SECRET_KEY}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:?Set ADMIN_USERNAME}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Set ADMIN_PASSWORD}
+      MONITORING_DB_PATH: /var/lib/data-monitoring/monitoring.db
+      MONITORING_POLL_INTERVAL_SECONDS: ${MONITORING_POLL_INTERVAL_SECONDS:-15}
+      MONITORING_WORKER_CONCURRENCY: ${MONITORING_WORKER_CONCURRENCY:-2}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - monitoring-data:/var/lib/data-monitoring
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  monitoring-data:

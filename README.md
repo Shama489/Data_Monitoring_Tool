@@ -22,7 +22,7 @@ it signs bearer tokens and derives the encryption key for stored datasets and
 monitoring results. Losing or changing it makes existing encrypted data
 unreadable. Do not use the example bootstrap password in a deployed environment.
 
-All API routes except `/`, `/api/health`, and `/api/auth/login` require a
+All API routes except `/`, `/api/health`, `/api/health/ready`, and `/api/auth/login` require a
 `Bearer` access token. Login with `POST /api/auth/login`; the returned access
 token expires after one hour. Administrators create and manage accounts with
 `POST`/`GET /api/auth/users` and `PATCH /api/auth/users/{id}`. Passwords are
@@ -85,6 +85,15 @@ Monitoring workflows automatically persist their input datasets and result.
 Saved datasets can be monitored again by passing their `dataset_id` to
 `POST /api/monitoring/analyze`.
 
+Generate encrypted, owner-scoped PDF, Excel (`xlsx`), and PowerPoint (`pptx`)
+reports from a saved result with `POST /api/reports`, passing `result_id` and
+one or more `formats`. List reports with `GET /api/reports`; download an
+artifact with `GET /api/reports/{report_id}/{format}`. Reports include summary
+metrics, charts, findings, detailed tool results, and alert outcomes. Add
+`report_formats` to a recurring monitoring schedule to generate the requested
+reports after each successful scheduled run. Report file bytes are encrypted
+at rest using the configured `AUTH_SECRET_KEY`.
+
 The dashboard's **Voice assistant** tab accepts typed questions or browser
 speech recognition for English, Spanish, French, and Hindi, and can read its
 answer aloud where browser speech synthesis is available. Voice input requires
@@ -127,7 +136,8 @@ recurring check with `POST /api/schedules` using an owned `dataset_id`,
 freshness settings (`timestamp_column` plus `max_age_hours`). A freshness
 schedule always includes the quality check. Drift schedules also require an
 owned `baseline_dataset_id`; forecasts and explanations require the date and
-target columns. Add `alert_channels` (for example
+target columns. Add `report_formats` (any of `pdf`, `xlsx`, `pptx`) to produce
+reports after each scheduled run, and `alert_channels` (for example
 `[{"channel":"email","recipient":"ops@example.com"}]`) to deliver notifications
 when a scheduled run finds an issue. Every run is persisted in monitoring
 history; `GET /api/schedules` reports the next run and most recent status. Pause
@@ -136,6 +146,50 @@ or resume with `PATCH /api/schedules/{id}` and remove a job with
 can manage the schedules they own. Due jobs are claimed transactionally in
 SQLite so multiple API workers do not normally launch the same run at once.
 The dashboard's **Schedules** tab provides the same controls.
+
+Scheduled jobs use durable SQLite schedule records, transactional claiming,
+bounded worker concurrency, and up to two automatic retries with exponential
+backoff after failures. Run the worker separately with `python worker.py` and
+set `MONITORING_SCHEDULER_ENABLED=false` on API processes to avoid running a
+scheduler in every web worker. Configure `MONITORING_WORKER_CONCURRENCY` and
+`MONITORING_POLL_INTERVAL_SECONDS` to control the worker pool and poll interval.
+
+## Dashboard customization and localization
+
+The monitoring dashboard has per-account saved preferences for English,
+Spanish, French, or Hindi, a system/light/dark/high-contrast theme, and
+selectable overview metric widgets. It adjusts metric cards for narrow/mobile
+viewports. The voice assistant supports the same languages. Preferences are
+available through authenticated `GET`/`POST /api/preferences`.
+
+## Runtime reliability and deployment
+
+- Authenticated API requests are limited to 300 requests per client IP per
+  60-second window by default. Configure `API_RATE_LIMIT_REQUESTS` and
+  `API_RATE_LIMIT_WINDOW_SECONDS`; exceeded quotas return HTTP 429 and
+  `Retry-After`. Login retains its separate failed-attempt block.
+- `GET /api/health` is a liveness check. Unauthenticated
+  `GET /api/health/ready` verifies database readiness and returns 503 when the
+  database is unavailable.
+- Admins can inspect process-local request counts, server errors, and latency
+  aggregates at `GET /api/metrics`. API logs include worker failures and
+  database readiness errors.
+- Non-sensitive tool and source-capability metadata is cached in each API
+  process for 60 seconds. User data and analysis results are not cached.
+- `Dockerfile` and `docker-compose.yml` provide an API plus a separate durable
+  schedule worker sharing a persistent database volume. Supply strong
+  `AUTH_SECRET_KEY`, `ADMIN_USERNAME`, and `ADMIN_PASSWORD` environment values
+  before starting Compose.
+
+The current store and durable queue use SQLite. The Compose deployment supports
+multiple API worker processes and a separate worker on one host; it is not a
+multi-host horizontally scaled database/queue. For multi-host production
+deployment, migrate the store and schedule-claiming backend to a shared
+PostgreSQL database and use a shared task broker/object store before adding
+replicas. Rate limits use SQLite storage and therefore coordinate local
+processes on the same database volume. When behind a reverse proxy, configure
+the proxy and ASGI trusted-proxy settings carefully; the limiter intentionally
+uses the direct peer IP rather than trusting arbitrary forwarded headers.
 
 ## Run the Monitoring Dashboard
 

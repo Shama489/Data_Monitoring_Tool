@@ -7,6 +7,7 @@ import os
 import sqlite3
 import time
 import uuid
+import base64
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
@@ -111,6 +112,34 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             created_at REAL NOT NULL,
             updated_at REAL NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS monitoring_reports (
+            id TEXT PRIMARY KEY,
+            owner_id TEXT NOT NULL,
+            result_id TEXT NOT NULL,
+            schedule_id TEXT,
+            created_at REAL NOT NULL,
+            summary TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS monitoring_report_files (
+            report_id TEXT NOT NULL REFERENCES monitoring_reports(id) ON DELETE CASCADE,
+            format TEXT NOT NULL,
+            filename TEXT NOT NULL,
+            mime_type TEXT NOT NULL,
+            content TEXT NOT NULL,
+            PRIMARY KEY(report_id, format)
+        );
+        CREATE INDEX IF NOT EXISTS idx_monitoring_reports_owner
+            ON monitoring_reports(owner_id, created_at DESC);
+        CREATE TABLE IF NOT EXISTS user_preferences (
+            user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+            value TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS api_rate_limits (
+            client_key TEXT PRIMARY KEY,
+            requests INTEGER NOT NULL,
+            window_started REAL NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS lineage_events (
             id TEXT PRIMARY KEY,
             dataset_id TEXT REFERENCES datasets(id) ON DELETE CASCADE,
@@ -150,7 +179,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
         """
     )
     connection.execute("BEGIN IMMEDIATE")
-    for table in ("datasets", "monitoring_results", "audit_records"):
+    for table in ("datasets", "monitoring_results", "audit_records", "monitoring_schedules"):
         columns = {
             row["name"]
             for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
@@ -167,6 +196,11 @@ def _create_schema(connection: sqlite3.Connection) -> None:
                     connection.execute(
                         f"ALTER TABLE datasets ADD COLUMN {column} {declaration}"
                     )
+        if table == "monitoring_schedules" and "retry_count" not in columns:
+            connection.execute(
+                "ALTER TABLE monitoring_schedules "
+                "ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0"
+            )
 
 
 def _migrate_stored_content(connection: sqlite3.Connection) -> None:
@@ -309,6 +343,190 @@ def clear_login_failures(client_key: str) -> None:
         )
 
 
+def consume_api_rate_limit(
+    client_key: str,
+    limit: int = 300,
+    window_seconds: int = 60,
+    now: float | None = None,
+) -> int:
+    """Atomically consume a fixed-window request quota across API worker processes."""
+    current_time = time.time() if now is None else now
+    with connect_database() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute(
+            "SELECT requests, window_started FROM api_rate_limits WHERE client_key = ?",
+            (client_key,),
+        ).fetchone()
+        if row is None or row["window_started"] <= current_time - window_seconds:
+            connection.execute(
+                "INSERT INTO api_rate_limits (client_key, requests, window_started) "
+                "VALUES (?, 1, ?) ON CONFLICT(client_key) DO UPDATE SET "
+                "requests = 1, window_started = excluded.window_started",
+                (client_key, current_time),
+            )
+            retry_after = 0
+        elif row["requests"] >= limit:
+            retry_after = max(
+                1, int(row["window_started"] + window_seconds - current_time + 0.999)
+            )
+        else:
+            connection.execute(
+                "UPDATE api_rate_limits SET requests = requests + 1 WHERE client_key = ?",
+                (client_key,),
+            )
+            retry_after = 0
+        if int(current_time) % 300 == 0:
+            connection.execute(
+                "DELETE FROM api_rate_limits WHERE window_started < ?",
+                (current_time - max(window_seconds * 2, 3600),),
+            )
+    return retry_after
+
+
+def get_user_preferences(user_id: str) -> dict[str, Any]:
+    with connect_database() as connection:
+        row = connection.execute(
+            "SELECT value FROM user_preferences WHERE user_id = ?", (user_id,)
+        ).fetchone()
+    return _decode(row["value"], {}) if row else {}
+
+
+def set_user_preferences(user_id: str, preferences: dict[str, Any]) -> dict[str, Any]:
+    with connect_database() as connection:
+        user = connection.execute(
+            "SELECT id FROM users WHERE id = ?", (user_id,)
+        ).fetchone()
+        if user is None:
+            raise ValueError("User was not found.")
+        connection.execute(
+            "INSERT INTO user_preferences (user_id, value, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET value = excluded.value, "
+            "updated_at = excluded.updated_at",
+            (user_id, _encode(preferences), time.time()),
+        )
+        _audit(
+            connection,
+            "updated",
+            "user_preferences",
+            user_id,
+            {"keys": sorted(preferences)},
+            user_id,
+        )
+    return preferences
+
+
+def create_monitoring_report(
+    owner_id: str,
+    result_id: str,
+    artifacts: dict[str, dict[str, Any]],
+    schedule_id: str | None = None,
+    result_owner_scope: str | None = None,
+) -> dict[str, Any]:
+    from auth_security import encrypt_data
+
+    report_id = uuid.uuid4().hex
+    created_at = time.time()
+    formats = sorted(artifacts)
+    summary = {"formats": formats, "schedule_id": schedule_id}
+    with connect_database() as connection:
+        result = connection.execute(
+            "SELECT 1 FROM monitoring_results WHERE id = ? "
+            "AND (? IS NULL OR owner_id = ?)",
+            (result_id, result_owner_scope, result_owner_scope),
+        ).fetchone()
+        if result is None:
+            raise ValueError("Monitoring result was not found.")
+        connection.execute(
+            "INSERT INTO monitoring_reports "
+            "(id, owner_id, result_id, schedule_id, created_at, summary) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (report_id, owner_id, result_id, schedule_id, created_at, _encode(summary)),
+        )
+        for report_format, artifact in artifacts.items():
+            encoded_content = base64.b64encode(artifact["content"]).decode("ascii")
+            encrypted_content = encrypt_data({"content": encoded_content})
+            connection.execute(
+                "INSERT INTO monitoring_report_files "
+                "(report_id, format, filename, mime_type, content) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    report_id,
+                    report_format,
+                    artifact["filename"],
+                    artifact["mime_type"],
+                    encrypted_content,
+                ),
+            )
+        _audit(
+            connection,
+            "created",
+            "monitoring_report",
+            report_id,
+            {"result_id": result_id, "formats": formats},
+            owner_id,
+        )
+    return {
+        "id": report_id,
+        "result_id": result_id,
+        "schedule_id": schedule_id,
+        "created_at": created_at,
+        "formats": formats,
+    }
+
+
+def list_monitoring_reports(
+    owner_id: str | None, limit: int = 100
+) -> list[dict[str, Any]]:
+    with connect_database() as connection:
+        if owner_id is None:
+            rows = connection.execute(
+                "SELECT * FROM monitoring_reports ORDER BY created_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        else:
+            rows = connection.execute(
+                "SELECT * FROM monitoring_reports WHERE owner_id = ? "
+                "ORDER BY created_at DESC LIMIT ?",
+                (owner_id, limit),
+            ).fetchall()
+    return [
+        {
+            "id": row["id"],
+            "result_id": row["result_id"],
+            "schedule_id": row["schedule_id"],
+            "created_at": row["created_at"],
+            **_decode(row["summary"], {}),
+        }
+        for row in rows
+    ]
+
+
+def get_monitoring_report_file(
+    report_id: str, report_format: str, owner_id: str | None
+) -> dict[str, Any] | None:
+    from auth_security import decrypt_data
+
+    query = (
+        "SELECT f.filename, f.mime_type, f.content FROM monitoring_report_files AS f "
+        "JOIN monitoring_reports AS r ON r.id = f.report_id "
+        "WHERE r.id = ? AND f.format = ?"
+    )
+    parameters: list[Any] = [report_id, report_format]
+    if owner_id is not None:
+        query += " AND r.owner_id = ?"
+        parameters.append(owner_id)
+    with connect_database() as connection:
+        row = connection.execute(query, parameters).fetchone()
+    if row is None:
+        return None
+    decoded = decrypt_data(row["content"])
+    return {
+        "filename": row["filename"],
+        "mime_type": row["mime_type"],
+        "content": base64.b64decode(decoded["content"]),
+    }
+
+
 def create_monitoring_schedule(
     owner_id: str,
     dataset_id: str,
@@ -372,6 +590,7 @@ def _schedule_record(row: sqlite3.Row) -> dict[str, Any]:
         "last_run_at": row["last_run_at"],
         "last_status": row["last_status"],
         "last_error": row["last_error"],
+        "retry_count": row["retry_count"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
@@ -495,15 +714,29 @@ def finish_monitoring_schedule(
     status = "succeeded" if succeeded else "failed"
     with connect_database() as connection:
         row = connection.execute(
-            "SELECT owner_id FROM monitoring_schedules WHERE id = ?",
+            "SELECT owner_id, retry_count FROM monitoring_schedules WHERE id = ?",
             (schedule_id,),
         ).fetchone()
         if row is None:
             return
+        retry_count = 0 if succeeded else int(row["retry_count"]) + 1
+        retry_delay = min(30 * (2 ** max(retry_count - 1, 0)), 3600)
         connection.execute(
             "UPDATE monitoring_schedules SET last_run_at = ?, last_status = ?, "
-            "last_error = ?, updated_at = ? WHERE id = ?",
-            (now, status, error[:1000] if error else None, now, schedule_id),
+            "last_error = ?, retry_count = ?, next_run_at = CASE "
+            "WHEN ? AND ? < 3 THEN ? ELSE next_run_at END, "
+            "updated_at = ? WHERE id = ?",
+            (
+                now,
+                status,
+                error[:1000] if error else None,
+                retry_count,
+                int(not succeeded),
+                retry_count,
+                now + retry_delay,
+                now,
+                schedule_id,
+            ),
         )
         _audit(
             connection,

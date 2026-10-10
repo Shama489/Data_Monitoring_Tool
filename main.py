@@ -3,17 +3,24 @@ import json
 import io
 import logging
 import math
+import os
+import time
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 
 from agents.monitoring_agent import (
     MonitoringStageError,
-    build_tool_registry,
     run_monitoring,
+)
+from api_runtime import (
+    cached_monitoring_tools,
+    cached_source_capabilities,
+    metrics_snapshot,
+    record_request,
 )
 from profiler import (
     analyze_clusters,
@@ -41,7 +48,7 @@ from notifications import (
     persist_alert_rules,
     send_notifications,
 )
-from data_sources import DataSourceError, load_source, source_capabilities, summarize_source
+from data_sources import DataSourceError, load_source, summarize_source
 from monitoring_store import (
     delete_configuration,
     delete_dataset,
@@ -60,9 +67,15 @@ from monitoring_store import (
     set_configuration,
     set_configurations,
     create_monitoring_schedule,
+    create_monitoring_report,
     delete_monitoring_schedule,
+    get_monitoring_report_file,
+    get_user_preferences,
     list_monitoring_schedules,
+    list_monitoring_reports,
+    open_database,
     set_monitoring_schedule_enabled,
+    set_user_preferences,
 )
 from tools.data_tools import load_dataset
 from auth_security import (
@@ -85,18 +98,27 @@ from monitoring_store import (
     update_user,
 )
 from scheduled_monitoring import scheduler_loop
+from reporting import REPORT_FORMATS, generate_monitoring_reports
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    worker = asyncio.create_task(scheduler_loop(), name="scheduled-monitoring")
-    app.state.scheduler_task = worker
+    worker_enabled = os.getenv("MONITORING_SCHEDULER_ENABLED", "true").lower() not in {
+        "0", "false", "no",
+    }
+    worker = (
+        asyncio.create_task(scheduler_loop(), name="scheduled-monitoring")
+        if worker_enabled else None
+    )
+    if worker is not None:
+        app.state.scheduler_task = worker
     try:
         yield
     finally:
-        worker.cancel()
-        with suppress(asyncio.CancelledError):
-            await worker
-        del app.state.scheduler_task
+        if worker is not None:
+            worker.cancel()
+            with suppress(asyncio.CancelledError):
+                await worker
+            del app.state.scheduler_task
 
 
 app = FastAPI(title="Data Monitoring Tool", lifespan=lifespan)
@@ -105,6 +127,25 @@ app.add_middleware(RequestBodyLimitMiddleware)
 logger = logging.getLogger(__name__)
 MAX_DATASET_ROWS = 100_000
 MAX_DATASET_COLUMNS = 1_000
+
+
+@app.middleware("http")
+async def request_metrics_middleware(request: Request, call_next):
+    started = time.perf_counter()
+    status_code = 500
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+        return response
+    finally:
+        route = request.scope.get("route")
+        route_name = getattr(route, "path", request.url.path)
+        record_request(
+            request.method,
+            route_name,
+            status_code,
+            time.perf_counter() - started,
+        )
 
 
 def _bad_request(message: str) -> None:
@@ -300,6 +341,28 @@ def health_check():
     return {"status": "ok", "service": "data-monitoring-tool"}
 
 
+@app.get("/api/health/ready")
+def readiness_check():
+    try:
+        connection = open_database()
+        try:
+            connection.execute("SELECT 1").fetchone()
+        finally:
+            connection.close()
+    except Exception as error:
+        logger.exception("Readiness database check failed")
+        raise HTTPException(
+            status_code=503,
+            detail="The monitoring database is unavailable",
+        ) from error
+    return {"status": "ready", "database": "ok"}
+
+
+@app.get("/api/metrics")
+def metrics_endpoint():
+    return metrics_snapshot()
+
+
 @app.post("/api/auth/login")
 def login_endpoint(payload: dict[str, Any], request: Request):
     username = payload.get("username")
@@ -394,12 +457,12 @@ def update_user_endpoint(user_id: str, payload: dict[str, Any]):
 
 @app.get("/api/sources/capabilities")
 def source_capabilities_endpoint():
-    return source_capabilities()
+    return cached_source_capabilities()
 
 
 @app.get("/api/monitoring/tools")
 def monitoring_tools_endpoint():
-    return {"tools": build_tool_registry().describe()}
+    return cached_monitoring_tools()
 
 
 @app.post("/api/assistant/ask")
@@ -866,6 +929,119 @@ def get_monitoring_result_endpoint(result_id: str):
     return result
 
 
+@app.post("/api/reports", status_code=201)
+def create_monitoring_report_endpoint(payload: dict[str, Any]):
+    result_id = payload.get("result_id")
+    formats = payload.get("formats")
+    if not isinstance(result_id, str) or not result_id.strip():
+        _bad_request("result_id is required")
+    if (
+        not isinstance(formats, list)
+        or not formats
+        or not all(isinstance(item, str) for item in formats)
+    ):
+        _bad_request("formats must be a non-empty list of report formats")
+    formats = list(dict.fromkeys(item.lower() for item in formats))
+    unsupported = [item for item in formats if item not in REPORT_FORMATS]
+    if unsupported:
+        _bad_request(f"Unsupported report formats: {unsupported}")
+
+    owner_scope = current_user_scope()
+    stored_result = get_monitoring_result(result_id, owner_id=owner_scope)
+    if stored_result is None:
+        raise HTTPException(status_code=404, detail="Monitoring result was not found")
+    dataset = (
+        get_dataset(stored_result["dataset_id"], owner_id=owner_scope)
+        if stored_result.get("dataset_id") else None
+    )
+    dataset_name = dataset["name"] if dataset else "monitoring_report"
+    try:
+        artifacts = generate_monitoring_reports(
+            stored_result,
+            dataset_name,
+            formats,
+        )
+        saved_report = create_monitoring_report(
+            current_user_id(),
+            result_id,
+            artifacts,
+            result_owner_scope=owner_scope,
+        )
+    except (TypeError, ValueError) as error:
+        _bad_request(str(error))
+    return saved_report
+
+
+@app.get("/api/reports")
+def list_monitoring_reports_endpoint(
+    limit: int = Query(default=100, ge=1, le=500),
+):
+    return {"reports": list_monitoring_reports(current_user_scope(), limit=limit)}
+
+
+@app.get("/api/reports/{report_id}/{report_format}")
+def download_monitoring_report_endpoint(report_id: str, report_format: str):
+    if report_format not in REPORT_FORMATS:
+        _bad_request("report_format must be pdf, xlsx, or pptx")
+    artifact = get_monitoring_report_file(
+        report_id,
+        report_format,
+        owner_id=current_user_scope(),
+    )
+    if artifact is None:
+        raise HTTPException(status_code=404, detail="Monitoring report was not found")
+    return Response(
+        content=artifact["content"],
+        media_type=artifact["mime_type"],
+        headers={
+            "Content-Disposition": f'attachment; filename="{artifact["filename"]}"'
+        },
+    )
+
+
+@app.get("/api/preferences")
+def get_user_preferences_endpoint():
+    return {"preferences": get_user_preferences(current_user_id())}
+
+
+@app.post("/api/preferences")
+def set_user_preferences_endpoint(payload: dict[str, Any]):
+    preferences = payload.get("preferences", payload)
+    if not isinstance(preferences, dict):
+        _bad_request("preferences must be an object")
+    allowed_fields = {"language", "theme", "widgets"}
+    if set(preferences) - allowed_fields:
+        _bad_request(f"Supported preference fields are: {', '.join(sorted(allowed_fields))}")
+    merged = {**get_user_preferences(current_user_id()), **preferences}
+    if merged.get("language", "en") not in {"en", "es", "fr", "hi"}:
+        _bad_request("language must be one of: en, es, fr, hi")
+    if merged.get("theme", "system") not in {"system", "light", "dark", "high_contrast"}:
+        _bad_request("theme must be system, light, dark, or high_contrast")
+    widgets = merged.get(
+        "widgets",
+        ["quality_score", "drift_score", "anomalies", "historical_runs"],
+    )
+    supported_widgets = {
+        "quality_score",
+        "drift_score",
+        "anomalies",
+        "historical_runs",
+    }
+    if (
+        not isinstance(widgets, list)
+        or not widgets
+        or len(widgets) > len(supported_widgets)
+        or not all(isinstance(item, str) and item in supported_widgets for item in widgets)
+    ):
+        _bad_request("widgets must select one or more supported dashboard widgets")
+    merged["widgets"] = list(dict.fromkeys(widgets))
+    try:
+        set_user_preferences(current_user_id(), merged)
+    except ValueError as error:
+        _bad_request(str(error))
+    return {"preferences": merged}
+
+
 @app.get("/api/schedules")
 def list_monitoring_schedules_endpoint():
     return {
@@ -938,7 +1114,19 @@ def create_monitoring_schedule_endpoint(payload: dict[str, Any]):
         "checks": checks,
         "quality_options": quality_options,
         "run_owner_id": dataset.get("owner_id"),
+        "dataset_name": dataset["name"],
     }
+    report_formats = payload.get("report_formats", [])
+    if (
+        not isinstance(report_formats, list)
+        or not all(isinstance(item, str) for item in report_formats)
+    ):
+        _bad_request("report_formats must be a list containing pdf, xlsx, and/or pptx")
+    report_formats = list(dict.fromkeys(item.lower() for item in report_formats))
+    unsupported_formats = [item for item in report_formats if item not in REPORT_FORMATS]
+    if unsupported_formats:
+        _bad_request(f"Unsupported report formats: {unsupported_formats}")
+    schedule["report_formats"] = report_formats
     if baseline_id is not None:
         schedule["baseline_dataset_id"] = baseline_id
     for key in ("date_column", "value_column", "metric", "target_column"):

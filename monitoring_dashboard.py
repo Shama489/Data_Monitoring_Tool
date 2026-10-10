@@ -202,8 +202,13 @@ def _result_rows(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return rows
 
 
-def _render_overview(results: list[dict[str, Any]]) -> None:
-    st.subheader("Monitoring overview")
+def _render_overview(
+    results: list[dict[str, Any]],
+    widgets: list[str] | None = None,
+    copy: dict[str, str] | None = None,
+) -> None:
+    copy = copy or _DASHBOARD_COPY["en"]
+    st.subheader(copy["overview"])
     if not results:
         st.info("No monitoring runs yet. Start a run below to populate your dashboard.")
         return
@@ -211,21 +216,30 @@ def _render_overview(results: list[dict[str, Any]]) -> None:
     rows = _result_rows(results)
     history = pd.DataFrame(rows).sort_values("created_at")
     latest = history.iloc[-1]
-    first, second, third, fourth = st.columns(4)
-    score = latest["quality_score"]
-    first.metric("Latest quality score", "—" if pd.isna(score) else f"{score:.1f}/100")
-    drift = latest["drift_score"]
-    second.metric("Latest drift score", "—" if pd.isna(drift) else f"{drift:.1f}")
-    third.metric(
-        "Latest anomalies",
-        "—" if pd.isna(latest["anomalies"]) else int(latest["anomalies"]),
-    )
-    fourth.metric("Historical runs", len(history))
+    metrics = {
+        "quality_score": (
+            copy["quality"],
+            "—" if pd.isna(latest["quality_score"]) else f"{latest['quality_score']:.1f}/100",
+        ),
+        "drift_score": (
+            copy["drift"],
+            "—" if pd.isna(latest["drift_score"]) else f"{latest['drift_score']:.1f}",
+        ),
+        "anomalies": (
+            copy["anomalies"],
+            "—" if pd.isna(latest["anomalies"]) else int(latest["anomalies"]),
+        ),
+        "historical_runs": (copy["runs"], len(history)),
+    }
+    chosen_widgets = [key for key in (widgets or list(metrics)) if key in metrics]
+    columns = st.columns(max(len(chosen_widgets), 1))
+    for column, key in zip(columns, chosen_widgets):
+        column.metric(*metrics[key])
 
     quality_history = history.dropna(subset=["quality_score"])
     drift_history = history.dropna(subset=["drift_score"])
     quality_tab, drift_tab, anomaly_tab = st.tabs(
-        ["Quality trend", "Drift trend", "Anomaly trend"]
+        [copy["quality_trend"], copy["drift_trend"], copy["anomaly_trend"]]
     )
     with quality_tab:
         if quality_history.empty:
@@ -500,6 +514,7 @@ def _render_schedules(
                 "schedule_id": item["id"],
                 "dataset_id": item["dataset_id"],
                 "checks": ", ".join(item["schedule"].get("checks", [])),
+                "report_formats": ", ".join(item["schedule"].get("report_formats", [])),
                 "interval_minutes": item["schedule"].get("interval_seconds", 0) // 60,
                 "enabled": item["enabled"],
                 "next_run": pd.to_datetime(item["next_run_at"], unit="s", utc=True),
@@ -509,6 +524,7 @@ def _render_schedules(
                 ),
                 "last_status": item["last_status"],
                 "last_error": item["last_error"],
+                "retry_count": item.get("retry_count", 0),
             }
             for item in schedules
         ]
@@ -644,6 +660,11 @@ def _render_schedules(
             help='Examples: ["email"] or [{"channel":"email","recipient":"alerts@example.com"}]',
             key="schedule-alert-channels",
         )
+        report_formats = st.multiselect(
+            "Generate a report after each run",
+            ["pdf", "xlsx", "pptx"],
+            key="schedule-report-formats",
+        )
         st.caption(
             "Alerts are sent only when at least one channel is configured and the run detects a finding."
         )
@@ -664,6 +685,7 @@ def _render_schedules(
                         "interval_seconds": int(interval_minutes * 60),
                         "checks": selected_checks,
                         "alert_channels": channels,
+                        "report_formats": report_formats,
                     }
                     if timestamp_column != "None":
                         payload["timestamp_column"] = timestamp_column
@@ -692,15 +714,279 @@ def _render_schedules(
                         st.error(response.json().get("detail", "Could not create schedule."))
 
 
+_DASHBOARD_COPY = {
+    "en": {
+        "title": "Advanced Monitoring Dashboard",
+        "caption": "Unified quality, drift, anomaly, alert, forecast, XAI, and historical monitoring.",
+        "overview": "Overview",
+        "run": "Run monitoring",
+        "lineage": "Lineage & versions",
+        "schedules": "Schedules",
+        "history": "History & alerts",
+        "assistant": "Voice assistant",
+        "reports": "Reports",
+        "quality": "Latest quality score",
+        "drift": "Latest drift score",
+        "anomalies": "Latest anomalies",
+        "runs": "Historical runs",
+        "quality_trend": "Quality trend",
+        "drift_trend": "Drift trend",
+        "anomaly_trend": "Anomaly trend",
+    },
+    "es": {
+        "title": "Panel avanzado de supervisión",
+        "caption": "Calidad, deriva, anomalías, alertas, pronósticos, XAI e historial en un solo lugar.",
+        "overview": "Resumen",
+        "run": "Ejecutar supervisión",
+        "lineage": "Linaje y versiones",
+        "schedules": "Programaciones",
+        "history": "Historial y alertas",
+        "assistant": "Asistente de voz",
+        "reports": "Informes",
+        "quality": "Puntuación de calidad",
+        "drift": "Puntuación de deriva",
+        "anomalies": "Anomalías recientes",
+        "runs": "Ejecuciones históricas",
+        "quality_trend": "Tendencia de calidad",
+        "drift_trend": "Tendencia de deriva",
+        "anomaly_trend": "Tendencia de anomalías",
+    },
+    "fr": {
+        "title": "Tableau de surveillance avancée",
+        "caption": "Qualité, dérive, anomalies, alertes, prévisions, XAI et historique réunis.",
+        "overview": "Vue d’ensemble",
+        "run": "Lancer la surveillance",
+        "lineage": "Lignage et versions",
+        "schedules": "Planifications",
+        "history": "Historique et alertes",
+        "assistant": "Assistant vocal",
+        "reports": "Rapports",
+        "quality": "Score de qualité",
+        "drift": "Score de dérive",
+        "anomalies": "Anomalies récentes",
+        "runs": "Exécutions historiques",
+        "quality_trend": "Tendance qualité",
+        "drift_trend": "Tendance de dérive",
+        "anomaly_trend": "Tendance des anomalies",
+    },
+    "hi": {
+        "title": "उन्नत निगरानी डैशबोर्ड",
+        "caption": "गुणवत्ता, ड्रिफ्ट, विसंगतियां, अलर्ट, पूर्वानुमान, XAI और इतिहास।",
+        "overview": "अवलोकन",
+        "run": "निगरानी चलाएं",
+        "lineage": "डेटा इतिहास और संस्करण",
+        "schedules": "समय-सारणी",
+        "history": "इतिहास और अलर्ट",
+        "assistant": "वॉइस सहायक",
+        "reports": "रिपोर्ट",
+        "quality": "नवीनतम गुणवत्ता स्कोर",
+        "drift": "नवीनतम ड्रिफ्ट स्कोर",
+        "anomalies": "नवीनतम विसंगतियां",
+        "runs": "ऐतिहासिक रन",
+        "quality_trend": "गुणवत्ता रुझान",
+        "drift_trend": "ड्रिफ्ट रुझान",
+        "anomaly_trend": "विसंगति रुझान",
+    },
+}
+
+
+def _render_dashboard_preferences(
+    api_base_url: str,
+    headers: dict[str, str],
+) -> dict[str, Any]:
+    response = _get(api_base_url, headers, "/api/preferences")
+    preferences = response.get("preferences", {}) if response else {}
+    if not isinstance(preferences, dict):
+        preferences = {}
+    defaults = {
+        "language": "en",
+        "theme": "dark",
+        "widgets": ["quality_score", "drift_score", "anomalies", "historical_runs"],
+    }
+    preferences = {**defaults, **preferences}
+    with st.expander("Dashboard settings", expanded=False):
+        with st.form("dashboard-preferences"):
+            language_labels = {
+                "en": "English",
+                "es": "Español",
+                "fr": "Français",
+                "hi": "हिन्दी",
+            }
+            language = st.selectbox(
+                "Dashboard language",
+                list(language_labels),
+                format_func=language_labels.get,
+                index=list(language_labels).index(preferences["language"])
+                if preferences["language"] in language_labels else 0,
+            )
+            themes = ["system", "light", "dark", "high_contrast"]
+            theme = st.selectbox(
+                "Theme",
+                themes,
+                index=themes.index(preferences["theme"])
+                if preferences["theme"] in themes else 0,
+            )
+            widget_labels = {
+                "quality_score": "Quality score",
+                "drift_score": "Drift score",
+                "anomalies": "Anomaly count",
+                "historical_runs": "Historical runs",
+            }
+            widgets = st.multiselect(
+                "Overview widgets",
+                list(widget_labels),
+                default=[
+                    item for item in preferences["widgets"]
+                    if item in widget_labels
+                ] or list(widget_labels),
+                format_func=widget_labels.get,
+            )
+            submitted = st.form_submit_button("Save dashboard settings")
+        if submitted:
+            if not widgets:
+                st.error("Select at least one overview widget.")
+            else:
+                try:
+                    save_response = requests.post(
+                        f"{api_base_url}/api/preferences",
+                        headers=headers,
+                        json={
+                            "preferences": {
+                                "language": language,
+                                "theme": theme,
+                                "widgets": widgets,
+                            }
+                        },
+                        timeout=20,
+                    )
+                except requests.RequestException as error:
+                    st.error(f"Could not save dashboard settings: {error}")
+                else:
+                    if save_response.status_code != 200:
+                        st.error(save_response.json().get("detail", "Could not save dashboard settings."))
+                    else:
+                        st.success("Dashboard settings saved.")
+                        st.rerun()
+
+    theme = preferences["theme"]
+    palette = {
+        "dark": ("#0e1117", "#f4f6f8"),
+        "light": ("#f8fafc", "#17212b"),
+        "high_contrast": ("#000000", "#ffffff"),
+        "system": ("transparent", "inherit"),
+    }
+    background, foreground = palette.get(theme, palette["dark"])
+    st.markdown(
+        f"""<style>
+        [data-testid="stAppViewContainer"] {{ background: {background}; color: {foreground}; }}
+        @media (max-width: 760px) {{
+          [data-testid="stHorizontalBlock"] {{ flex-wrap: wrap !important; gap: 0.5rem !important; }}
+          [data-testid="column"] {{ min-width: min(100%, 260px) !important; flex: 1 1 100% !important; }}
+          [data-testid="stMetric"] {{ padding: 0.55rem !important; }}
+        }}
+        </style>""",
+        unsafe_allow_html=True,
+    )
+    return preferences
+
+
+def _render_reports(
+    api_base_url: str,
+    headers: dict[str, str],
+    results: list[dict[str, Any]],
+) -> None:
+    st.subheader("Automated monitoring reports")
+    if results:
+        reportable = [result for result in results if result.get("id")]
+        labels = {
+            f"{item.get('created_at', 'Run')} · {item.get('check_type', 'monitoring')} · {item['id']}": item
+            for item in reportable
+        }
+        selected = st.selectbox("Monitoring run", list(labels), key="report-run")
+        formats = st.multiselect(
+            "Report formats",
+            ["pdf", "xlsx", "pptx"],
+            default=["pdf", "xlsx", "pptx"],
+            key="report-formats",
+        )
+        if st.button("Generate report", type="primary", key="generate-report"):
+            try:
+                response = requests.post(
+                    f"{api_base_url}/api/reports",
+                    headers=headers,
+                    json={"result_id": labels[selected]["id"], "formats": formats},
+                    timeout=120,
+                )
+            except requests.RequestException as error:
+                st.error(f"Report generation failed: {error}")
+            else:
+                if response.status_code != 201:
+                    st.error(response.json().get("detail", "Report generation failed."))
+                else:
+                    st.success(f"Generated report `{response.json()['id']}`.")
+                    st.rerun()
+    else:
+        st.info("Run monitoring before generating a report.")
+
+    saved_payload = _get(api_base_url, headers, "/api/reports", {"limit": 25})
+    if saved_payload is None:
+        return
+    saved_reports = saved_payload.get("reports", [])
+    st.markdown("#### Saved reports")
+    if not saved_reports:
+        st.info("No reports have been generated yet.")
+        return
+    for report in saved_reports:
+        with st.expander(
+            f"{pd.to_datetime(report['created_at'], unit='s', utc=True)} · {report['id']}"
+        ):
+            st.caption(f"Monitoring result: {report['result_id']}")
+            for report_format in report.get("formats", []):
+                download_key = f"report-download-{report['id']}-{report_format}"
+                content = st.session_state.get(download_key)
+                if content is None:
+                    if st.button(
+                        f"Prepare {report_format.upper()} download",
+                        key=f"prepare-{report['id']}-{report_format}",
+                    ):
+                        try:
+                            download = requests.get(
+                                f"{api_base_url}/api/reports/{report['id']}/{report_format}",
+                                headers=headers,
+                                timeout=60,
+                            )
+                        except requests.RequestException as error:
+                            st.error(f"Could not load {report_format.upper()} report: {error}")
+                        else:
+                            if download.status_code != 200:
+                                st.error(download.json().get("detail", "Could not load report."))
+                            else:
+                                st.session_state[download_key] = download.content
+                                st.rerun()
+                else:
+                    st.download_button(
+                        f"Download {report_format.upper()}",
+                        data=content,
+                        file_name=f"monitoring_report_{report['id']}.{report_format}",
+                        mime={
+                            "pdf": "application/pdf",
+                            "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                        }[report_format],
+                        key=f"download-{report['id']}-{report_format}",
+                    )
+
+
 def render_monitoring_dashboard(
     api_base_url: str,
     headers: dict[str, str],
     role: str,
 ) -> None:
-    st.title("Advanced Monitoring Dashboard")
-    st.caption(
-        "Unified quality, drift, anomaly, alert, forecast, XAI, and historical monitoring."
-    )
+    preferences = _render_dashboard_preferences(api_base_url, headers)
+    language = preferences["language"]
+    copy = _DASHBOARD_COPY.get(language, _DASHBOARD_COPY["en"])
+    st.title(copy["title"])
+    st.caption(copy["caption"])
 
     datasets_payload = _get(api_base_url, headers, "/api/datasets", {"limit": 500})
     if datasets_payload is None:
@@ -715,18 +1001,19 @@ def render_monitoring_dashboard(
         return
     schedules = schedules_payload.get("schedules") or []
 
-    overview_tab, run_tab, lineage_tab, schedules_tab, history_tab, assistant_tab = st.tabs(
+    overview_tab, run_tab, lineage_tab, schedules_tab, history_tab, assistant_tab, reports_tab = st.tabs(
         [
-            "Overview",
-            "Run monitoring",
-            "Lineage & versions",
-            "Schedules",
-            "History & alerts",
-            "Voice assistant",
+            copy["overview"],
+            copy["run"],
+            copy["lineage"],
+            copy["schedules"],
+            copy["history"],
+            copy["assistant"],
+            copy["reports"],
         ]
     )
     with overview_tab:
-        _render_overview(results)
+        _render_overview(results, preferences["widgets"], copy)
 
     with run_tab:
         st.subheader("Create a monitoring run")
@@ -845,3 +1132,6 @@ def render_monitoring_dashboard(
 
     with assistant_tab:
         _render_voice_assistant(api_base_url, headers, datasets)
+
+    with reports_tab:
+        _render_reports(api_base_url, headers, results)
