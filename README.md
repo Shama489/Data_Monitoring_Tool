@@ -42,7 +42,9 @@ encryption. Dataset and result records are scoped to their owner; non-admin
 users receive not-found responses for records they do not own. Requests larger
 than 10 MiB are rejected. The XAI Streamlit dashboard signs in through the API,
 stores its upload under the signed-in account, and disables analysis controls
-for viewers. CSV dataset uploads are limited to 100,000 rows and 1,000 columns.
+for viewers. CSV, XLSX, JSON, Parquet, TSV, and text dataset uploads are limited
+to 10 MiB, 100,000 rows, and 1,000 columns. Legacy `.xls` uploads are accepted
+when the API environment has the optional `xlrd` reader installed.
 Local-file sources are disabled unless `DATASET_ALLOWED_DIRS` lists the
 directories the API is permitted to read. Paths are canonicalized (including
 symlinks), constrained to those roots, and restricted to supported tabular file
@@ -71,7 +73,8 @@ The existing `alerts.db` alert history is migrated to the new database on first
 use. Available management endpoints include:
 
 - `POST /api/datasets`, `GET /api/datasets`, and `GET`/`DELETE /api/datasets/{id}`
-- `POST /api/datasets/upload?name=events.csv` for bounded raw CSV uploads
+- `POST /api/datasets/upload?name=events.csv` for bounded raw CSV, Excel,
+  JSON, Parquet, TSV, and text uploads (the `name` extension selects the parser)
 - `POST /api/assistant/ask` for text or voice-transcribed monitoring questions;
   `language` supports `en`, `es`, `fr`, and `hi`
 - `GET /api/monitoring/results` and `GET /api/monitoring/results/{id}`
@@ -142,10 +145,13 @@ reports after each scheduled run, and `alert_channels` (for example
 when a scheduled run finds an issue. Every run is persisted in monitoring
 history; `GET /api/schedules` reports the next run and most recent status. Pause
 or resume with `PATCH /api/schedules/{id}` and remove a job with
-`DELETE /api/schedules/{id}`. Administrators can manage all schedules; analysts
-can manage the schedules they own. Due jobs are claimed transactionally in
-SQLite so multiple API workers do not normally launch the same run at once.
-The dashboard's **Schedules** tab provides the same controls.
+`DELETE /api/schedules/{id}`. PATCH also accepts `interval_seconds` to change a
+schedule's run interval; an active schedule's next run is recalculated from the
+edit time. Administrators can manage all schedules; analysts can manage the
+schedules they own, while viewers are read-only. Due jobs are claimed
+transactionally in SQLite so multiple API workers do not normally launch the
+same run at once. The dashboard's **Scheduled monitoring** workspace provides
+create, interval edit, pause/resume, and confirmed delete controls.
 
 Scheduled jobs use durable SQLite schedule records, transactional claiming,
 bounded worker concurrency, and up to two automatic retries with exponential
@@ -201,12 +207,15 @@ streamlit run xai_dashboard.py
 ```
 
 Sign in with the bootstrap administrator or an account created by an
-administrator. The default workspace combines quality scores, drift trends,
-anomaly counts, configurable monitoring runs, forecasts, XAI results, alert
-history, saved historical reports, and dataset lineage/version comparisons.
-Users can upload or select datasets permitted by their role. The **Explainable AI** workspace retains the
-standalone classification/regression workflow, target selection, holdout
-evaluation, feature importance, per-row SHAP explanations, and JSON download.
+administrator. The responsive workspace provides sidebar navigation for the
+overview, data explorer, quality, anomalies, drift, trends/forecasts, model
+explanations, monitoring runs, schedules, reports, assistant, alerts,
+comparisons, settings, and history. Dataset, date-range, and text filters use
+real persisted API results. The data explorer accepts CSV, XLSX, JSON, Parquet,
+TSV, and text uploads; database and cloud connector readiness is shown from the
+API, with credentials entered as masked values or configured on the server.
+The separate **Explainable AI** workspace retains its classification/regression
+workflow, holdout evaluation, SHAP explanations, and JSON download.
 
 ## Advanced ML analytics
 

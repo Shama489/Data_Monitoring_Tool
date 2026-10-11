@@ -112,6 +112,49 @@ def _read_file_bytes(content: bytes, file_type: str, source_name: str, sheet_nam
         raise DataSourceError(f"Could not read {source_name}: {error}") from error
 
 
+def load_uploaded_file(
+    content: bytes,
+    file_type: str,
+    source_name: str,
+    max_rows: int | None = None,
+    max_columns: int | None = None,
+) -> pd.DataFrame:
+    """Parse an uploaded tabular file using the same readers as configured sources."""
+    extension = file_type.lower().lstrip(".")
+    if extension not in _LOCAL_FILE_EXTENSIONS:
+        raise DataSourceError(f"Unsupported file type: {extension or 'unknown'}")
+    try:
+        if extension in {"csv", "tsv", "txt"}:
+            separator: str | None = {
+                "csv": ",",
+                "tsv": "\t",
+                "txt": None,
+            }[extension]
+            header = pd.read_csv(
+                io.BytesIO(content),
+                sep=separator,
+                engine="python" if separator is None else "c",
+                nrows=0,
+            )
+            if max_columns is not None and len(header.columns) > max_columns:
+                raise DataSourceError(f"Dataset must not exceed {max_columns:,} columns")
+            return pd.read_csv(
+                io.BytesIO(content),
+                sep=separator,
+                engine="python" if separator is None else "c",
+                nrows=max_rows,
+            )
+
+        frame = _read_file_bytes(content, extension, source_name)
+        if max_columns is not None and len(frame.columns) > max_columns:
+            raise DataSourceError(f"Dataset must not exceed {max_columns:,} columns")
+        return frame.head(max_rows) if max_rows is not None else frame
+    except DataSourceError:
+        raise
+    except Exception as error:
+        raise DataSourceError(f"Could not read {source_name}: {error}") from error
+
+
 def load_local_file(path: str, file_type: str = "", sheet_name: str | int | None = None) -> pd.DataFrame:
     file_path, extension = _validate_local_file_path(path, file_type)
     return _read_file_bytes(file_path.read_bytes(), extension, file_path.name, sheet_name)
@@ -347,6 +390,7 @@ def source_capabilities() -> dict[str, Any]:
             "formats": ["csv", "excel", "json", "parquet", "tsv", "txt"],
             "dependencies": {"pandas": "pandas", "excel": "openpyxl", "parquet": "pyarrow"},
             "required_fields": ["path"],
+            "credential_env": ["DATASET_ALLOWED_DIRS"],
             "credential_setup": "No credentials required; file must be readable by the API process.",
         },
         {

@@ -324,7 +324,11 @@ async def authentication_middleware(request: Request, call_next):
             method in {"PUT", "PATCH", "DELETE"}
             and path.startswith("/api/schedules/")
         ):
-            pass
+            if user["role"] == "viewer":
+                return JSONResponse(
+                    status_code=403,
+                    content={"detail": "Analyst role required"},
+                )
         elif (
             method == "POST"
             and path.startswith("/api/datasets/")

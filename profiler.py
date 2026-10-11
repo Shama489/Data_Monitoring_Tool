@@ -1848,7 +1848,6 @@ def recommend_items(
         "fallback_reason": fallback_reason,
     }
 
-
 def train_and_explain_model(df, target_column, task="classification", test_size=0.2):
     """Train a Random Forest, evaluate a holdout set, and return global/local explanations."""
     if target_column not in df.columns:
