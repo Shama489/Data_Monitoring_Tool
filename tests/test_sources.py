@@ -4,7 +4,12 @@ import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
 
-from data_sources import DataSourceError, load_local_file, load_sql_query
+from data_sources import (
+    DataSourceError,
+    load_local_file,
+    load_sql_query,
+    source_capabilities,
+)
 from main import app
 from notifications import ALERT_HISTORY, reset_alert_state
 from conftest import admin_headers
@@ -36,6 +41,18 @@ def test_source_capabilities_report_provider_setup():
     assert "txt" in providers["local_files"]["formats"]
     assert providers["dropbox"]["credential_env"] == ["DROPBOX_ACCESS_TOKEN"]
     assert "missing_dependencies" in providers["s3"]
+
+
+def test_local_file_source_is_not_reported_ready_without_allowed_roots(monkeypatch):
+    monkeypatch.delenv("DATASET_ALLOWED_DIRS", raising=False)
+
+    local_files = {
+        provider["type"]: provider
+        for provider in source_capabilities()["providers"]
+    }["local_files"]
+
+    assert local_files["status"] == "configuration_required"
+    assert "DATASET_ALLOWED_DIRS" in local_files["missing_configuration"]
 
 
 def test_sql_loader_rejects_non_select_queries():

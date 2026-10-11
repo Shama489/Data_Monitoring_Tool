@@ -74,8 +74,8 @@ with st.sidebar:
     st.caption(f"Signed in as **{st.session_state['user']['username']}**")
     st.caption(f"Role: `{st.session_state['user']['role']}`")
     selected_page = st.radio(
-        "Workspace",
-        ["Monitoring Dashboard", "Explainable AI"],
+        "Application",
+        ["Monitoring platform", "Explainable AI lab"],
         index=0,
     )
     if st.button("Sign out"):
@@ -155,7 +155,7 @@ with st.sidebar:
                                 else:
                                     st.error(update_response.json().get("detail", "Could not update the user."))
 
-if selected_page == "Monitoring Dashboard":
+if selected_page == "Monitoring platform":
     render_monitoring_dashboard(
         API_BASE_URL,
         _api_headers(),

@@ -1,6 +1,5 @@
 import asyncio
 import json
-import io
 import logging
 import math
 import os
@@ -48,7 +47,7 @@ from notifications import (
     persist_alert_rules,
     send_notifications,
 )
-from data_sources import DataSourceError, load_source, summarize_source
+from data_sources import DataSourceError, load_source, load_uploaded_file, summarize_source
 from monitoring_store import (
     delete_configuration,
     delete_dataset,
@@ -70,11 +69,13 @@ from monitoring_store import (
     create_monitoring_report,
     delete_monitoring_schedule,
     get_monitoring_report_file,
+    get_monitoring_schedule,
     get_user_preferences,
     list_monitoring_schedules,
     list_monitoring_reports,
     open_database,
     set_monitoring_schedule_enabled,
+    update_monitoring_schedule_interval,
     set_user_preferences,
 )
 from tools.data_tools import load_dataset
@@ -695,26 +696,43 @@ def create_dataset_endpoint(payload: dict[str, Any]):
 
 @app.post("/api/datasets/upload", status_code=201)
 async def upload_dataset_file_endpoint(request: Request, name: str = Query(min_length=1, max_length=255)):
-    if request.headers.get("content-type", "").split(";", 1)[0].strip().lower() != "text/csv":
-        _bad_request("Uploaded datasets must use the text/csv content type")
     safe_name = Path(name.replace("\\", "/")).name
-    if not safe_name or not safe_name.lower().endswith(".csv"):
-        _bad_request("uploaded file name must end with .csv")
+    extension = Path(safe_name).suffix.lower().lstrip(".")
+    if not safe_name or extension not in {"csv", "xls", "xlsx", "json", "parquet", "tsv", "txt"}:
+        _bad_request("uploaded file must be CSV, Excel, JSON, Parquet, TSV, or text")
+    content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    accepted_content_types = {
+        "csv": {"text/csv", "application/octet-stream"},
+        "xls": {"application/vnd.ms-excel", "application/octet-stream"},
+        "xlsx": {
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "application/octet-stream",
+        },
+        "json": {"application/json", "text/json", "application/octet-stream"},
+        "parquet": {"application/vnd.apache.parquet", "application/octet-stream"},
+        "tsv": {"text/tab-separated-values", "text/plain", "application/octet-stream"},
+        "txt": {"text/plain", "application/octet-stream"},
+    }
+    if content_type not in accepted_content_types[extension]:
+        _bad_request(f"Content-Type does not match the .{extension} upload")
     content = await request.body()
     try:
-        header = pd.read_csv(io.BytesIO(content), nrows=0)
-        if len(header.columns) > MAX_DATASET_COLUMNS:
-            _bad_request(f"Dataset must not exceed {MAX_DATASET_COLUMNS:,} columns")
-        frame = pd.read_csv(io.BytesIO(content), nrows=MAX_DATASET_ROWS + 1)
-    except (pd.errors.ParserError, UnicodeDecodeError, ValueError) as error:
-        _bad_request(f"Invalid CSV content: {error}")
+        frame = load_uploaded_file(
+            content,
+            extension,
+            safe_name,
+            max_rows=MAX_DATASET_ROWS + 1,
+            max_columns=MAX_DATASET_COLUMNS,
+        )
+    except (DataSourceError, ValueError) as error:
+        _bad_request(f"Invalid {extension.upper()} content: {error}")
     if frame.empty:
-        _bad_request("CSV dataset must not be empty")
+        _bad_request("Uploaded dataset must not be empty")
     _validate_dataset_dimensions(frame)
     dataset_id = save_dataset(
         safe_name,
         _frame_records(frame),
-        {"type": "upload", "file_type": "csv", "name": safe_name},
+        {"type": "upload", "file_type": extension, "name": safe_name},
         owner_id=current_user_id(),
     )
     return {"id": dataset_id, "name": safe_name}
@@ -1019,13 +1037,26 @@ def set_user_preferences_endpoint(payload: dict[str, Any]):
         _bad_request("theme must be system, light, dark, or high_contrast")
     widgets = merged.get(
         "widgets",
-        ["quality_score", "drift_score", "anomalies", "historical_runs"],
+        [
+            "quality_score",
+            "drift_score",
+            "anomalies",
+            "historical_runs",
+            "datasets",
+            "active_schedules",
+            "missing_values",
+            "duplicate_rows",
+        ],
     )
     supported_widgets = {
         "quality_score",
         "drift_score",
         "anomalies",
         "historical_runs",
+        "datasets",
+        "active_schedules",
+        "missing_values",
+        "duplicate_rows",
     }
     if (
         not isinstance(widgets, list)
@@ -1200,14 +1231,31 @@ def create_monitoring_schedule_endpoint(payload: dict[str, Any]):
 
 @app.patch("/api/schedules/{schedule_id}")
 def update_monitoring_schedule_endpoint(schedule_id: str, payload: dict[str, Any]):
+    if not payload or set(payload) - {"enabled", "interval_seconds"}:
+        _bad_request("Provide enabled and/or interval_seconds")
     enabled = payload.get("enabled")
-    if not isinstance(enabled, bool):
+    if "enabled" in payload and not isinstance(enabled, bool):
         _bad_request("enabled must be a boolean")
-    if not set_monitoring_schedule_enabled(
+    interval_seconds = payload.get("interval_seconds")
+    if "interval_seconds" in payload:
+        if (
+            isinstance(interval_seconds, bool)
+            or not isinstance(interval_seconds, int)
+            or not 60 <= interval_seconds <= 31 * 24 * 60 * 60
+        ):
+            _bad_request("interval_seconds must be between 60 and 2,678,400")
+        if not update_monitoring_schedule_interval(
+            schedule_id,
+            interval_seconds,
+            owner_id=current_user_scope(),
+        ):
+            raise HTTPException(status_code=404, detail="Monitoring schedule was not found")
+    if enabled is not None and not set_monitoring_schedule_enabled(
         schedule_id, enabled, owner_id=current_user_scope()
     ):
         raise HTTPException(status_code=404, detail="Monitoring schedule was not found")
-    return {"id": schedule_id, "enabled": enabled}
+    updated = get_monitoring_schedule(schedule_id, owner_id=current_user_scope())
+    return updated
 
 
 @app.delete("/api/schedules/{schedule_id}")

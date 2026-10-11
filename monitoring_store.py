@@ -642,6 +642,53 @@ def set_monitoring_schedule_enabled(
     return cursor.rowcount > 0
 
 
+def update_monitoring_schedule_interval(
+    schedule_id: str,
+    interval_seconds: int,
+    owner_id: str | None = None,
+) -> bool:
+    now = time.time()
+    with connect_database() as connection:
+        if owner_id is None:
+            row = connection.execute(
+                "SELECT schedule, enabled FROM monitoring_schedules WHERE id = ?",
+                (schedule_id,),
+            ).fetchone()
+        else:
+            row = connection.execute(
+                "SELECT schedule, enabled FROM monitoring_schedules "
+                "WHERE id = ? AND owner_id = ?",
+                (schedule_id, owner_id),
+            ).fetchone()
+        if row is None:
+            return False
+        schedule = _decode(row["schedule"], {})
+        schedule["interval_seconds"] = interval_seconds
+        if owner_id is None:
+            connection.execute(
+                "UPDATE monitoring_schedules SET schedule = ?, "
+                "next_run_at = CASE WHEN enabled = 1 THEN ? ELSE next_run_at END, "
+                "updated_at = ? WHERE id = ?",
+                (_encode(schedule), now + interval_seconds, now, schedule_id),
+            )
+        else:
+            connection.execute(
+                "UPDATE monitoring_schedules SET schedule = ?, "
+                "next_run_at = CASE WHEN enabled = 1 THEN ? ELSE next_run_at END, "
+                "updated_at = ? WHERE id = ? AND owner_id = ?",
+                (_encode(schedule), now + interval_seconds, now, schedule_id, owner_id),
+            )
+        _audit(
+            connection,
+            "updated",
+            "monitoring_schedule",
+            schedule_id,
+            {"interval_seconds": interval_seconds},
+            owner_id,
+        )
+    return True
+
+
 def delete_monitoring_schedule(
     schedule_id: str, owner_id: str | None = None
 ) -> bool:

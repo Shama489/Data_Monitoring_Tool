@@ -107,6 +107,17 @@ def test_schedule_validation_and_owner_scoping():
     schedule_id = created.json()["id"]
     paused = client.patch(f"/api/schedules/{schedule_id}", json={"enabled": False})
     assert paused.status_code == 200
+    interval_update = client.patch(
+        f"/api/schedules/{schedule_id}",
+        json={"interval_seconds": 120},
+    )
+    assert interval_update.status_code == 200
+    assert interval_update.json()["schedule"]["interval_seconds"] == 120
+    invalid_interval = client.patch(
+        f"/api/schedules/{schedule_id}",
+        json={"interval_seconds": 30},
+    )
+    assert invalid_interval.status_code == 400
     schedule = next(
         item for item in client.get("/api/schedules").json()["schedules"]
         if item["id"] == schedule_id
@@ -114,6 +125,48 @@ def test_schedule_validation_and_owner_scoping():
     assert schedule["enabled"] is False
     assert schedule["last_status"] == "paused"
     assert client.delete(f"/api/schedules/{schedule_id}").json()["deleted"] is True
+
+
+def test_viewer_cannot_edit_or_delete_existing_schedules():
+    from auth_security import hash_password, issue_token
+    from monitoring_store import open_database
+
+    client = TestClient(app, headers=admin_headers())
+    dataset = client.post(
+        "/api/datasets",
+        json={"name": "viewer-schedule", "data": [{"value": 1}]},
+    ).json()
+    schedule = client.post(
+        "/api/schedules",
+        json={"dataset_id": dataset["id"], "interval_seconds": 60},
+    ).json()
+    connection = open_database()
+    try:
+        connection.execute(
+            "INSERT INTO users (id, username, password_hash, role, is_active, created_at) "
+            "VALUES (?, ?, ?, ?, 1, ?)",
+            (
+                "schedule-viewer-user",
+                "schedule-viewer",
+                hash_password("viewer-password-123"),
+                "viewer",
+                time.time(),
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    viewer_token = issue_token({"id": "schedule-viewer-user"}, lifetime_seconds=3600)
+    viewer = TestClient(
+        app,
+        headers={"Authorization": f"Bearer {viewer_token}"},
+    )
+
+    assert viewer.patch(
+        f"/api/schedules/{schedule['id']}",
+        json={"enabled": False},
+    ).status_code == 403
+    assert viewer.delete(f"/api/schedules/{schedule['id']}").status_code == 403
 
 
 def test_analyst_can_only_schedule_and_manage_owned_datasets():
