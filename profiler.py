@@ -198,6 +198,7 @@ def check_data_quality(
     expected_columns = list(expected_columns or [])
     expected_dtypes = expected_dtypes or {}
     actual_columns = [str(column) for column in df.columns]
+    type_aliases = {"string": "object", "str": "object", "integer": "int64", "float": "float64"}
     missing_columns = [str(column) for column in expected_columns if str(column) not in actual_columns]
     extra_columns = [column for column in actual_columns if column not in {str(item) for item in expected_columns}]
     type_issues = []
@@ -205,8 +206,7 @@ def check_data_quality(
         if column_name in df.columns:
             actual_type = str(df[column_name].dtype)
             expected_type = str(expected_type)
-            aliases = {"string": "object", "str": "object", "integer": "int64", "float": "float64"}
-            if aliases.get(expected_type.lower(), expected_type) != actual_type:
+            if type_aliases.get(expected_type.lower(), expected_type) != actual_type:
                 type_issues.append({"column": column_name, "expected": expected_type, "actual": actual_type})
 
     renamed_columns = []
@@ -216,10 +216,14 @@ def check_data_quality(
         for expected_column in missing_columns:
             candidates = []
             expected_type = expected_dtypes.get(expected_column)
-            expected_type = aliases.get(str(expected_type).lower(), str(expected_type)) if expected_type else None
+            normalized_expected_type = (
+                type_aliases.get(str(expected_type).lower(), str(expected_type))
+                if expected_type is not None
+                else None
+            )
             for actual_column in extra_columns:
                 actual_type = str(df[actual_column].dtype)
-                if expected_type and expected_type != actual_type:
+                if normalized_expected_type and normalized_expected_type != actual_type:
                     continue
                 confidence = round(SequenceMatcher(None, expected_column.lower(), actual_column.lower()).ratio(), 2)
                 if confidence >= 0.6:
