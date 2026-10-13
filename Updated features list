@@ -1,70 +1,59 @@
-Fully missing Features
+# Data Monitoring Tool - Feature List
 
-- ✅ Scheduled recurring quality, drift, anomaly, forecast, and XAI checks with freshness monitoring and alert delivery
-- Natural-language querying
-- AutoML model selection
-- Root-cause analysis
-- ✅ Encryption for uploaded datasets and monitoring results at rest
-- Audit logs with actor ownership are available through the authenticated admin API
-- ✅ Role-based access control (admin, analyst, viewer)
-- ✅ Multi-user bearer-token authentication
-- Custom dashboard builder
-- Dark mode UI
-- Multi-language support
-- Mobile-responsive dashboard
-- Scheduled reports
-- PDF, Excel, and PowerPoint report downloads
-- Fraud detection workflow
-- Data classification workflow
-- Clustering analysis
-- Recommendation engine
-- Predictive maintenance
-- Chatbot assistant
-- Voice commands
-- ✅ Dataset lineage and pipeline event tracking for ingestion, versions, comparisons, and monitoring failures
-- ✅ Immutable dataset version history with owner-scoped access
-- ✅ Dataset comparison for schema, type, quality, missing-value, duplicate, and drift changes
-- Real-time monitoring
-- ✅ Unified advanced monitoring dashboard for quality, drift, anomaly, alert, forecast, XAI, and historical-result views
+## Dataset profiling and quality
 
-Partially implemented
+- Profile datasets with row and column counts, data types, memory usage, and a data quality score.
+- Inspect previews, descriptive statistics, null distributions, correlations, cardinality, and memory use.
+- Detect exact duplicates and near-duplicates, including scalable candidate generation for larger datasets.
+- Validate expected columns and data types, identify likely renamed columns, and check data freshness.
+- Apply configurable column-level business rules and review failed rows.
+- Detect IQR outliers and Isolation Forest anomalies.
+- Generate data-quality recommendations and summaries; OpenAI-backed summaries are optional.
 
-- Schema validation
-  - Basic schema reporting exists.
-  - Full datatype validation and renamed-column detection are not complete.
-  - API configuration is not fully forwarded.
+## Drift, trends, and forecasting
 
-- Business-rule validation
-  - Basic rules such as `>= 0` and `contains @` exist.
-  - A complete configurable rule engine is not implemented.
+- Compare baseline and current datasets for schema, missing values, duplicates, quality, and feature drift.
+- Measure numeric and categorical drift with KS and PSI-based analysis, severity scores, and visualizations.
+- Analyze time-series trends and forecast metrics or data health.
+- Use linear and ARIMA forecasting; Prophet and TensorFlow-backed LSTM are optional methods with fallback reporting.
 
-- Forecasting
-  - Linear and ARIMA forecasting work.
-  - Prophet is optional; TensorFlow-backed LSTM forecasting is implemented.
-  - Forecast responses identify when an optional model falls back to linear.
+## Machine learning and explainability
 
-- Explainable AI
-  - Feature importance and optional SHAP support exist.
-  - The XAI dashboard supports evaluation and per-row explanations; a full monitoring dashboard is not implemented.
+- Compare candidate classification or regression models and select a best-performing model for a chosen metric.
+- Evaluate models on a holdout set with task-appropriate metrics and feature importance.
+- Generate per-row explanations with optional SHAP support.
+- Run K-means clustering, Isolation Forest-based fraud-pattern screening, predictive-maintenance modeling, and item recommendations.
 
-- Generative AI summaries
-  - Basic AI-style summaries exist.
-  - Full report-generation workflows and executive report automation are missing.
+## Data sources and workflows
 
-## Implemented
+- Upload CSV, Excel, JSON, Parquet, TSV, and text files within configured size and dataset limits.
+- Load data from local files, SQL databases, PostgreSQL, MySQL, MongoDB, S3, Dropbox, and Google Drive when provider configuration is available.
+- Check source capabilities and analyze multiple sources through the API.
+- Run configurable monitoring workflows for quality, drift, forecasting, and explanations, with tool traces and evidence-based findings.
+- Ask questions about a selected dataset through the monitoring assistant.
 
-- Exact duplicate detection
-- Near-duplicate detection with exact scoring and scalable LSH candidate generation
-- Data quality analysis
-- Drift detection
-- Trend analysis
-- ARIMA and linear forecasting
-- Feature importance
-- Optional SHAP explanations
-- Multi-source loading
-- Database/cloud source support
-- Email, SMS, WhatsApp, Slack, and Teams notifications
-- Basic API endpoints
-- Authentication, RBAC, encrypted stored datasets/results, and bounded CSV uploads
+## Monitoring, history, and reports
 
-The biggest remaining implementation gaps are chatbot and advanced ML workflows.
+- Persist datasets, monitoring results, alert rules and history, configuration, and audit records in SQLite.
+- Create immutable, owner-scoped dataset versions; inspect lineage and pipeline events.
+- Compare saved datasets or versions and retain comparison results in monitoring history.
+- Schedule recurring checks, pause or resume them, edit intervals, and review run status.
+- Retry failed scheduled jobs with bounded concurrency and backoff.
+- Generate PDF, Excel, and PowerPoint reports, including reports after scheduled runs.
+- Configure alert rules and deliver notifications through email, SMS, WhatsApp, Slack, and Microsoft Teams.
+
+## API, dashboard, and access
+
+- Use the FastAPI service and interactive API documentation for authenticated monitoring and dataset operations.
+- Explore quality, anomalies, drift, trends and forecasts, explanations, runs, schedules, reports, alerts, comparisons, lineage, and history in the Streamlit dashboards.
+- Use the voice assistant for typed questions or browser speech input, with spoken answers when browser support is available.
+- Set per-account dashboard language (English, Spanish, French, or Hindi), theme, and overview metric widgets; the dashboard adapts to narrow screens.
+- Authenticate with bearer tokens and use admin, analyst, or viewer roles with owner-scoped dataset and result access.
+- Protect stored datasets and results with encryption at rest; use password hashing, request-size limits, rate limiting, and admin audit access.
+- Check service health and readiness, inspect request metrics, and deploy the API with a separate schedule worker using Docker Compose.
+
+## Availability notes
+
+- Prophet, TensorFlow/LSTM, SHAP, OpenAI summaries, and external source providers require their optional packages or credentials.
+- Scheduled monitoring is periodic (minimum interval: 60 seconds); it is not a streaming real-time ingestion system.
+- Voice input and speech output depend on browser Web Speech API support and permissions.
