@@ -163,8 +163,11 @@ scheduler in every web worker. Configure `MONITORING_WORKER_CONCURRENCY` and
 ## Dashboard customization and localization
 
 The monitoring dashboard has per-account saved preferences for English,
-Spanish, French, or Hindi, a system/light/dark/high-contrast theme, and
-selectable overview metric widgets. It adjusts metric cards for narrow/mobile
+Spanish, French, or Hindi and a system/light/dark/high-contrast theme. Its
+overview includes a widget builder for metric cards and line/bar trend charts
+for quality, drift, anomalies, missing values, and duplicate rows. Drag widgets
+to rearrange them, add custom titles, or remove widgets; layouts are saved with
+the account's dashboard preferences. It adjusts metric cards for narrow/mobile
 viewports. The voice assistant supports the same languages. Preferences are
 available through authenticated `GET`/`POST /api/preferences`.
 

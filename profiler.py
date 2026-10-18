@@ -279,17 +279,46 @@ def check_data_quality(
 
         operator = rule.get("operator")
         expected = rule.get("value")
-        if rule.get("expression") == ">= 0":
-            operator, expected = ">=", 0
-        elif rule.get("expression") == "contains @":
-            operator, expected = "contains", "@"
+        expression = str(rule.get("expression", "")).strip()
+
+        if expression:
+            if expression in {">= 0", "non_negative", ">=0"}:
+                operator, expected = ">=", 0
+            elif expression in {"> 0", "positive", ">0"}:
+                operator, expected = ">", 0
+            elif expression in {"<= 0", "<=0"}:
+                operator, expected = "<=", 0
+            elif expression in {"< 0", "negative", "<0"}:
+                operator, expected = "<", 0
+            elif expression in {"contains @", "email"}:
+                operator, expected = "contains", "@"
+            elif expression in {"not_null", "is_not_null", "required"}:
+                operator = "is_not_null"
+            elif expression == "is_null":
+                operator = "is_null"
+            else:
+                match = re.match(r"^([><=!]=?)\s*(-?\d+(?:\.\d+)?)$", expression)
+                if match:
+                    operator = match.group(1)
+                    val_str = match.group(2)
+                    expected = float(val_str) if "." in val_str else int(val_str)
 
         try:
             if operator in {">", ">=", "<", "<=", "==", "!="}:
-                actual = pd.to_numeric(value, errors="coerce") if isinstance(expected, (int, float)) else value
-                return {">": actual > expected, ">=": actual >= expected, "<": actual < expected, "<=": actual <= expected, "==": actual == expected, "!=": actual != expected}[operator]
+                if isinstance(expected, (int, float)):
+                    actual = pd.to_numeric(value, errors="coerce")
+                    if pd.isna(actual):
+                        return False
+                    return {">": actual > expected, ">=": actual >= expected, "<": actual < expected, "<=": actual <= expected, "==": actual == expected, "!=": actual != expected}[operator]
+                return {">": value > expected, ">=": value >= expected, "<": value < expected, "<=": value <= expected, "==": value == expected, "!=": value != expected}[operator]
             if operator == "between":
-                return expected[0] <= value <= expected[1]
+                low, high = expected[0], expected[1]
+                if isinstance(low, (int, float)) or isinstance(high, (int, float)):
+                    actual = pd.to_numeric(value, errors="coerce")
+                    if pd.isna(actual):
+                        return False
+                    return low <= actual <= high
+                return low <= value <= high
             if operator == "in":
                 return value in expected
             if operator == "not_in":
@@ -382,13 +411,27 @@ def _call_openai_quality_summary(metrics):
         f"Dataset metrics: {json.dumps(metrics, ensure_ascii=False, default=str)}"
     )
 
-    response = client.responses.create(
-        model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-        input=prompt,
-        temperature=0.2,
-    )
+    model_name = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    content = None
+    try:
+        if hasattr(client, "responses"):
+            response = client.responses.create(
+                model=model_name,
+                input=prompt,
+                temperature=0.2,
+            )
+            content = getattr(response, "output_text", None)
+    except Exception:
+        content = None
 
-    content = getattr(response, "output_text", None)
+    if not content:
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+        )
+        content = response.choices[0].message.content
+
     if not content:
         raise RuntimeError("OpenAI response did not include output text")
 
@@ -508,6 +551,7 @@ def answer_monitoring_question(
             "quality": ("quality", "score", "health", "good", "bad"),
             "anomaly": ("anomaly", "outlier", "abnormal"),
             "drift": ("drift", "shift", "distribution"),
+            "duplicate": ("duplicate", "duplicates", "dup", "repeated", "repeat", "copy"),
             "summary": ("summary", "overall", "status", "monitor"),
         },
         "es": {
@@ -515,6 +559,7 @@ def answer_monitoring_question(
             "quality": ("calidad", "puntuación", "puntuacion", "puntaje", "salud"),
             "anomaly": ("anomalía", "anomalia", "atípico", "atipico", "anómalo", "anomalo"),
             "drift": ("deriva", "cambio", "distribución", "distribucion"),
+            "duplicate": ("duplicado", "duplicados", "repetido", "repetidos"),
             "summary": ("resumen", "general", "estado", "supervisión", "supervision"),
         },
         "fr": {
@@ -522,6 +567,7 @@ def answer_monitoring_question(
             "quality": ("qualité", "qualite", "score", "santé", "sante"),
             "anomaly": ("anomalie", "anomalies", "aberrant", "anormal"),
             "drift": ("dérive", "derive", "changement", "distribution"),
+            "duplicate": ("doublon", "doublons", "dupliqué", "dupliqués", "répété"),
             "summary": ("résumé", "resume", "global", "état", "etat", "surveillance"),
         },
         "hi": {
@@ -529,6 +575,7 @@ def answer_monitoring_question(
             "quality": ("गुणवत्ता", "स्कोर", "अंक", "स्वास्थ्य"),
             "anomaly": ("विसंगति", "विसंगतियां", "असामान्य", "आउटलायर"),
             "drift": ("ड्रिफ्ट", "बदलाव", "वितरण"),
+            "duplicate": ("दोहराव", "डुप्लिकेट", "नकल", "समान"),
             "summary": ("सारांश", "स्थिति", "निगरानी", "कुल"),
         },
     }
@@ -544,8 +591,10 @@ def answer_monitoring_question(
             "drift_yes": "Yes—drift was detected. The overall drift score is {score:.1f} ({severity} severity).",
             "drift_no": "No material drift was detected. The overall drift score is {score:.1f} ({severity} severity).",
             "drift_unavailable": "No drift report is available for the current monitoring context.",
+            "duplicate_yes": "I found {total} duplicate rows ({percent:.1f}% of total rows) in the dataset.",
+            "duplicate_no": "No duplicate rows were found in the current dataset.",
             "summary": "Overall quality is {quality:.1f}/100, drift is {drift:.1f}, and there are {anomalies} anomalies in the current monitoring snapshot.",
-            "help": "I can answer questions about quality scores, missing values, anomalies, drift, and monitoring status.",
+            "help": "I can answer questions about quality scores, missing values, duplicates, anomalies, drift, and monitoring status.",
         },
         "es": {
             "missing_values": "Hay {total} valores faltantes en {count} columnas.",
@@ -558,8 +607,10 @@ def answer_monitoring_question(
             "drift_yes": "Sí, se detectó deriva. La puntuación general es {score:.1f} (severidad {severity}).",
             "drift_no": "No se detectó deriva significativa. La puntuación es {score:.1f} (severidad {severity}).",
             "drift_unavailable": "No hay un informe de deriva disponible en el contexto actual.",
+            "duplicate_yes": "Se encontraron {total} filas duplicadas ({percent:.1f}% del total) en el conjunto de datos.",
+            "duplicate_no": "No se encontraron filas duplicadas en el conjunto de datos actual.",
             "summary": "La calidad general es {quality:.1f}/100, la deriva es {drift:.1f} y hay {anomalies} anomalías en la supervisión actual.",
-            "help": "Puedo responder sobre calidad, valores faltantes, anomalías, deriva y estado de supervisión.",
+            "help": "Puedo responder sobre calidad, valores faltantes, duplicados, anomalías, deriva y estado de supervisión.",
         },
         "fr": {
             "missing_values": "Il y a {total} valeurs manquantes dans {count} colonnes.",
@@ -572,8 +623,10 @@ def answer_monitoring_question(
             "drift_yes": "Oui, une dérive a été détectée. Le score global est de {score:.1f} (gravité {severity}).",
             "drift_no": "Aucune dérive significative n’a été détectée. Le score est de {score:.1f} (gravité {severity}).",
             "drift_unavailable": "Aucun rapport de dérive n’est disponible dans le contexte actuel.",
+            "duplicate_yes": "{total} lignes en double ont été détectées ({percent:.1f}% des lignes) dans le jeu de données.",
+            "duplicate_no": "Aucun doublon n'a été détecté dans le jeu de données actuel.",
             "summary": "La qualité globale est de {quality:.1f}/100, la dérive est de {drift:.1f} et il y a {anomalies} anomalies dans la surveillance actuelle.",
-            "help": "Je peux répondre sur la qualité, les valeurs manquantes, les anomalies, la dérive et l’état de surveillance.",
+            "help": "Je peux répondre sur la qualité, les valeurs manquantes, les doublons, les anomalies, la dérive et l’état de surveillance.",
         },
         "hi": {
             "missing_values": "{count} कॉलम में {total} मान अनुपलब्ध हैं।",
@@ -586,8 +639,10 @@ def answer_monitoring_question(
             "drift_yes": "हां, डेटा ड्रिफ्ट मिला। कुल स्कोर {score:.1f} है (गंभीरता {severity})।",
             "drift_no": "कोई महत्वपूर्ण डेटा ड्रिफ्ट नहीं मिला। स्कोर {score:.1f} है (गंभीरता {severity})।",
             "drift_unavailable": "वर्तमान निगरानी संदर्भ में ड्रिफ्ट रिपोर्ट उपलब्ध नहीं है।",
+            "duplicate_yes": "डेटासेट में {total} डुप्लिकेट पंक्तियां ({percent:.1f}%) पाई गईं।",
+            "duplicate_no": "वर्तमान डेटासेट में कोई डुप्लिकेट पंक्ति नहीं मिली।",
             "summary": "कुल गुणवत्ता {quality:.1f}/100 है, ड्रिफ्ट {drift:.1f} है और वर्तमान निगरानी में {anomalies} विसंगतियां हैं।",
-            "help": "मैं गुणवत्ता स्कोर, अनुपलब्ध मान, विसंगतियों, ड्रिफ्ट और निगरानी स्थिति के बारे में उत्तर दे सकता हूं।",
+            "help": "मैं गुणवत्ता स्कोर, अनुपलब्ध मान, डुप्लिकेट, विसंगतियों, ड्रिफ्ट और निगरानी स्थिति के बारे में उत्तर दे सकता हूं।",
         },
     }[language]
     intent_phrases = phrases[language]
@@ -639,6 +694,31 @@ def answer_monitoring_question(
             "context": {
                 "total_missing_values": missing_total,
                 "columns_with_missing_values": missing_columns,
+            },
+        }
+
+    if has_intent("duplicate"):
+        exact_duplicates = 0
+        total_rows = 0
+        if isinstance(quality_report, dict):
+            exact_duplicates = int(quality_report.get("duplicates", 0))
+            total_rows = int(quality_report.get("rows", 0))
+        elif df is not None:
+            exact_duplicates = int(df.duplicated().sum())
+            total_rows = len(df)
+        pct = (exact_duplicates / max(total_rows, 1)) * 100
+        answer = (
+            localized["duplicate_yes"].format(total=exact_duplicates, percent=pct)
+            if exact_duplicates > 0
+            else localized["duplicate_no"]
+        )
+        return {
+            "category": "quality",
+            "answer": answer,
+            "confidence": "high",
+            "context": {
+                "exact_duplicates": exact_duplicates,
+                "duplicate_percentage": round(pct, 2),
             },
         }
 
@@ -793,11 +873,21 @@ def detect_outliers_iqr(df):
     num = df.select_dtypes(include=np.number)
 
     for col in num.columns:
-        q1, q3 = num[col].quantile([0.25, 0.75])
+        series = num[col].dropna()
+        if series.empty:
+            result[col] = {"count": 0, "lower_bound": None, "upper_bound": None, "percentage": 0.0}
+            continue
+        q1, q3 = series.quantile([0.25, 0.75])
         iqr = q3 - q1
-        out = num[(num[col] < q1 - 1.5 * iqr) |
-                  (num[col] > q3 + 1.5 * iqr)]
-        result[col] = {"count": len(out)}
+        lower = q1 - 1.5 * iqr
+        upper = q3 + 1.5 * iqr
+        out = series[(series < lower) | (series > upper)]
+        result[col] = {
+            "count": len(out),
+            "lower_bound": round(float(lower), 4),
+            "upper_bound": round(float(upper), 4),
+            "percentage": round(float(len(out) / max(len(series), 1) * 100), 2),
+        }
     return result
 
 def plot_outliers(df, col):
@@ -805,18 +895,25 @@ def plot_outliers(df, col):
     return apply_modern_theme(fig)
 
 # ANOMALIES
-def detect_anomalies_isolation_forest(df):
+def detect_anomalies_isolation_forest(df, contamination=0.05):
     num = df.select_dtypes(include=np.number).dropna()
     if num.shape[1] == 0 or len(num) < 10:
         return None
 
-    model = IsolationForest(contamination=0.05, random_state=42)
+    try:
+        contam = float(contamination)
+        if not 0.001 <= contam <= 0.5:
+            contam = 0.05
+    except (TypeError, ValueError):
+        contam = 0.05
+
+    model = IsolationForest(contamination=contam, random_state=42)
     preds = model.fit_predict(num)
     idx = num.index[preds == -1]
 
     return {
         "total_anomalies": len(idx),
-        "anomaly_percentage": len(idx) / len(df) * 100,
+        "anomaly_percentage": len(idx) / max(len(df), 1) * 100,
         "indices": idx.tolist()
     }
 
@@ -863,14 +960,42 @@ def plot_memory_usage(df):
 # RECOMMENDATIONS
 def generate_recommendations(df, report):
     rec = []
-    if report["total_nulls"] > 0:
-        rec.append({"type":"Missing Values",
-                    "issue":"Null values detected",
-                    "solution":"Use fillna/dropna"})
-    if report["duplicates"] > 0:
-        rec.append({"type":"Duplicates",
-                    "issue":"Duplicate rows found",
-                    "solution":"Use drop_duplicates"})
+    if report.get("total_nulls", 0) > 0:
+        rec.append({"type": "Missing Values",
+                    "issue": "Null values detected",
+                    "solution": "Use fillna/dropna"})
+    if report.get("duplicates", 0) > 0:
+        rec.append({"type": "Duplicates",
+                    "issue": "Duplicate rows found",
+                    "solution": "Use drop_duplicates"})
+    if report.get("all_null_columns"):
+        rec.append({"type": "Empty Columns",
+                    "issue": f"{len(report['all_null_columns'])} column(s) are completely empty",
+                    "solution": "Drop empty columns using df.drop(columns=...)"})
+    dup_details = report.get("duplicate_detection", {})
+    if dup_details.get("near_duplicate_pairs", 0) > 0:
+        rec.append({"type": "Near Duplicates",
+                    "issue": f"{dup_details['near_duplicate_pairs']} near-duplicate pair(s) detected",
+                    "solution": "Review highly similar rows for potential data entry repetition"})
+    business_rules = report.get("business_rule_validation", {})
+    if business_rules.get("violations", 0) > 0:
+        rec.append({"type": "Business Rules",
+                    "issue": f"{business_rules['violations']} business rule violation(s) identified",
+                    "solution": "Filter or correct rows violating column business rules"})
+    freshness = report.get("data_freshness", {})
+    if freshness.get("is_fresh") is False:
+        rec.append({"type": "Data Freshness",
+                    "issue": f"Data exceeds maximum allowed age ({freshness.get('age_hours')} hrs vs max {freshness.get('max_age_hours')} hrs)",
+                    "solution": "Trigger upstream pipeline refresh to ensure dataset currency"})
+    schema = report.get("schema_validation", {})
+    if schema.get("missing_columns"):
+        rec.append({"type": "Schema Validation",
+                    "issue": f"Missing expected column(s): {', '.join(schema['missing_columns'])}",
+                    "solution": "Ensure data source pipeline supplies all expected schema columns"})
+    if schema.get("type_issues"):
+        rec.append({"type": "Data Type Mismatch",
+                    "issue": f"{len(schema['type_issues'])} column(s) do not match expected dtypes",
+                    "solution": "Cast affected columns to the expected data types"})
     return rec
 
 
