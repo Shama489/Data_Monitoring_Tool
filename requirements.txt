@@ -52,6 +52,7 @@ smmap==5.0.3
 SQLAlchemy==2.0.48
 starlette==0.52.1
 streamlit==1.55.0
+streamlit-sortables==0.3.1
 tenacity==9.1.4
 toml==0.10.2
 tornado==6.5.5

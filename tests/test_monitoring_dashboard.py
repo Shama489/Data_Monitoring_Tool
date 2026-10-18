@@ -2,7 +2,40 @@ from datetime import datetime, timezone
 
 import pandas as pd
 
-from monitoring_dashboard import _filter_monitoring_results, _result_rows
+from monitoring_dashboard import (
+    _filter_monitoring_results,
+    _normalize_dashboard_widgets,
+    _result_rows,
+)
+
+
+def test_normalize_dashboard_widgets_keeps_legacy_preferences_and_custom_layout():
+    legacy = _normalize_dashboard_widgets(["quality_score", "anomalies"])
+    assert [widget["metric"] for widget in legacy] == ["quality_score", "anomalies"]
+    assert all(widget["kind"] == "metric" for widget in legacy)
+
+    custom = _normalize_dashboard_widgets([
+        {
+            "id": "custom-score",
+            "kind": "chart",
+            "metric": "quality_score",
+            "title": "Quality trend",
+            "chart_type": "line",
+        },
+        {
+            "id": "custom-score",
+            "kind": "metric",
+            "metric": "anomalies",
+            "title": "Duplicate id is ignored",
+        },
+    ])
+    assert custom == [{
+        "id": "custom-score",
+        "kind": "chart",
+        "metric": "quality_score",
+        "title": "Quality trend",
+        "chart_type": "line",
+    }]
 
 
 def test_filter_monitoring_results_uses_dataset_date_and_search_filters():

@@ -42,10 +42,11 @@ def test_connection() -> bool:
 
 
 # SAFE QUERY EXECUTION
-def get_data(query: str, params: dict | None = None) -> pd.DataFrame:
+def get_data(query: str | text, params: dict | None = None) -> pd.DataFrame:
     try:
         with engine.connect() as conn:
-            df = pd.read_sql(text(query), conn, params=params)
+            stmt = query if hasattr(query, "compile") else text(str(query))
+            df = pd.read_sql(stmt, conn, params=params)
         return df
     except Exception as e:
         print(f"❌ Database Error: {e}")
@@ -87,5 +88,5 @@ def get_table_data(table_name: str, limit: int = 100) -> pd.DataFrame:
     if safe_name not in tables["table_name"].tolist():
         raise ValueError(f"Invalid table name: {safe_name}")
 
-    query = text(f"SELECT * FROM {safe_name} LIMIT :limit")
+    query = f"SELECT * FROM {safe_name} LIMIT :limit"
     return get_data(query, {"limit": limit})
