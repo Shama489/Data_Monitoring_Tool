@@ -7,6 +7,7 @@ import time
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qsl, urlsplit
 
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Query, Request, Response
@@ -48,7 +49,14 @@ from notifications import (
     persist_alert_rules,
     send_notifications,
 )
-from data_sources import DataSourceError, load_source, load_uploaded_file, summarize_source
+from data_sources import (
+    MAX_SOURCE_COLUMNS,
+    MAX_SOURCE_ROWS,
+    DataSourceError,
+    load_source,
+    load_uploaded_file,
+    summarize_source,
+)
 from monitoring_store import (
     clear_login_failures,
     create_dataset_version,
@@ -125,8 +133,8 @@ app = FastAPI(title="Data Monitoring Tool", lifespan=lifespan)
 app.middleware("http")(authentication_middleware)
 app.add_middleware(RequestBodyLimitMiddleware)
 logger = logging.getLogger(__name__)
-MAX_DATASET_ROWS = 100_000
-MAX_DATASET_COLUMNS = 1_000
+MAX_DATASET_ROWS = MAX_SOURCE_ROWS
+MAX_DATASET_COLUMNS = MAX_SOURCE_COLUMNS
 
 
 @app.middleware("http")
@@ -213,6 +221,75 @@ def _validate_dataset_dimensions(frame: pd.DataFrame) -> None:
         _bad_request(f"Dataset must not exceed {MAX_DATASET_ROWS:,} rows")
     if len(frame.columns) > MAX_DATASET_COLUMNS:
         _bad_request(f"Dataset must not exceed {MAX_DATASET_COLUMNS:,} columns")
+
+
+def _validate_scheduled_source(source: Any) -> dict[str, Any]:
+    if not isinstance(source, dict):
+        _bad_request("source must be an object")
+    source_type = str(source.get("type", "")).strip().lower()
+    if source_type in {"sql", "postgresql", "mysql"}:
+        if "url" in source or not isinstance(source.get("url_env"), str):
+            _bad_request("Scheduled SQL sources must use url_env for server-side credentials")
+    if source_type == "mongodb":
+        if "uri" in source or not isinstance(source.get("uri_env"), str):
+            _bad_request("Scheduled MongoDB sources must use uri_env for server-side credentials")
+
+    credential_markers = (
+        "authorization",
+        "auth",
+        "credential",
+        "password",
+        "secret",
+        "token",
+        "apikey",
+        "accesskey",
+        "privatekey",
+    )
+
+    def has_inline_credential(key: Any) -> bool:
+        normalized = "".join(character for character in str(key).lower() if character.isalnum())
+        return not normalized.endswith("env") and any(
+            marker in normalized for marker in credential_markers
+        )
+
+    def contains_inline_credentials(value: Any) -> bool:
+        if isinstance(value, dict):
+            return any(
+                has_inline_credential(key)
+                or str(key).lower() in {"headers", "credentials"}
+                or contains_inline_credentials(item)
+                for key, item in value.items()
+            )
+        if isinstance(value, list):
+            return any(contains_inline_credentials(item) for item in value)
+        return False
+
+    if contains_inline_credentials(source):
+        _bad_request(
+            "Scheduled source credentials must use server environment variables"
+        )
+    url = source.get("url")
+    if isinstance(url, str):
+        try:
+            parsed_url = urlsplit(url)
+        except ValueError:
+            _bad_request("Scheduled source URL is invalid")
+        sensitive_query_keys = {
+            "access_token",
+            "api_key",
+            "auth",
+            "key",
+            "password",
+            "secret",
+            "token",
+        }
+        if parsed_url.username or parsed_url.password or parsed_url.fragment or any(
+            key.lower() in sensitive_query_keys
+            or has_inline_credential(key)
+            for key, _ in parse_qsl(parsed_url.query, keep_blank_values=True)
+        ):
+            _bad_request("Scheduled source URLs must not contain embedded credentials")
+    return source
 
 
 def _persist_endpoint_result(
@@ -720,7 +797,7 @@ async def upload_dataset_file_endpoint(request: Request, name: str = Query(min_l
             content,
             extension,
             safe_name,
-            max_rows=MAX_DATASET_ROWS + 1,
+            max_rows=MAX_DATASET_ROWS,
             max_columns=MAX_DATASET_COLUMNS,
         )
     except (DataSourceError, ValueError) as error:
@@ -1148,11 +1225,28 @@ def list_monitoring_schedules_endpoint():
 @app.post("/api/schedules", status_code=201)
 def create_monitoring_schedule_endpoint(payload: dict[str, Any]):
     dataset_id = payload.get("dataset_id")
-    if not isinstance(dataset_id, str) or not dataset_id.strip():
-        _bad_request("dataset_id is required")
-    dataset = get_dataset(dataset_id, owner_id=current_user_scope())
-    if dataset is None:
-        raise HTTPException(status_code=404, detail="Dataset was not found")
+    source_config = None
+    if dataset_id is not None:
+        if not isinstance(dataset_id, str) or not dataset_id.strip():
+            _bad_request("dataset_id must be a non-empty string")
+        if payload.get("source") is not None:
+            _bad_request("Provide either dataset_id or source, not both")
+        dataset = get_dataset(dataset_id, owner_id=current_user_scope())
+        if dataset is None:
+            raise HTTPException(status_code=404, detail="Dataset was not found")
+    else:
+        source_config = _validate_scheduled_source(payload.get("source"))
+        try:
+            initial_frame = load_source(source_config)
+        except (DataSourceError, TypeError, ValueError) as error:
+            _bad_request(str(error))
+        if initial_frame.empty:
+            _bad_request("Source dataset must not be empty")
+        dataset = {
+            "name": _dataset_name(payload, default="scheduled_source"),
+            "data": _frame_records(initial_frame),
+            "owner_id": current_user_id(),
+        }
 
     try:
         interval_seconds = int(payload.get("interval_seconds", 3600))
@@ -1284,6 +1378,16 @@ def create_monitoring_schedule_endpoint(payload: dict[str, Any]):
         else:
             _bad_request("alert_channels entries must be channel names or objects")
     schedule["alert_channels"] = validated_channels
+
+    if source_config is not None:
+        dataset_id = save_dataset(
+            dataset["name"],
+            dataset["data"],
+            _dataset_source({"source": source_config}),
+            owner_id=current_user_id(),
+        )
+        schedule["source"] = source_config
+        schedule["latest_dataset_id"] = dataset_id
 
     saved = create_monitoring_schedule(
         current_user_id(),

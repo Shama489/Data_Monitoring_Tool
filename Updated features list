@@ -27,7 +27,7 @@
 ## Data sources and workflows
 
 - Upload CSV, Excel, JSON, Parquet, TSV, and text files within configured size and dataset limits.
-- Load data from local files, SQL databases, PostgreSQL, MySQL, MongoDB, S3, Dropbox, and Google Drive when provider configuration is available.
+- Load data from local files, SQL databases, PostgreSQL, MySQL, MongoDB, S3, Dropbox, Google Drive, and allowlisted HTTPS JSON APIs when provider configuration is available.
 - Check source capabilities and analyze multiple sources through the API.
 - Run configurable monitoring workflows for quality, drift, forecasting, and explanations, with tool traces and evidence-based findings.
 - Ask questions about a selected dataset through the monitoring assistant.
@@ -37,7 +37,7 @@
 - Persist datasets, monitoring results, alert rules and history, configuration, and audit records in SQLite.
 - Create immutable, owner-scoped dataset versions; inspect lineage and pipeline events.
 - Compare saved datasets or versions and retain comparison results in monitoring history.
-- Schedule recurring checks, pause or resume them, edit intervals, and review run status.
+- Schedule recurring checks against saved datasets or refreshable sources; source polls create immutable dataset versions and run the selected checks. Pause or resume schedules, edit intervals, and review run status.
 - Retry failed scheduled jobs with bounded concurrency and backoff.
 - Generate PDF, Excel, and PowerPoint reports, including reports after scheduled runs.
 - Configure alert rules and deliver notifications through email, SMS, WhatsApp, Slack, and Microsoft Teams.

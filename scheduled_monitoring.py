@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from agents.monitoring_agent import run_monitoring
+from data_sources import DataSourceError, load_source
 from monitoring_store import (
     claim_due_monitoring_schedules,
+    create_monitoring_schedule_dataset_version,
     create_monitoring_report,
     finish_monitoring_schedule,
     record_lineage_event,
@@ -22,8 +25,66 @@ logger = logging.getLogger(__name__)
 
 def _execute_schedule(item: dict[str, Any]) -> None:
     config: dict[str, Any] = item["schedule"]
+    dataset_id = item["dataset_id"]
+    source = config.get("source")
+    if isinstance(source, dict):
+        try:
+            frame = load_source(source)
+            if frame.empty:
+                raise DataSourceError("Source dataset must not be empty")
+            source_metadata = {
+                key: source[key]
+                for key in (
+                    "type",
+                    "file_type",
+                    "name",
+                    "bucket",
+                    "key",
+                    "database",
+                    "collection",
+                    "file_id",
+                )
+                if source.get(key) is not None
+            }
+            dataset_id = create_monitoring_schedule_dataset_version(
+                item["id"],
+                config.get("dataset_name", "monitoring_dataset"),
+                json.loads(frame.to_json(orient="records", date_format="iso")),
+                source_metadata,
+                "Scheduled source refresh",
+            )
+        except Exception as error:
+            logger.error(
+                "Scheduled source refresh failed for %s (%s)",
+                item["id"],
+                type(error).__name__,
+            )
+            safe_error = f"{type(error).__name__}: source refresh failed"
+            finish_monitoring_schedule(
+                item["id"],
+                succeeded=False,
+                error=safe_error,
+            )
+            try:
+                record_lineage_event(
+                    item["dataset_id"],
+                    "source_refresh",
+                    "scheduled_ingestion",
+                    "failed",
+                    input_dataset_ids=[item["dataset_id"]],
+                    details={"schedule_id": item["id"]},
+                    error=safe_error[:500],
+                    owner_id=config.get("run_owner_id", item["owner_id"]),
+                )
+            except ValueError:
+                logger.warning(
+                    "Could not record lineage for failed source schedule %s",
+                    item["id"],
+                )
+            return
+
     payload: dict[str, Any] = {
-        "dataset_id": item["dataset_id"],
+        "dataset_id": dataset_id,
         "checks": config["checks"],
         "schedule_id": item["id"],
         "scheduled": True,
@@ -75,13 +136,14 @@ def _execute_schedule(item: dict[str, Any]) -> None:
         )
         try:
             record_lineage_event(
-                item["dataset_id"],
+                dataset_id,
                 "monitoring_run",
                 "scheduled_monitoring",
                 "failed",
-                input_dataset_ids=[item["dataset_id"]],
+                input_dataset_ids=[dataset_id],
                 details={"schedule_id": item["id"]},
                 error=f"{type(error).__name__}: {error}"[:500],
+                owner_id=config.get("run_owner_id", item["owner_id"]),
             )
         except ValueError:
             logger.warning(

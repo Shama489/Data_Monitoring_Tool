@@ -160,6 +160,19 @@ set `MONITORING_SCHEDULER_ENABLED=false` on API processes to avoid running a
 scheduler in every web worker. Configure `MONITORING_WORKER_CONCURRENCY` and
 `MONITORING_POLL_INTERVAL_SECONDS` to control the worker pool and poll interval.
 
+Schedules can monitor either a saved dataset (`dataset_id`) or a configured
+source (`source`). A source is loaded once when the schedule is created and
+again on each poll. Successful polls create linked immutable dataset versions;
+the existing monitoring workflow runs against each new version. Failed fetches
+do not create a version and use the scheduler's existing bounded retry policy.
+Scheduled SQL and MongoDB sources must use `url_env` and `uri_env` to name
+server-side environment variables; never put passwords or API credentials in
+the schedule request. HTTP API sources use `token_env` for an optional bearer
+token, and provider credentials such as Dropbox or AWS remain server-side.
+
+For example, a recurring HTTP source can be scheduled with
+`{"source":{"type":"http_json","url":"https://api.example.com/events","token_env":"EVENTS_API_TOKEN"},"interval_seconds":3600,"checks":["quality","anomalies"]}`.
+
 ## Dashboard customization and localization
 
 The monitoring dashboard has per-account saved preferences for English,
@@ -492,7 +505,15 @@ The response includes the selected checks, executed tool trace, quality and drif
 }
 ```
 
-Supported source types are `csv`, `excel`, `json`, `parquet`, `tsv`, `txt`, `sql`, `postgresql`, `mysql`, `mongodb`, `s3`, `dropbox`, and `google_drive`. SQL sources only accept `SELECT` queries. Configure cloud credentials through the provider SDK environment variables, including `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`, `DROPBOX_ACCESS_TOKEN`, and `GOOGLE_APPLICATION_CREDENTIALS`.
+Supported source types are `csv`, `excel`, `json`, `parquet`, `tsv`, `txt`, `sql`, `postgresql`, `mysql`, `mongodb`, `s3`, `dropbox`, `google_drive`, and `http_json` (`rest_json`). SQL sources only accept `SELECT` queries. Configure cloud credentials through the provider SDK environment variables, including `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`, `DROPBOX_ACCESS_TOKEN`, and `GOOGLE_APPLICATION_CREDENTIALS`.
+
+The `http_json` source (alias `rest_json`) loads record arrays from an HTTPS
+JSON API. Provide `url`, an optional dotted `records_path`, and optionally
+`token_env` naming an environment variable that contains a bearer token.
+Configure `DATA_SOURCE_HTTP_ALLOWED_HOSTS` as a comma-separated allowlist of
+hostnames before using this connector. Redirects are disabled. Source files and
+HTTP responses are limited to 50 MiB; all source loaders reject data exceeding
+100,000 rows or 1,000 columns. SQL results are read in bounded chunks.
 
 Use `GET /api/sources/capabilities` to check supported providers, missing SDKs, and required credential configuration before submitting a multi-source analysis. Provider SDK imports remain optional at startup; install the relevant entries from `requirements.txt` when needed. AWS credentials are resolved through the normal SDK chain, including environment variables, profiles, and execution roles.
 
