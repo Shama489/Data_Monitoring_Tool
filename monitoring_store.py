@@ -984,6 +984,7 @@ def create_dataset_version(
     data: Any,
     change_summary: str | None,
     owner_id: str | None = None,
+    source: Any = None,
 ) -> str | None:
     with connect_database() as connection:
         if owner_id is None:
@@ -1004,7 +1005,8 @@ def create_dataset_version(
             connection,
             name,
             data,
-            {
+            source
+            or {
                 "type": "dataset_version",
                 "parent_dataset_id": dataset_id,
                 "name": name,
@@ -1014,6 +1016,60 @@ def create_dataset_version(
             version_number=parent["version_number"] + 1,
             change_summary=change_summary,
         )
+
+
+def create_monitoring_schedule_dataset_version(
+    schedule_id: str,
+    name: str,
+    data: Any,
+    source: Any,
+    change_summary: str,
+) -> str:
+    """Atomically persist a fetched snapshot and advance its schedule pointer."""
+    with connect_database() as connection:
+        schedule_row = connection.execute(
+            "SELECT id, owner_id, dataset_id, schedule FROM monitoring_schedules "
+            "WHERE id = ?",
+            (schedule_id,),
+        ).fetchone()
+        if schedule_row is None:
+            raise ValueError("Monitoring schedule was not found")
+        schedule = _decode(schedule_row["schedule"], {})
+        if not isinstance(schedule.get("source"), dict):
+            raise ValueError("Monitoring schedule does not refresh a source")
+        parent_id = schedule.get("latest_dataset_id", schedule_row["dataset_id"])
+        parent = connection.execute(
+            "SELECT id, owner_id, version_number FROM datasets "
+            "WHERE id = ? AND owner_id = ?",
+            (parent_id, schedule_row["owner_id"]),
+        ).fetchone()
+        if parent is None:
+            raise ValueError("Latest source dataset version was not found")
+        version_id = _insert_dataset(
+            connection,
+            name,
+            data,
+            source,
+            schedule_row["owner_id"],
+            parent_dataset_id=parent_id,
+            version_number=parent["version_number"] + 1,
+            change_summary=change_summary,
+        )
+        schedule["latest_dataset_id"] = version_id
+        connection.execute(
+            "UPDATE monitoring_schedules SET schedule = ?, updated_at = ? "
+            "WHERE id = ?",
+            (_encode(schedule), time.time(), schedule_id),
+        )
+        _audit(
+            connection,
+            "source_version_created",
+            "monitoring_schedule",
+            schedule_id,
+            {"dataset_id": version_id, "parent_dataset_id": parent_id},
+            schedule_row["owner_id"],
+        )
+        return version_id
 
 
 def save_dataset(

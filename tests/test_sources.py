@@ -6,7 +6,10 @@ from fastapi.testclient import TestClient
 
 from data_sources import (
     DataSourceError,
+    load_http_json,
     load_local_file,
+    load_source,
+    load_uploaded_file,
     load_sql_query,
     source_capabilities,
 )
@@ -41,6 +44,10 @@ def test_source_capabilities_report_provider_setup():
     assert "txt" in providers["local_files"]["formats"]
     assert providers["dropbox"]["credential_env"] == ["DROPBOX_ACCESS_TOKEN"]
     assert "missing_dependencies" in providers["s3"]
+    assert providers["http_json"]["aliases"] == ["rest_json"]
+    assert providers["http_json"]["credential_env"] == [
+        "DATA_SOURCE_HTTP_ALLOWED_HOSTS"
+    ]
 
 
 def test_local_file_source_is_not_reported_ready_without_allowed_roots(monkeypatch):
@@ -82,6 +89,114 @@ def test_sql_loader_accepts_commented_select_queries_with_embedded_semicolons():
         frame,
         pd.DataFrame({"value": ["alpha;beta", "gamma;delta"]}),
     )
+
+
+def test_sql_loader_rejects_results_above_the_configured_row_limit():
+    with pytest.raises(DataSourceError, match="must not exceed 2 rows"):
+        load_sql_query(
+            "sqlite://",
+            "SELECT 1 AS value UNION ALL SELECT 2 UNION ALL SELECT 3",
+            max_rows=2,
+        )
+
+
+def test_sql_loader_does_not_expose_connection_errors(monkeypatch):
+    def fail_engine(*_args, **_kwargs):
+        raise RuntimeError("connection failed for db://alice:private-password@host")
+
+    monkeypatch.setattr("data_sources.create_engine", fail_engine)
+
+    with pytest.raises(DataSourceError) as raised:
+        load_sql_query("db://alice:private-password@host", "SELECT 1")
+
+    assert "private-password" not in str(raised.value)
+    assert str(raised.value) == (
+        "Database query failed; check the source configuration and query"
+    )
+
+
+def test_source_loader_enforces_row_limit_for_local_files(tmp_path, monkeypatch):
+    monkeypatch.setenv("DATASET_ALLOWED_DIRS", str(tmp_path))
+    path = tmp_path / "events.csv"
+    path.write_text("value\n1\n2\n3\n", encoding="utf-8")
+
+    with pytest.raises(DataSourceError, match="must not exceed 2 rows"):
+        load_source({"type": "csv", "path": str(path)}, max_rows=2)
+
+
+def test_uploaded_file_loader_rejects_instead_of_truncating_excess_rows():
+    with pytest.raises(DataSourceError, match="must not exceed 1 rows"):
+        load_uploaded_file(
+            b"value\n1\n2\n",
+            "csv",
+            "events.csv",
+            max_rows=1,
+        )
+
+
+def test_http_json_source_uses_environment_token_and_extracts_records(monkeypatch):
+    calls = []
+
+    class FakeResponse:
+        status_code = 200
+        is_redirect = False
+
+        def raise_for_status(self):
+            return None
+
+        def iter_content(self, chunk_size):
+            assert chunk_size > 0
+            yield b'{"payload":{"items":[{"value":1},{"value":2}]}}'
+
+        def close(self):
+            return None
+
+    def fake_get(url, **kwargs):
+        calls.append((url, kwargs))
+        return FakeResponse()
+
+    monkeypatch.setenv("DATA_SOURCE_HTTP_ALLOWED_HOSTS", "api.example.test")
+    monkeypatch.setenv("TEST_API_TOKEN", "test-only-token")
+    monkeypatch.setattr("data_sources.requests.get", fake_get)
+
+    frame = load_http_json(
+        "https://api.example.test/records",
+        token_env="TEST_API_TOKEN",
+        records_path="payload.items",
+    )
+
+    assert frame.to_dict(orient="records") == [{"value": 1}, {"value": 2}]
+    assert calls[0][1]["headers"]["Authorization"] == "Bearer test-only-token"
+    assert calls[0][1]["allow_redirects"] is False
+
+
+def test_http_json_source_rejects_unallowlisted_hosts_and_oversized_results(monkeypatch):
+    monkeypatch.setenv("DATA_SOURCE_HTTP_ALLOWED_HOSTS", "trusted.example.test")
+    with pytest.raises(DataSourceError, match="not listed"):
+        load_http_json("https://other.example.test/data")
+    with pytest.raises(DataSourceError, match="not listed"):
+        load_http_json("https://trusted.example.test:8443/data")
+
+    class FakeResponse:
+        status_code = 200
+        is_redirect = False
+
+        def raise_for_status(self):
+            return None
+
+        def iter_content(self, chunk_size):
+            yield b'{"data":[{"value":1},{"value":2}]}'
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr("data_sources.requests.get", lambda *_args, **_kwargs: FakeResponse())
+
+    with pytest.raises(DataSourceError, match="must not exceed 1 rows"):
+        load_http_json(
+            "https://trusted.example.test/data",
+            max_rows=1,
+        )
 
 
 def test_sources_endpoint_reports_success_and_partial_failure(tmp_path, monkeypatch):
@@ -309,6 +424,47 @@ def test_monitoring_agent_loads_source_and_sends_requested_notification(monkeypa
     assert body["notifications"]["status"] == "sent"
     assert sent_alerts[0]["event_type"] == "monitoring_workflow"
     assert sent_alerts[0]["channels"] == ["slack"]
+
+
+def test_http_source_runs_quality_anomaly_and_drift_monitoring(monkeypatch):
+    class FakeResponse:
+        status_code = 200
+        is_redirect = False
+
+        def raise_for_status(self):
+            return None
+
+        def iter_content(self, chunk_size):
+            records = [{"value": value} for value in range(10, 29)]
+            records.append({"value": 1000})
+            yield json.dumps({"data": records}).encode()
+
+        def close(self):
+            return None
+
+    monkeypatch.setenv("DATA_SOURCE_HTTP_ALLOWED_HOSTS", "api.example.test")
+    monkeypatch.setattr(
+        "data_sources.requests.get",
+        lambda *_args, **_kwargs: FakeResponse(),
+    )
+    response = client.post(
+        "/api/monitoring/analyze",
+        json={
+            "source": {
+                "type": "http_json",
+                "url": "https://api.example.test/events",
+            },
+            "checks": ["quality", "anomalies", "drift"],
+            "baseline": [{"value": value} for value in range(20)],
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert set(body["results"]) == {"quality", "anomalies", "drift"}
+    assert body["results"]["anomalies"]["available"] is True
+    assert body["results"]["drift"]["drift_detected"] is True
+    assert client.get(f"/api/datasets/{body['dataset_id']}").status_code == 200
 
 
 def test_quality_endpoint_forwards_optional_llm_flag(monkeypatch):

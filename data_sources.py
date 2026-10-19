@@ -5,11 +5,14 @@ from __future__ import annotations
 import io
 import importlib.util
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qsl, urlsplit
 
 import pandas as pd
+import requests
 from sqlalchemy import create_engine, text
 
 
@@ -17,6 +20,11 @@ class DataSourceError(RuntimeError):
     """Raised when a monitoring source cannot be loaded."""
 
 
+logger = logging.getLogger(__name__)
+MAX_SOURCE_ROWS = 100_000
+MAX_SOURCE_COLUMNS = 1_000
+MAX_SOURCE_BYTES = 50 * 1024 * 1024
+SQL_READ_CHUNK_SIZE = 5_000
 _LOCAL_FILE_EXTENSIONS = {"csv", "xls", "xlsx", "json", "parquet", "tsv", "txt"}
 _EXTENSION_ALIASES = {"excel": {"xls", "xlsx"}}
 
@@ -89,22 +97,80 @@ def _validate_local_file_path(
     return resolved, extension
 
 
-def _read_file_bytes(content: bytes, file_type: str, source_name: str, sheet_name: str | int | None = None) -> pd.DataFrame:
+def _validate_frame_dimensions(
+    frame: pd.DataFrame,
+    max_rows: int | None = None,
+    max_columns: int | None = None,
+) -> pd.DataFrame:
+    if max_columns is not None and len(frame.columns) > max_columns:
+        raise DataSourceError(f"Dataset must not exceed {max_columns:,} columns")
+    if max_rows is not None and len(frame.index) > max_rows:
+        raise DataSourceError(f"Dataset must not exceed {max_rows:,} rows")
+    return frame
+
+
+def _is_credential_name(name: Any) -> bool:
+    normalized = "".join(
+        character for character in str(name).lower() if character.isalnum()
+    )
+    return any(
+        marker in normalized
+        for marker in (
+            "apikey",
+            "accesskey",
+            "accesstoken",
+            "authorization",
+            "credential",
+            "password",
+            "privatekey",
+            "secret",
+            "token",
+        )
+    )
+
+
+def _read_file_bytes(
+    content: bytes,
+    file_type: str,
+    source_name: str,
+    sheet_name: str | int | None = None,
+    max_rows: int | None = None,
+    max_columns: int | None = None,
+) -> pd.DataFrame:
     extension = file_type.lower().lstrip(".") or Path(source_name).suffix.lower().lstrip(".")
     stream = io.BytesIO(content)
     try:
         if extension == "csv":
-            return pd.read_csv(stream)
+            frame = pd.read_csv(stream, nrows=max_rows + 1 if max_rows is not None else None)
+            return _validate_frame_dimensions(frame, max_rows, max_columns)
         if extension in {"xls", "xlsx"}:
-            return pd.read_excel(stream, sheet_name=sheet_name or 0)
+            frame = pd.read_excel(
+                stream,
+                sheet_name=sheet_name or 0,
+                nrows=max_rows + 1 if max_rows is not None else None,
+            )
+            return _validate_frame_dimensions(frame, max_rows, max_columns)
         if extension == "json":
-            return pd.read_json(stream)
+            frame = pd.read_json(stream)
+            return _validate_frame_dimensions(frame, max_rows, max_columns)
         if extension == "parquet":
-            return pd.read_parquet(stream)
+            frame = pd.read_parquet(stream)
+            return _validate_frame_dimensions(frame, max_rows, max_columns)
         if extension == "tsv":
-            return pd.read_csv(stream, sep="\t")
+            frame = pd.read_csv(
+                stream,
+                sep="\t",
+                nrows=max_rows + 1 if max_rows is not None else None,
+            )
+            return _validate_frame_dimensions(frame, max_rows, max_columns)
         if extension == "txt":
-            return pd.read_csv(stream, sep=None, engine="python")
+            frame = pd.read_csv(
+                stream,
+                sep=None,
+                engine="python",
+                nrows=max_rows + 1 if max_rows is not None else None,
+            )
+            return _validate_frame_dimensions(frame, max_rows, max_columns)
         raise DataSourceError(f"Unsupported file type: {extension or 'unknown'}")
     except DataSourceError:
         raise
@@ -138,26 +204,47 @@ def load_uploaded_file(
             )
             if max_columns is not None and len(header.columns) > max_columns:
                 raise DataSourceError(f"Dataset must not exceed {max_columns:,} columns")
-            return pd.read_csv(
+            frame = pd.read_csv(
                 io.BytesIO(content),
                 sep=separator,
                 engine="python" if separator is None else "c",
-                nrows=max_rows,
+                nrows=max_rows + 1 if max_rows is not None else None,
             )
+            return _validate_frame_dimensions(frame, max_rows, max_columns)
 
-        frame = _read_file_bytes(content, extension, source_name)
-        if max_columns is not None and len(frame.columns) > max_columns:
-            raise DataSourceError(f"Dataset must not exceed {max_columns:,} columns")
-        return frame.head(max_rows) if max_rows is not None else frame
+        return _read_file_bytes(
+            content,
+            extension,
+            source_name,
+            max_rows=max_rows,
+            max_columns=max_columns,
+        )
     except DataSourceError:
         raise
     except Exception as error:
         raise DataSourceError(f"Could not read {source_name}: {error}") from error
 
 
-def load_local_file(path: str, file_type: str = "", sheet_name: str | int | None = None) -> pd.DataFrame:
+def load_local_file(
+    path: str,
+    file_type: str = "",
+    sheet_name: str | int | None = None,
+    max_rows: int | None = None,
+    max_columns: int | None = None,
+) -> pd.DataFrame:
     file_path, extension = _validate_local_file_path(path, file_type)
-    return _read_file_bytes(file_path.read_bytes(), extension, file_path.name, sheet_name)
+    try:
+        if file_path.stat().st_size > MAX_SOURCE_BYTES:
+            raise DataSourceError(
+                f"Local source file must not exceed {MAX_SOURCE_BYTES // (1024 * 1024)} MiB"
+            )
+        content = file_path.read_bytes()
+    except DataSourceError:
+        raise
+    except OSError as error:
+        logger.error("Local source file could not be read (%s)", type(error).__name__)
+        raise DataSourceError("Local source file could not be read") from error
+    return _read_file_bytes(content, extension, file_path.name, sheet_name, max_rows, max_columns)
 
 
 def _strip_sql_leading_comments(query: str) -> str:
@@ -242,7 +329,42 @@ def _find_sql_statement_terminator(query: str) -> int | None:
     return None
 
 
-def load_sql_query(database_url: str, query: str, params: dict[str, Any] | None = None) -> pd.DataFrame:
+def _read_sql_bounded(
+    connection: Any,
+    query: str,
+    params: dict[str, Any] | None,
+    max_rows: int | None,
+    max_columns: int | None,
+) -> pd.DataFrame:
+    chunks = pd.read_sql_query(
+        text(query),
+        connection,
+        params=params,
+        chunksize=SQL_READ_CHUNK_SIZE,
+    )
+    frames = []
+    row_count = 0
+    columns: list[Any] = []
+    for chunk in chunks:
+        if not columns:
+            columns = list(chunk.columns)
+        _validate_frame_dimensions(chunk, max_columns=max_columns)
+        row_count += len(chunk.index)
+        if max_rows is not None and row_count > max_rows:
+            raise DataSourceError(f"Dataset must not exceed {max_rows:,} rows")
+        frames.append(chunk)
+    if not frames:
+        return pd.DataFrame(columns=columns)
+    return pd.concat(frames, ignore_index=True)
+
+
+def load_sql_query(
+    database_url: str,
+    query: str,
+    params: dict[str, Any] | None = None,
+    max_rows: int | None = MAX_SOURCE_ROWS,
+    max_columns: int | None = MAX_SOURCE_COLUMNS,
+) -> pd.DataFrame:
     if not database_url.strip():
         raise DataSourceError("database_url is required")
 
@@ -262,31 +384,62 @@ def load_sql_query(database_url: str, query: str, params: dict[str, Any] | None 
         if not normalized_query:
             raise DataSourceError("Only SELECT queries are allowed")
 
-    engine = create_engine(database_url, pool_pre_ping=True)
+    engine = None
     try:
+        engine = create_engine(database_url, pool_pre_ping=True)
         with engine.connect() as connection:
-            return pd.read_sql_query(text(query), connection, params=params)
+            return _read_sql_bounded(
+                connection,
+                query,
+                params,
+                max_rows,
+                max_columns,
+            )
     except Exception as error:
-        raise DataSourceError(f"Database query failed: {error}") from error
+        if isinstance(error, DataSourceError):
+            raise
+        logger.error("SQL source query failed (%s)", type(error).__name__)
+        raise DataSourceError("Database query failed; check the source configuration and query") from error
     finally:
-        engine.dispose()
+        if engine is not None:
+            engine.dispose()
 
 
-def load_mongodb(uri: str, database: str, collection: str, query: dict[str, Any] | None = None, limit: int = 10000) -> pd.DataFrame:
+def load_mongodb(
+    uri: str,
+    database: str,
+    collection: str,
+    query: dict[str, Any] | None = None,
+    limit: int = 10000,
+    max_rows: int | None = MAX_SOURCE_ROWS,
+    max_columns: int | None = MAX_SOURCE_COLUMNS,
+) -> pd.DataFrame:
     try:
         from pymongo import MongoClient
     except ImportError as error:
         raise DataSourceError("MongoDB support requires pymongo") from error
     if not uri or not database or not collection:
         raise DataSourceError("uri, database, and collection are required for MongoDB")
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+        raise DataSourceError("MongoDB limit must be a positive integer")
+    bounded_limit = min(limit, max_rows + 1) if max_rows is not None else limit
     client = MongoClient(uri, serverSelectionTimeoutMS=5000)
     try:
-        documents = list(client[database][collection].find(query or {}, limit=max(1, min(limit, 100000))))
+        documents = list(
+            client[database][collection].find(query or {}, limit=bounded_limit)
+        )
         for document in documents:
             document.pop("_id", None)
-        return pd.DataFrame(documents)
+        return _validate_frame_dimensions(
+            pd.DataFrame(documents),
+            max_rows,
+            max_columns,
+        )
     except Exception as error:
-        raise DataSourceError(f"MongoDB query failed: {error}") from error
+        if isinstance(error, DataSourceError):
+            raise
+        logger.error("MongoDB source query failed (%s)", type(error).__name__)
+        raise DataSourceError("MongoDB query failed; check the source configuration") from error
     finally:
         client.close()
 
@@ -298,11 +451,21 @@ def load_s3(bucket: str, key: str, file_type: str = "", sheet_name: str | int | 
         raise DataSourceError("Amazon S3 support requires boto3") from error
     try:
         response = boto3.client("s3").get_object(Bucket=bucket, Key=key)
-        return _read_file_bytes(response["Body"].read(), file_type, key, sheet_name)
+        body = response["Body"]
+        try:
+            content = body.read(MAX_SOURCE_BYTES + 1)
+        finally:
+            body.close()
+        if len(content) > MAX_SOURCE_BYTES:
+            raise DataSourceError(
+                f"S3 object must not exceed {MAX_SOURCE_BYTES // (1024 * 1024)} MiB"
+            )
+        return _read_file_bytes(content, file_type, key, sheet_name)
     except DataSourceError:
         raise
     except Exception as error:
-        raise DataSourceError(f"S3 object could not be loaded: {error}") from error
+        logger.error("S3 source object could not be loaded (%s)", type(error).__name__)
+        raise DataSourceError("S3 object could not be loaded; check the source configuration") from error
 
 
 def load_dropbox(path: str, file_type: str = "", sheet_name: str | int | None = None) -> pd.DataFrame:
@@ -314,18 +477,30 @@ def load_dropbox(path: str, file_type: str = "", sheet_name: str | int | None = 
     if not token:
         raise DataSourceError("DROPBOX_ACCESS_TOKEN is required")
     try:
-        _, response = dropbox.Dropbox(token).files_download(path)
+        client = dropbox.Dropbox(token)
+        metadata = client.files_get_metadata(path)
+        if getattr(metadata, "size", 0) > MAX_SOURCE_BYTES:
+            raise DataSourceError(
+                f"Dropbox file must not exceed {MAX_SOURCE_BYTES // (1024 * 1024)} MiB"
+            )
+        _, response = client.files_download(path)
+        if len(response.content) > MAX_SOURCE_BYTES:
+            raise DataSourceError(
+                f"Dropbox file must not exceed {MAX_SOURCE_BYTES // (1024 * 1024)} MiB"
+            )
         return _read_file_bytes(response.content, file_type, path, sheet_name)
     except DataSourceError:
         raise
     except Exception as error:
-        raise DataSourceError(f"Dropbox file could not be loaded: {error}") from error
+        logger.error("Dropbox source file could not be loaded (%s)", type(error).__name__)
+        raise DataSourceError("Dropbox file could not be loaded; check the source configuration") from error
 
 
 def load_google_drive(file_id: str, file_type: str = "", sheet_name: str | int | None = None) -> pd.DataFrame:
     try:
         from google.oauth2.service_account import Credentials
         from googleapiclient.discovery import build
+        from googleapiclient.http import MediaIoBaseDownload
     except ImportError as error:
         raise DataSourceError("Google Drive support requires google-api-python-client and google-auth") from error
     credentials_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
@@ -336,16 +511,168 @@ def load_google_drive(file_id: str, file_type: str = "", sheet_name: str | int |
             credentials_path,
             scopes=["https://www.googleapis.com/auth/drive.readonly"],
         )
-        metadata = build("drive", "v3", credentials=credentials).files().get(fileId=file_id, fields="name,mimeType").execute()
-        response = build("drive", "v3", credentials=credentials).files().get_media(fileId=file_id).execute()
+        drive = build("drive", "v3", credentials=credentials)
+        metadata = drive.files().get(fileId=file_id, fields="name,mimeType,size").execute()
+        if int(metadata.get("size", 0)) > MAX_SOURCE_BYTES:
+            raise DataSourceError(
+                f"Google Drive file must not exceed {MAX_SOURCE_BYTES // (1024 * 1024)} MiB"
+            )
+        output = io.BytesIO()
+        downloader = MediaIoBaseDownload(
+            output,
+            drive.files().get_media(fileId=file_id),
+            chunksize=256 * 1024,
+        )
+        complete = False
+        while not complete:
+            _, complete = downloader.next_chunk()
+            if output.tell() > MAX_SOURCE_BYTES:
+                raise DataSourceError(
+                    f"Google Drive file must not exceed {MAX_SOURCE_BYTES // (1024 * 1024)} MiB"
+                )
+        response = output.getvalue()
         return _read_file_bytes(response, file_type, metadata.get("name", file_id), sheet_name)
     except DataSourceError:
         raise
     except Exception as error:
-        raise DataSourceError(f"Google Drive file could not be loaded: {error}") from error
+        logger.error("Google Drive source could not be loaded (%s)", type(error).__name__)
+        raise DataSourceError("Google Drive file could not be loaded; check the source configuration") from error
 
 
-def load_source(source: dict[str, Any]) -> pd.DataFrame:
+def _environment_value(source: dict[str, Any], setting: str) -> str:
+    environment_name = source.get(setting)
+    if (
+        not isinstance(environment_name, str)
+        or not environment_name
+        or not environment_name.isidentifier()
+    ):
+        raise DataSourceError(f"{setting} must name a server environment variable")
+    value = os.getenv(environment_name)
+    if not value:
+        raise DataSourceError(f"The server environment variable {environment_name} is not configured")
+    return value
+
+
+def load_http_json(
+    url: str,
+    token_env: str | None = None,
+    records_path: str | None = None,
+    params: dict[str, Any] | None = None,
+    max_rows: int | None = MAX_SOURCE_ROWS,
+    max_columns: int | None = MAX_SOURCE_COLUMNS,
+) -> pd.DataFrame:
+    """Load tabular records from an allowlisted HTTPS JSON API."""
+    if records_path is not None and (
+        not isinstance(records_path, str)
+        or not records_path
+        or any(not part for part in records_path.split("."))
+    ):
+        raise DataSourceError("records_path must be a non-empty dotted path")
+    if params is not None and not isinstance(params, dict):
+        raise DataSourceError("HTTP API params must be an object")
+    if params and any(_is_credential_name(key) for key in params):
+        raise DataSourceError(
+            "Do not put credentials in HTTP query parameters; use token_env"
+        )
+    parsed_url = urlsplit(url)
+    if (
+        parsed_url.scheme.lower() != "https"
+        or not parsed_url.hostname
+        or parsed_url.username is not None
+        or parsed_url.password is not None
+    ):
+        raise DataSourceError("HTTP JSON sources require an HTTPS URL without embedded credentials")
+    if any(
+        _is_credential_name(key)
+        for key, _ in parse_qsl(parsed_url.query, keep_blank_values=True)
+    ):
+        raise DataSourceError(
+            "Do not put credentials in HTTP query parameters; use token_env"
+        )
+
+    configured_hosts = {
+        item.strip().lower()
+        for item in os.getenv("DATA_SOURCE_HTTP_ALLOWED_HOSTS", "").split(",")
+        if item.strip()
+    }
+    host_with_port = parsed_url.netloc.lower()
+    if not configured_hosts:
+        raise DataSourceError("DATA_SOURCE_HTTP_ALLOWED_HOSTS is not configured")
+    try:
+        port = parsed_url.port
+    except ValueError as error:
+        raise DataSourceError("HTTP API URL contains an invalid port") from error
+    hostname = parsed_url.hostname.lower()
+    allowed_by_hostname = hostname in configured_hosts
+    if port not in (None, 443) and host_with_port not in configured_hosts:
+        allowed_by_hostname = False
+    if host_with_port not in configured_hosts and not allowed_by_hostname:
+        raise DataSourceError("HTTP API host is not listed in DATA_SOURCE_HTTP_ALLOWED_HOSTS")
+
+    headers = {"Accept": "application/json"}
+    if token_env:
+        headers["Authorization"] = (
+            f"Bearer {_environment_value({'token_env': token_env}, 'token_env')}"
+        )
+
+    response = None
+    try:
+        response = requests.get(
+            url,
+            params=params,
+            headers=headers,
+            timeout=(5, 30),
+            allow_redirects=False,
+            stream=True,
+        )
+        if response.is_redirect:
+            raise DataSourceError("HTTP API redirects are not supported")
+        response.raise_for_status()
+        content = bytearray()
+        for chunk in response.iter_content(chunk_size=64 * 1024):
+            content.extend(chunk)
+            if len(content) > MAX_SOURCE_BYTES:
+                raise DataSourceError(
+                    f"HTTP API response must not exceed {MAX_SOURCE_BYTES // (1024 * 1024)} MiB"
+                )
+        payload = json.loads(content)
+    except DataSourceError:
+        raise
+    except requests.RequestException as error:
+        logger.error("HTTP JSON source request failed (%s)", type(error).__name__)
+        status_code = getattr(response, "status_code", None)
+        if status_code is not None:
+            raise DataSourceError(f"HTTP API request failed with status {status_code}") from error
+        raise DataSourceError("HTTP API request failed; check the endpoint and connectivity") from error
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as error:
+        logger.error("HTTP JSON source returned invalid JSON (%s)", type(error).__name__)
+        raise DataSourceError("HTTP API response was not valid JSON") from error
+    finally:
+        if response is not None:
+            response.close()
+
+    records: Any = payload
+    if records_path:
+        for key in records_path.split("."):
+            if not isinstance(records, dict) or key not in records:
+                raise DataSourceError("records_path does not exist in the HTTP API response")
+            records = records[key]
+    elif isinstance(records, dict):
+        records = records.get("data", records.get("results"))
+    if not isinstance(records, list) or any(not isinstance(item, dict) for item in records):
+        raise DataSourceError("HTTP API response must contain a list of record objects")
+    return _validate_frame_dimensions(
+        pd.DataFrame(records),
+        max_rows,
+        max_columns,
+    )
+
+
+def load_source(
+    source: dict[str, Any],
+    max_rows: int | None = MAX_SOURCE_ROWS,
+    max_columns: int | None = MAX_SOURCE_COLUMNS,
+) -> pd.DataFrame:
     source_type = str(source.get("type", "")).lower().strip()
     file_type = str(source.get("file_type", ""))
     sheet_name = source.get("sheet_name")
@@ -368,18 +695,66 @@ def load_source(source: dict[str, Any]) -> pd.DataFrame:
                 raise DataSourceError(
                     "Declared file type does not match the source type"
                 )
-        return load_local_file(str(path), file_type or normalized_type, sheet_name)
+        frame = load_local_file(
+            str(path),
+            file_type or normalized_type,
+            sheet_name,
+            max_rows,
+            max_columns,
+        )
+        return _validate_frame_dimensions(frame, max_rows, max_columns)
     if source_type in {"postgresql", "mysql", "sql"}:
-        return load_sql_query(str(source.get("url", "")), str(source.get("query", "")), source.get("params"))
+        if "url" in source and "url_env" in source:
+            raise DataSourceError("Specify either url or url_env for SQL sources, not both")
+        database_url = (
+            _environment_value(source, "url_env")
+            if "url_env" in source
+            else str(source.get("url", ""))
+        )
+        return load_sql_query(
+            database_url,
+            str(source.get("query", "")),
+            source.get("params"),
+            max_rows,
+            max_columns,
+        )
     if source_type == "mongodb":
-        return load_mongodb(str(source.get("uri", "")), str(source.get("database", "")), str(source.get("collection", "")), source.get("query"), int(source.get("limit", 10000)))
+        if "uri" in source and "uri_env" in source:
+            raise DataSourceError("Specify either uri or uri_env for MongoDB sources, not both")
+        uri = (
+            _environment_value(source, "uri_env")
+            if "uri_env" in source
+            else str(source.get("uri", ""))
+        )
+        return load_mongodb(
+            uri,
+            str(source.get("database", "")),
+            str(source.get("collection", "")),
+            source.get("query"),
+            int(source.get("limit", 10000)),
+            max_rows,
+            max_columns,
+        )
     if source_type == "s3":
-        return load_s3(str(source.get("bucket", "")), str(source.get("key", "")), file_type, sheet_name)
-    if source_type == "dropbox":
-        return load_dropbox(str(source.get("path", "")), file_type, sheet_name)
-    if source_type in {"google_drive", "gdrive"}:
-        return load_google_drive(str(source.get("file_id", "")), file_type, sheet_name)
-    raise DataSourceError(f"Unsupported source type: {source_type or 'unknown'}")
+        frame = load_s3(str(source.get("bucket", "")), str(source.get("key", "")), file_type, sheet_name)
+    elif source_type == "dropbox":
+        frame = load_dropbox(str(source.get("path", "")), file_type, sheet_name)
+    elif source_type in {"google_drive", "gdrive"}:
+        frame = load_google_drive(str(source.get("file_id", "")), file_type, sheet_name)
+    elif source_type in {"http_json", "rest_json"}:
+        if "url" not in source:
+            raise DataSourceError("url is required for HTTP JSON sources")
+        frame = load_http_json(
+            str(source["url"]),
+            source.get("token_env"),
+            source.get("records_path"),
+            source.get("params"),
+            max_rows,
+            max_columns,
+        )
+    else:
+        raise DataSourceError(f"Unsupported source type: {source_type or 'unknown'}")
+    return _validate_frame_dimensions(frame, max_rows, max_columns)
 
 
 def source_capabilities() -> dict[str, Any]:
@@ -424,6 +799,14 @@ def source_capabilities() -> dict[str, Any]:
             "required_fields": ["file_id"],
             "credential_env": ["GOOGLE_APPLICATION_CREDENTIALS"],
         },
+        {
+            "type": "http_json",
+            "aliases": ["rest_json"],
+            "dependencies": {"requests": "requests"},
+            "required_fields": ["url"],
+            "credential_env": ["DATA_SOURCE_HTTP_ALLOWED_HOSTS"],
+            "credential_setup": "Allowlist API hostnames in DATA_SOURCE_HTTP_ALLOWED_HOSTS; use token_env for optional bearer credentials.",
+        },
     ]
 
     for provider in providers:
@@ -453,7 +836,23 @@ def source_capabilities() -> dict[str, Any]:
 
 def summarize_source(source: dict[str, Any], df: pd.DataFrame) -> dict[str, Any]:
     return {
-        "source": {key: value for key, value in source.items() if key not in {"url", "uri"}},
+        "source": {
+            key: value
+            for key, value in source.items()
+            if key.lower()
+            not in {
+                "url",
+                "uri",
+                "query",
+                "params",
+                "headers",
+                "authorization",
+                "password",
+                "secret",
+                "token",
+                "credentials",
+            }
+        },
         "rows": int(df.shape[0]),
         "columns": int(df.shape[1]),
         "column_names": list(df.columns),

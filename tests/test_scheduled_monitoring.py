@@ -76,6 +76,195 @@ def test_schedule_runs_recurring_freshness_check_and_alerts(monkeypatch):
     assert run_due_schedules() == 0
 
 
+def test_source_schedule_creates_versions_and_monitors_each_refresh(tmp_path, monkeypatch):
+    monkeypatch.setenv("DATASET_ALLOWED_DIRS", str(tmp_path))
+    source_path = tmp_path / "events.csv"
+    source_path.write_text("value\n1\n2\n", encoding="utf-8")
+    response = client.post(
+        "/api/schedules",
+        json={
+            "source": {"type": "csv", "path": str(source_path)},
+            "interval_seconds": 60,
+            "checks": ["quality"],
+        },
+    )
+
+    assert response.status_code == 201, response.text
+    schedule = response.json()
+    root_dataset_id = schedule["dataset_id"]
+    source_path.write_text("value\n10\n20\n", encoding="utf-8")
+    connection = open_database()
+    try:
+        connection.execute(
+            "UPDATE monitoring_schedules SET next_run_at = ? WHERE id = ?",
+            (time.time() - 1, schedule["id"]),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    assert run_due_schedules() == 1
+    updated_schedule = next(
+        item for item in client.get("/api/schedules").json()["schedules"]
+        if item["id"] == schedule["id"]
+    )
+    latest_dataset_id = updated_schedule["schedule"]["latest_dataset_id"]
+    versions = client.get(
+        f"/api/datasets/{root_dataset_id}/versions"
+    ).json()["versions"]
+    latest_dataset = client.get(f"/api/datasets/{latest_dataset_id}").json()
+    results = client.get(
+        "/api/monitoring/results",
+        params={"dataset_id": latest_dataset_id},
+    ).json()["results"]
+
+    assert len(versions) == 2
+    assert versions[1]["parent_dataset_id"] == root_dataset_id
+    assert latest_dataset["data"] == [{"value": 10}, {"value": 20}]
+    assert latest_dataset["version_number"] == 2
+    assert any(
+        item["result"]["schedule_id"] == schedule["id"]
+        for item in results
+    )
+
+
+def test_failed_source_poll_creates_no_version_and_retries(tmp_path, monkeypatch):
+    monkeypatch.setenv("DATASET_ALLOWED_DIRS", str(tmp_path))
+    source_path = tmp_path / "events.csv"
+    source_path.write_text("value\n1\n", encoding="utf-8")
+    created = client.post(
+        "/api/schedules",
+        json={
+            "source": {"type": "csv", "path": str(source_path)},
+            "interval_seconds": 60,
+        },
+    )
+    assert created.status_code == 201, created.text
+    schedule = created.json()
+    source_path.unlink()
+
+    connection = open_database()
+    try:
+        connection.execute(
+            "UPDATE monitoring_schedules SET next_run_at = ? WHERE id = ?",
+            (time.time() - 1, schedule["id"]),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    assert run_due_schedules() == 1
+    failed = next(
+        item for item in client.get("/api/schedules").json()["schedules"]
+        if item["id"] == schedule["id"]
+    )
+    versions = client.get(
+        f"/api/datasets/{schedule['dataset_id']}/versions"
+    ).json()["versions"]
+    assert failed["last_status"] == "failed"
+    assert failed["retry_count"] == 1
+    assert "source refresh failed" in failed["last_error"]
+    assert len(versions) == 1
+
+    source_path.write_text("value\n2\n", encoding="utf-8")
+    connection = open_database()
+    try:
+        connection.execute(
+            "UPDATE monitoring_schedules SET next_run_at = ? WHERE id = ?",
+            (time.time() - 1, schedule["id"]),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    assert run_due_schedules() == 1
+    recovered = next(
+        item for item in client.get("/api/schedules").json()["schedules"]
+        if item["id"] == schedule["id"]
+    )
+    versions = client.get(
+        f"/api/datasets/{schedule['dataset_id']}/versions"
+    ).json()["versions"]
+    assert recovered["last_status"] == "succeeded"
+    assert recovered["retry_count"] == 0
+    assert len(versions) == 2
+
+
+def test_scheduled_http_source_uses_environment_credentials_without_persisting_them(monkeypatch):
+    import json
+
+    calls = []
+
+    class FakeResponse:
+        status_code = 200
+        is_redirect = False
+
+        def raise_for_status(self):
+            return None
+
+        def iter_content(self, chunk_size):
+            yield json.dumps({"data": [{"value": 1}]}).encode()
+
+        def close(self):
+            return None
+
+    def fake_get(url, **kwargs):
+        calls.append(kwargs["headers"].get("Authorization"))
+        return FakeResponse()
+
+    secret = "test-scheduled-api-secret"
+    monkeypatch.setenv("DATA_SOURCE_HTTP_ALLOWED_HOSTS", "api.example.test")
+    monkeypatch.setenv("SCHEDULED_API_TOKEN", secret)
+    monkeypatch.setattr("data_sources.requests.get", fake_get)
+
+    response = client.post(
+        "/api/schedules",
+        json={
+            "source": {
+                "type": "http_json",
+                "url": "https://api.example.test/events",
+                "token_env": "SCHEDULED_API_TOKEN",
+            },
+            "interval_seconds": 60,
+        },
+    )
+
+    assert response.status_code == 201, response.text
+    assert response.json()["schedule"]["source"]["token_env"] == "SCHEDULED_API_TOKEN"
+    assert secret not in response.text
+    assert calls == [f"Bearer {secret}"]
+    schedule_id = response.json()["id"]
+    connection = open_database()
+    try:
+        connection.execute(
+            "UPDATE monitoring_schedules SET next_run_at = ? WHERE id = ?",
+            (time.time() - 1, schedule_id),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    assert run_due_schedules() == 1
+    assert calls == [f"Bearer {secret}", f"Bearer {secret}"]
+
+
+def test_source_schedule_rejects_inline_credentials(tmp_path, monkeypatch):
+    response = client.post(
+        "/api/schedules",
+        json={
+            "source": {
+                "type": "http_json",
+                "url": "https://api.example.test/events?api_key=private",
+                "token": "private",
+            },
+            "interval_seconds": 60,
+        },
+    )
+
+    assert response.status_code == 400
+    assert "credentials" in response.json()["detail"]
+
+
 def test_schedule_validation_and_owner_scoping():
     dataset_response = client.post(
         "/api/datasets",
