@@ -30,6 +30,7 @@ from profiler import (
     answer_monitoring_question,
     calculate_data_quality_score,
     check_data_quality,
+    compare_models,
     detect_fraud_patterns,
     forecast_data_health,
     forecast_metric,
@@ -57,34 +58,39 @@ from data_sources import (
     summarize_source,
 )
 from monitoring_store import (
+    clear_login_failures,
+    create_dataset_version,
+    create_monitoring_report,
+    create_monitoring_schedule,
     delete_configuration,
     delete_dataset,
-    create_dataset_version,
-    get_dataset_lineage,
+    delete_monitoring_schedule,
     get_audit_records,
     get_configurations,
     get_dataset,
+    get_dataset_lineage,
+    get_monitoring_report_file,
     get_monitoring_result,
+    get_monitoring_schedule,
+    get_user_preferences,
     list_datasets,
     list_dataset_versions,
+    list_monitoring_reports,
     list_monitoring_results,
+    list_monitoring_schedules,
+    list_users,
+    login_retry_after,
+    open_database,
     persist_monitoring_run,
     record_lineage_event,
+    record_login_failure,
     save_dataset,
     set_configuration,
     set_configurations,
-    create_monitoring_schedule,
-    create_monitoring_report,
-    delete_monitoring_schedule,
-    get_monitoring_report_file,
-    get_monitoring_schedule,
-    get_user_preferences,
-    list_monitoring_schedules,
-    list_monitoring_reports,
-    open_database,
     set_monitoring_schedule_enabled,
-    update_monitoring_schedule_interval,
     set_user_preferences,
+    update_monitoring_schedule_interval,
+    update_user,
 )
 from tools.data_tools import load_dataset
 from auth_security import (
@@ -98,13 +104,6 @@ from auth_security import (
     issue_token,
     login_attempt_key,
     RequestBodyLimitMiddleware,
-)
-from monitoring_store import (
-    clear_login_failures,
-    list_users,
-    login_retry_after,
-    record_login_failure,
-    update_user,
 )
 from scheduled_monitoring import scheduler_loop
 from reporting import REPORT_FORMATS, generate_monitoring_reports
@@ -1099,6 +1098,88 @@ def get_user_preferences_endpoint():
     return {"preferences": get_user_preferences(current_user_id())}
 
 
+def _validate_dashboard_widgets(widgets: Any) -> list[str] | list[dict[str, str]]:
+    supported_metrics = {
+        "quality_score",
+        "drift_score",
+        "anomalies",
+        "historical_runs",
+        "datasets",
+        "active_schedules",
+        "missing_values",
+        "duplicate_rows",
+    }
+    trend_metrics = {
+        "quality_score",
+        "drift_score",
+        "anomalies",
+        "missing_values",
+        "duplicate_rows",
+    }
+    if not isinstance(widgets, list) or not widgets or len(widgets) > 24:
+        _bad_request("widgets must contain between 1 and 24 dashboard widgets")
+
+    if all(isinstance(item, str) for item in widgets):
+        if not all(item in supported_metrics for item in widgets):
+            _bad_request("widgets contains an unsupported dashboard metric")
+        return list(dict.fromkeys(widgets))
+
+    if not all(isinstance(item, dict) for item in widgets):
+        _bad_request("widgets must be a list of metric names or widget objects")
+
+    validated: list[dict[str, str]] = []
+    widget_ids: set[str] = set()
+    for item in widgets:
+        widget_id = item.get("id")
+        kind = item.get("kind")
+        metric = item.get("metric")
+        title = item.get("title")
+        expected_fields = {"id", "kind", "metric", "title"}
+        if kind == "chart":
+            expected_fields.add("chart_type")
+        if (
+            not isinstance(widget_id, str)
+            or not widget_id
+            or len(widget_id) > 64
+            or not widget_id[0].isascii()
+            or not widget_id[0].isalnum()
+            or not all(character.isascii() and (character.isalnum() or character in "-_") for character in widget_id)
+            or widget_id in widget_ids
+        ):
+            _bad_request("widget ids must be unique, short alphanumeric identifiers")
+        if (
+            set(item) != expected_fields
+            or not isinstance(kind, str)
+            or kind not in {"metric", "chart"}
+            or not isinstance(metric, str)
+            or metric not in supported_metrics
+            or not isinstance(title, str)
+            or not title.strip()
+            or len(title) > 80
+        ):
+            _bad_request("each widget needs a valid id, type, metric, and title")
+        widget = {
+            "id": widget_id,
+            "kind": kind,
+            "metric": metric,
+            "title": title.strip(),
+        }
+        if kind == "chart":
+            chart_type = item.get("chart_type")
+            if (
+                metric not in trend_metrics
+                or not isinstance(chart_type, str)
+                or chart_type not in {"line", "bar"}
+            ):
+                _bad_request(
+                    "chart widgets require a trend metric and a line or bar chart type"
+                )
+            widget["chart_type"] = chart_type
+        widget_ids.add(widget_id)
+        validated.append(widget)
+    return validated
+
+
 @app.post("/api/preferences")
 def set_user_preferences_endpoint(payload: dict[str, Any]):
     preferences = payload.get("preferences", payload)
@@ -1108,11 +1189,13 @@ def set_user_preferences_endpoint(payload: dict[str, Any]):
     if set(preferences) - allowed_fields:
         _bad_request(f"Supported preference fields are: {', '.join(sorted(allowed_fields))}")
     merged = {**get_user_preferences(current_user_id()), **preferences}
-    if merged.get("language", "en") not in {"en", "es", "fr", "hi"}:
+    language = merged.get("language", "en")
+    if not isinstance(language, str) or language not in {"en", "es", "fr", "hi"}:
         _bad_request("language must be one of: en, es, fr, hi")
-    if merged.get("theme", "system") not in {"system", "light", "dark", "high_contrast"}:
+    theme = merged.get("theme", "system")
+    if not isinstance(theme, str) or theme not in {"system", "light", "dark", "high_contrast"}:
         _bad_request("theme must be system, light, dark, or high_contrast")
-    widgets = merged.get(
+    merged["widgets"] = _validate_dashboard_widgets(merged.get(
         "widgets",
         [
             "quality_score",
@@ -1124,25 +1207,7 @@ def set_user_preferences_endpoint(payload: dict[str, Any]):
             "missing_values",
             "duplicate_rows",
         ],
-    )
-    supported_widgets = {
-        "quality_score",
-        "drift_score",
-        "anomalies",
-        "historical_runs",
-        "datasets",
-        "active_schedules",
-        "missing_values",
-        "duplicate_rows",
-    }
-    if (
-        not isinstance(widgets, list)
-        or not widgets
-        or len(widgets) > len(supported_widgets)
-        or not all(isinstance(item, str) and item in supported_widgets for item in widgets)
-    ):
-        _bad_request("widgets must select one or more supported dashboard widgets")
-    merged["widgets"] = list(dict.fromkeys(widgets))
+    ))
     try:
         set_user_preferences(current_user_id(), merged)
     except ValueError as error:
@@ -1535,7 +1600,11 @@ def analyze_drift_endpoint(payload: dict[str, Any]):
     if baseline_df.empty or current_df.empty:
         _bad_request("Baseline and current datasets must not be empty.")
 
-    report = analyze_dataset_drift(baseline_df, current_df)
+    try:
+        report = analyze_dataset_drift(baseline_df, current_df)
+    except (TypeError, ValueError) as error:
+        _bad_request(str(error))
+
     notification_result = None
     if _should_send_notifications(payload):
         drift_score = report.get("overall_drift_score", 0)
@@ -1686,7 +1755,7 @@ def forecast_endpoint(payload: dict[str, Any]):
             report = forecast_data_health(df, date_column, periods, frequency)
         else:
             report = forecast_metric(df, date_column, payload.get("value_column"), periods, frequency, method)
-    except (TypeError, ValueError) as error:
+    except (TypeError, ValueError, RuntimeError) as error:
         _bad_request(str(error))
     response = {"report": report}
     response.update(_persist_endpoint_result(payload, df, "forecast", response))
@@ -1699,14 +1768,25 @@ def explain_model_endpoint(payload: dict[str, Any]):
     target_column = payload.get("target_column")
     if dataset is None or not target_column:
         _bad_request("Dataset and target_column are required.")
+    mode = str(payload.get("mode", "explain")).strip().lower()
     try:
         frame = pd.DataFrame(dataset)
-        report = train_and_explain_model(
-            frame,
-            target_column,
-            payload.get("task", "classification"),
-            payload.get("test_size", 0.2),
-        )
+        if mode == "compare":
+            report = compare_models(
+                frame,
+                target_column,
+                task=payload.get("task", "classification"),
+                metric=payload.get("metric"),
+                test_size=payload.get("test_size", 0.2),
+                model_names=payload.get("model_names"),
+            )
+        else:
+            report = train_and_explain_model(
+                frame,
+                target_column,
+                payload.get("task", "classification"),
+                payload.get("test_size", 0.2),
+            )
     except (TypeError, ValueError) as error:
         _bad_request(str(error))
     response = {"report": report}

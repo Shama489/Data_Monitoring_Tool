@@ -140,6 +140,69 @@ def test_dashboard_preferences_health_and_metrics_endpoints():
     assert saved.status_code == 200
     assert client.get("/api/preferences").json()["preferences"] == saved.json()["preferences"]
 
+    custom_widgets = [
+        {
+            "id": "custom-quality",
+            "kind": "chart",
+            "metric": "quality_score",
+            "title": "Quality trend",
+            "chart_type": "line",
+        },
+        {
+            "id": "custom-anomalies",
+            "kind": "metric",
+            "metric": "anomalies",
+            "title": "Open anomalies",
+        },
+    ]
+    custom_layout = client.post(
+        "/api/preferences",
+        json={"preferences": {"widgets": custom_widgets}},
+    )
+    assert custom_layout.status_code == 200
+    assert custom_layout.json()["preferences"]["widgets"] == custom_widgets
+    assert client.get("/api/preferences").json()["preferences"]["widgets"] == custom_widgets
+
+    invalid_layout = client.post(
+        "/api/preferences",
+        json={
+            "preferences": {
+                "widgets": [
+                    {
+                        "id": "bad-widget",
+                        "kind": "chart",
+                        "metric": "datasets",
+                        "title": "Unsupported trend",
+                        "chart_type": "pie",
+                    }
+                ]
+            }
+        },
+    )
+    assert invalid_layout.status_code == 400
+    malformed_chart = client.post(
+        "/api/preferences",
+        json={
+            "preferences": {
+                "widgets": [
+                    {
+                        "id": "bad-widget",
+                        "kind": "chart",
+                        "metric": "quality_score",
+                        "title": "Malformed chart",
+                        "chart_type": [],
+                    }
+                ]
+            }
+        },
+    )
+    assert malformed_chart.status_code == 400
+    invalid_theme = client.post(
+        "/api/preferences",
+        json={"preferences": {"theme": []}},
+    )
+    assert invalid_theme.status_code == 400
+
     assert client.get("/api/health/ready").json() == {
         "status": "ready",
         "database": "ok",

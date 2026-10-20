@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -12,11 +13,95 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 import streamlit.components.v1 as components
+from streamlit_sortables import sort_items
 
 _voice_command_component = components.declare_component(
     "monitoring_voice_commands",
     path=str(Path(__file__).parent / "voice_component"),
 )
+
+_DASHBOARD_WIDGET_LABELS = {
+    "quality_score": "Quality score",
+    "drift_score": "Drift score",
+    "anomalies": "Anomaly count",
+    "historical_runs": "Historical runs",
+    "datasets": "Datasets monitored",
+    "active_schedules": "Active schedules",
+    "missing_values": "Missing-value rate",
+    "duplicate_rows": "Duplicate-row rate",
+}
+_TREND_WIDGET_METRICS = {
+    "quality_score",
+    "drift_score",
+    "anomalies",
+    "missing_values",
+    "duplicate_rows",
+}
+_DEFAULT_DASHBOARD_WIDGETS = [
+    {
+        "id": key,
+        "kind": "metric",
+        "metric": key,
+        "title": title,
+    }
+    for key, title in _DASHBOARD_WIDGET_LABELS.items()
+]
+
+
+def _normalize_dashboard_widgets(widgets: Any) -> list[dict[str, str]]:
+    if not isinstance(widgets, list):
+        return [dict(widget) for widget in _DEFAULT_DASHBOARD_WIDGETS]
+
+    normalized: list[dict[str, str]] = []
+    seen_ids: set[str] = set()
+    for item in widgets:
+        if isinstance(item, str) and item in _DASHBOARD_WIDGET_LABELS:
+            widget = {
+                "id": item,
+                "kind": "metric",
+                "metric": item,
+                "title": _DASHBOARD_WIDGET_LABELS[item],
+            }
+        elif isinstance(item, dict):
+            widget_id = item.get("id")
+            kind = item.get("kind")
+            metric = item.get("metric")
+            title = item.get("title")
+            if (
+                not isinstance(widget_id, str)
+                or not widget_id
+                or not isinstance(kind, str)
+                or kind not in {"metric", "chart"}
+                or not isinstance(metric, str)
+                or metric not in _DASHBOARD_WIDGET_LABELS
+            ):
+                continue
+            if kind == "chart" and (
+                metric not in _TREND_WIDGET_METRICS
+                or not isinstance(item.get("chart_type"), str)
+                or item["chart_type"] not in {"line", "bar"}
+            ):
+                continue
+            widget = {
+                "id": widget_id,
+                "kind": kind,
+                "metric": metric,
+                "title": (
+                    title.strip()[:80]
+                    if isinstance(title, str) and title.strip()
+                    else _DASHBOARD_WIDGET_LABELS[metric]
+                ),
+            }
+            if kind == "chart":
+                widget["chart_type"] = item["chart_type"]
+        else:
+            continue
+
+        if widget["id"] in seen_ids:
+            continue
+        seen_ids.add(widget["id"])
+        normalized.append(widget)
+    return normalized or [dict(widget) for widget in _DEFAULT_DASHBOARD_WIDGETS]
 
 
 def _get(
@@ -253,6 +338,11 @@ def _result_rows(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
         result = item.get("result") or {}
         checks = result.get("results") or {}
         quality = checks.get("quality") or {}
+        if not quality and "quality_score" in result:
+            quality = {
+                "quality_score": result.get("quality_score", {}),
+                "report": result.get("report", {}),
+            }
         comparison_quality = (result.get("quality") or {}).get("current") or {}
         score = (quality.get("quality_score") or {}).get("overall_score")
         if score is None:
@@ -260,7 +350,15 @@ def _result_rows(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
         drift = checks.get("drift") or {}
         if not drift and isinstance(result.get("distribution_drift"), dict):
             drift = result["distribution_drift"]
+        if not drift and isinstance(result.get("report"), dict) and "overall_drift_score" in result["report"]:
+            drift = result["report"]
+        elif not drift and "overall_drift_score" in result:
+            drift = result
         anomaly = checks.get("anomalies") or {}
+        if not anomaly and isinstance(result.get("report"), dict) and "total_anomalies" in result["report"]:
+            anomaly = result["report"]
+        elif not anomaly and "total_anomalies" in result:
+            anomaly = result
         quality_report = quality.get("report") or {}
         row_count = quality_report.get("rows")
         total_cells = (row_count or 0) * (quality_report.get("columns") or 0)
@@ -394,12 +492,56 @@ def _render_overview(
             and not pd.isna(previous.get("duplicate_percentage")) else None,
         ),
     }
-    chosen_widgets = [key for key in (widgets or list(metrics)) if key in metrics]
-    for start in range(0, len(chosen_widgets), 4):
-        row_widgets = chosen_widgets[start:start + 4]
+    widget_specs = _normalize_dashboard_widgets(widgets)
+    widget_index = 0
+    while widget_index < len(widget_specs):
+        widget = widget_specs[widget_index]
+        if widget["kind"] == "chart":
+            metric_key = widget["metric"]
+            if history.empty or metric_key not in history:
+                st.info(f"No monitoring history is available for {widget['title']}.")
+            else:
+                series = history.dropna(subset=[metric_key])
+                if series.empty:
+                    st.info(f"No monitoring history is available for {widget['title']}.")
+                elif widget["chart_type"] == "line":
+                    st.plotly_chart(
+                        px.line(
+                            series,
+                            x="created_at",
+                            y=metric_key,
+                            markers=True,
+                            title=widget["title"],
+                        ),
+                        use_container_width=True,
+                        key=f"dashboard-widget-{widget['id']}",
+                    )
+                else:
+                    st.plotly_chart(
+                        px.bar(
+                            series,
+                            x="created_at",
+                            y=metric_key,
+                            title=widget["title"],
+                        ),
+                        use_container_width=True,
+                        key=f"dashboard-widget-{widget['id']}",
+                    )
+            widget_index += 1
+            continue
+
+        row_widgets = []
+        while (
+            widget_index < len(widget_specs)
+            and widget_specs[widget_index]["kind"] == "metric"
+            and len(row_widgets) < 4
+        ):
+            row_widgets.append(widget_specs[widget_index])
+            widget_index += 1
         columns = st.columns(len(row_widgets))
-        for column, key in zip(columns, row_widgets):
-            column.metric(*metrics[key])
+        for column, metric_widget in zip(columns, row_widgets):
+            label, value, delta = metrics[metric_widget["metric"]]
+            column.metric(metric_widget["title"] or label, value, delta)
 
     if history.empty:
         st.info("No monitoring runs yet. Start a run to populate trend charts and monitoring KPIs.")
@@ -1109,16 +1251,7 @@ def _render_dashboard_preferences(
     defaults = {
         "language": "en",
         "theme": "dark",
-        "widgets": [
-            "quality_score",
-            "drift_score",
-            "anomalies",
-            "historical_runs",
-            "datasets",
-            "active_schedules",
-            "missing_values",
-            "duplicate_rows",
-        ],
+        "widgets": [dict(widget) for widget in _DEFAULT_DASHBOARD_WIDGETS],
     }
     preferences = {**defaults, **preferences}
     supported_languages = {"en", "es", "fr", "hi"}
@@ -1133,8 +1266,7 @@ def _render_dashboard_preferences(
         or preferences["theme"] not in supported_themes
     ):
         preferences["theme"] = "dark"
-    if not isinstance(preferences.get("widgets"), list):
-        preferences["widgets"] = defaults["widgets"]
+    widgets = _normalize_dashboard_widgets(preferences.get("widgets"))
     with st.expander("Dashboard settings", expanded=False):
         with st.form("dashboard-preferences"):
             language_labels = {
@@ -1157,50 +1289,147 @@ def _render_dashboard_preferences(
                 index=themes.index(preferences["theme"])
                 if preferences["theme"] in themes else 0,
             )
-            widget_labels = {
-                "quality_score": "Quality score",
-                "drift_score": "Drift score",
-                "anomalies": "Anomaly count",
-                "historical_runs": "Historical runs",
-                "datasets": "Datasets monitored",
-                "active_schedules": "Active schedules",
-                "missing_values": "Missing-value rate",
-                "duplicate_rows": "Duplicate-row rate",
-            }
-            widgets = st.multiselect(
-                "Overview widgets",
-                list(widget_labels),
-                default=[
-                    item for item in preferences["widgets"]
-                    if item in widget_labels
-                ] or list(widget_labels),
-                format_func=widget_labels.get,
-            )
             submitted = st.form_submit_button("Save dashboard settings")
         if submitted:
-            if not widgets:
-                st.error("Select at least one overview widget.")
+            saved = _post(
+                api_base_url,
+                headers,
+                "/api/preferences",
+                {
+                    "preferences": {
+                        "language": language,
+                        "theme": theme,
+                        "widgets": widgets,
+                    }
+                },
+                timeout=20,
+            )
+            if saved is not None:
+                st.success("Dashboard settings saved.")
+                st.rerun()
+
+        st.markdown("#### Dashboard widget builder")
+        st.caption("Add metric cards or history charts, then drag widgets to arrange the overview.")
+        widget_kind = st.selectbox(
+            "New widget type",
+            ["metric", "chart"],
+            format_func=lambda kind: "Metric card" if kind == "metric" else "Trend chart",
+            key="dashboard-new-widget-kind",
+        )
+        metric_options = (
+            list(_TREND_WIDGET_METRICS)
+            if widget_kind == "chart"
+            else list(_DASHBOARD_WIDGET_LABELS)
+        )
+        metric_options.sort(key=lambda key: list(_DASHBOARD_WIDGET_LABELS).index(key))
+        with st.form("dashboard-widget-builder"):
+            selected_metric = st.selectbox(
+                "Metric",
+                metric_options,
+                format_func=_DASHBOARD_WIDGET_LABELS.get,
+            )
+            chart_type = None
+            if widget_kind == "chart":
+                chart_type = st.selectbox("Chart style", ["line", "bar"])
+            title = st.text_input("Widget title", max_chars=80).strip()
+            add_widget = st.form_submit_button("Add widget")
+        if add_widget:
+            if len(widgets) >= 24:
+                st.error("A dashboard can contain at most 24 widgets.")
             else:
-                try:
-                    save_response = requests.post(
-                        f"{api_base_url}/api/preferences",
-                        headers=headers,
-                        json={
+                new_widget = {
+                    "id": f"custom-{uuid.uuid4().hex}",
+                    "kind": widget_kind,
+                    "metric": selected_metric,
+                    "title": title or _DASHBOARD_WIDGET_LABELS[selected_metric],
+                }
+                if chart_type is not None:
+                    new_widget["chart_type"] = chart_type
+                save_response = _post(
+                    api_base_url,
+                    headers,
+                    "/api/preferences",
+                    {
+                        "preferences": {
+                            "language": preferences["language"],
+                            "theme": preferences["theme"],
+                            "widgets": [*widgets, new_widget],
+                        }
+                    },
+                    timeout=20,
+                )
+                if save_response is not None:
+                    st.success("Widget added.")
+                    st.rerun()
+
+        widget_labels_by_id = {
+            widget["id"]: f"{widget['title']} · {widget['id']}"
+            for widget in widgets
+        }
+        id_by_widget_label = {
+            label: widget_id for widget_id, label in widget_labels_by_id.items()
+        }
+        if widgets:
+            sortable_labels = list(widget_labels_by_id.values())
+            sorted_labels = sort_items(
+                sortable_labels,
+                direction="vertical",
+                key="dashboard-widget-sortable",
+            )
+            ordered_widgets = [
+                next(
+                    widget for widget in widgets
+                    if widget["id"] == id_by_widget_label[label]
+                )
+                for label in sorted_labels
+                if label in id_by_widget_label
+            ] if isinstance(sorted_labels, list) else widgets
+            if len(ordered_widgets) != len(widgets):
+                ordered_widgets = widgets
+            if st.button("Save widget order", key="dashboard-save-widget-order"):
+                save_response = _post(
+                    api_base_url,
+                    headers,
+                    "/api/preferences",
+                    {
+                        "preferences": {
+                            "language": preferences["language"],
+                            "theme": preferences["theme"],
+                            "widgets": ordered_widgets,
+                        }
+                    },
+                    timeout=20,
+                )
+                if save_response is not None:
+                    st.success("Dashboard layout saved.")
+                    st.rerun()
+
+            if len(widgets) > 1:
+                remove_label = st.selectbox(
+                    "Widget to remove",
+                    list(widget_labels_by_id.values()),
+                    key="dashboard-remove-widget",
+                )
+                if st.button("Remove widget", key="dashboard-remove-widget-button"):
+                    remaining_widgets = [
+                        widget for widget in widgets
+                        if widget["id"] != id_by_widget_label[remove_label]
+                    ]
+                    save_response = _post(
+                        api_base_url,
+                        headers,
+                        "/api/preferences",
+                        {
                             "preferences": {
-                                "language": language,
-                                "theme": theme,
-                                "widgets": widgets,
+                                "language": preferences["language"],
+                                "theme": preferences["theme"],
+                                "widgets": remaining_widgets,
                             }
                         },
                         timeout=20,
                     )
-                except requests.RequestException as error:
-                    st.error(f"Could not save dashboard settings: {error}")
-                else:
-                    if save_response.status_code != 200:
-                        st.error(_response_error(save_response, "Could not save dashboard settings."))
-                    else:
-                        st.success("Dashboard settings saved.")
+                    if save_response is not None:
+                        st.success("Widget removed.")
                         st.rerun()
 
     theme = preferences["theme"]
@@ -1511,8 +1740,34 @@ def _latest_result(
 
 
 def _check_results(item: dict[str, Any] | None) -> dict[str, Any]:
-    result = item.get("result", {}) if item else {}
-    return result.get("results", {}) if isinstance(result, dict) else {}
+    if not item:
+        return {}
+    result = item.get("result", {})
+    if not isinstance(result, dict):
+        return {}
+    if "results" in result and isinstance(result["results"], dict):
+        return result["results"]
+
+    checks: dict[str, Any] = {}
+    check_type = str(item.get("check_type", ""))
+
+    if "quality_score" in result or check_type in {"data_quality", "data_quality_csv"}:
+        checks["quality"] = {
+            "quality_score": result.get("quality_score", {}),
+            "report": result.get("report", {}),
+            "ai_summary": result.get("ai_summary", {}),
+        }
+    if "overall_drift_score" in result or check_type in {"data_drift", "data_drift_csv"} or "distribution_drift" in result:
+        drift_data = result.get("distribution_drift") or result.get("report") or result
+        checks["drift"] = drift_data
+    if "total_anomalies" in result or (isinstance(result.get("report"), dict) and "total_anomalies" in result["report"]):
+        checks["anomalies"] = result.get("report") if "total_anomalies" in result.get("report", {}) else result
+    if check_type == "forecast" or "forecast" in result or (isinstance(result.get("report"), dict) and "forecast" in result["report"]):
+        checks["forecast"] = result.get("report") or result
+    if check_type == "explanation" or "feature_importance" in result or (isinstance(result.get("report"), dict) and "feature_importance" in result["report"]):
+        checks["explanation"] = result.get("report") or result
+
+    return checks
 
 
 def _date_columns(frame: pd.DataFrame) -> list[str]:
@@ -1727,6 +1982,37 @@ def _render_quality_page(
             st.dataframe(missing, use_container_width=True, hide_index=True)
         else:
             st.success("No missing values were reported in this run.")
+
+    ai_summary = quality.get("ai_summary", {})
+    if isinstance(ai_summary, dict) and ai_summary.get("summary"):
+        st.markdown("#### 🧠 AI Quality Insights & Recommendations")
+        risk = str(ai_summary.get("risk_level", "unknown")).upper()
+        risk_color = "#168f86" if risk == "LOW" else ("#e09f3e" if risk == "MEDIUM" else "#d95d5d")
+        st.markdown(
+            f"""<div style="background: rgba(22, 143, 134, 0.08); border-left: 4px solid {risk_color}; padding: 12px 16px; border-radius: 8px; margin-bottom: 16px;">
+            <strong>Risk Profile:</strong> <span style="color: {risk_color}; font-weight: bold;">{risk}</span><br>
+            <p style="margin-top: 6px; margin-bottom: 0;">{ai_summary.get('summary')}</p>
+            </div>""",
+            unsafe_allow_html=True,
+        )
+        col_findings, col_actions = st.columns(2)
+        with col_findings:
+            st.markdown("**Key Findings:**")
+            findings = ai_summary.get("key_findings", [])
+            if findings:
+                for f in findings:
+                    st.markdown(f"- {f}")
+            else:
+                st.caption("No issues detected.")
+        with col_actions:
+            st.markdown("**Recommended Actions:**")
+            actions = ai_summary.get("recommended_actions", [])
+            if actions:
+                for a in actions:
+                    st.markdown(f"- {a}")
+            else:
+                st.caption("No action required.")
+
     with st.expander("Schema, freshness, duplicate detection, and business rules"):
         st.json({
             "schema_validation": report.get("schema_validation"),
@@ -1921,25 +2207,28 @@ def _render_explainability(
     with st.form("explainability-form"):
         target = st.selectbox("Target column", list(frame.columns))
         task = st.selectbox("Prediction task", ["classification", "regression"])
+        mode = st.radio("Analysis type", ["AutoML Model Comparison", "Model Training & Feature Explanation"], horizontal=True)
         test_size = st.slider("Test data fraction", min_value=0.1, max_value=0.4, value=0.2, step=0.05)
         submitted = st.form_submit_button(
-            "Compare models",
+            "Run analysis",
             type="primary",
             disabled=role == "viewer",
         )
     if not submitted:
         return
+    request_payload = {
+        "data": frame.to_dict(orient="records"),
+        "dataset_id": dataset_id,
+        "target_column": target,
+        "task": task,
+        "test_size": test_size,
+        "mode": "compare" if mode == "AutoML Model Comparison" else "explain",
+    }
     report = _post(
         api_base_url,
         headers,
         "/api/analytics/explain",
-        {
-            "data": frame.to_dict(orient="records"),
-            "dataset_id": dataset_id,
-            "target_column": target,
-            "task": task,
-            "test_size": test_size,
-        },
+        request_payload,
         timeout=300,
     )
     if report is None:
@@ -1948,36 +2237,84 @@ def _render_explainability(
     if not isinstance(result, dict):
         st.error("The explainability service returned an invalid report.")
         return
-    summary = st.columns(3)
-    summary[0].metric("Selected model", result.get("selected_model", "Unavailable"))
-    summary[1].metric("Selection metric", result.get("metric", "Unavailable"))
-    summary[2].metric("Best score", result.get("best_score", "Unavailable"))
-    models = result.get("models", [])
-    if models:
-        model_frame = pd.DataFrame([
-            {"model": item.get("model"), "score": item.get("score"), **item.get("metrics", {})}
-            for item in models
-        ])
-        st.dataframe(model_frame, use_container_width=True, hide_index=True)
-        importance = result.get("best_model_summary", {}).get("feature_importance", [])
+
+    if "models" in result:
+        summary = st.columns(3)
+        summary[0].metric("Selected model", result.get("selected_model", "Unavailable"))
+        summary[1].metric("Selection metric", result.get("metric", "Unavailable"))
+        summary[2].metric("Best score", str(result.get("best_score", "Unavailable")))
+        models = result.get("models", [])
+        if models:
+            model_frame = pd.DataFrame([
+                {"model": item.get("model"), "score": item.get("score"), **item.get("metrics", {})}
+                for item in models
+            ])
+            st.markdown("#### Candidate models comparison")
+            st.dataframe(model_frame, use_container_width=True, hide_index=True)
+            importance = result.get("best_model_summary", {}).get("feature_importance", [])
+            if importance:
+                importance_frame = pd.DataFrame(importance)
+                if "value" in importance_frame.columns and "importance" not in importance_frame.columns:
+                    importance_frame = importance_frame.rename(columns={"value": "importance"})
+                if {"feature", "importance"}.issubset(importance_frame.columns):
+                    st.plotly_chart(
+                        px.bar(
+                            importance_frame.sort_values("importance"),
+                            x="importance",
+                            y="feature",
+                            orientation="h",
+                            title="Feature importance for selected model",
+                        ),
+                        use_container_width=True,
+                    )
+        if result.get("model_failures"):
+            with st.expander("Models that could not be evaluated"):
+                st.dataframe(pd.DataFrame(result["model_failures"]), use_container_width=True, hide_index=True)
+    else:
+        holdout = result.get("holdout", {})
+        metrics = holdout.get("metrics", {})
+        model_name = result.get("explanation_summary", {}).get("model_type", "Random Forest")
+        summary = st.columns(4)
+        summary[0].metric("Model", model_name)
+        if task == "classification":
+            summary[1].metric("Accuracy", f"{metrics.get('accuracy', 0):.1%}" if "accuracy" in metrics else "N/A")
+            summary[2].metric("Precision", f"{metrics.get('precision_weighted', 0):.1%}" if "precision_weighted" in metrics else "N/A")
+            summary[3].metric("F1 Score", f"{metrics.get('f1_weighted', 0):.1%}" if "f1_weighted" in metrics else "N/A")
+            if "confusion_matrix" in metrics and "class_labels" in metrics:
+                cm = pd.DataFrame(
+                    metrics["confusion_matrix"],
+                    index=metrics["class_labels"],
+                    columns=metrics["class_labels"],
+                )
+                st.markdown("#### Confusion Matrix")
+                st.dataframe(cm, use_container_width=True)
+        else:
+            summary[1].metric("MAE", f"{metrics.get('mae', 0):.4f}" if "mae" in metrics else "N/A")
+            summary[2].metric("RMSE", f"{metrics.get('rmse', 0):.4f}" if "rmse" in metrics else "N/A")
+            summary[3].metric("R² Score", f"{metrics.get('r2', 0):.4f}" if metrics.get("r2") is not None else "N/A")
+
+        importance = result.get("feature_importance", [])
         if importance:
             importance_frame = pd.DataFrame(importance)
             if "value" in importance_frame.columns and "importance" not in importance_frame.columns:
                 importance_frame = importance_frame.rename(columns={"value": "importance"})
             if {"feature", "importance"}.issubset(importance_frame.columns):
+                st.markdown("#### Global Feature Importance")
                 st.plotly_chart(
                     px.bar(
                         importance_frame.sort_values("importance"),
                         x="importance",
                         y="feature",
                         orientation="h",
-                        title="Feature importance for selected model",
+                        title=f"Feature importance ({model_name})",
                     ),
                     use_container_width=True,
                 )
-    if result.get("model_failures"):
-        with st.expander("Models that could not be evaluated"):
-            st.dataframe(pd.DataFrame(result["model_failures"]), use_container_width=True, hide_index=True)
+
+        if holdout.get("predictions"):
+            with st.expander("Holdout Predictions Preview"):
+                st.dataframe(pd.DataFrame(holdout["predictions"]), use_container_width=True, hide_index=True)
+
     with st.expander("Explanation details"):
         st.json(result)
 
