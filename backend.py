@@ -42,7 +42,9 @@ def test_connection() -> bool:
 
 
 # SAFE QUERY EXECUTION
-def get_data(query: str, params: dict | None = None) -> pd.DataFrame:
+from typing import Any
+
+def get_data(query: str | Any, params: dict | None = None) -> pd.DataFrame:
     try:
         with engine.connect() as conn:
             df = pd.read_sql(text(query), conn, params=params)
