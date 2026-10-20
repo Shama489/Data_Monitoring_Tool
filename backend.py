@@ -42,7 +42,9 @@ def test_connection() -> bool:
 
 
 # SAFE QUERY EXECUTION
-def get_data(query: str | text, params: dict | None = None) -> pd.DataFrame:
+from typing import Any
+
+def get_data(query: str | Any, params: dict | None = None) -> pd.DataFrame:
     try:
         with engine.connect() as conn:
             stmt = query if hasattr(query, "compile") else text(str(query))
