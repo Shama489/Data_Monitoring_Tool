@@ -1,3 +1,5 @@
+
+import monitoring_dashboard
 from datetime import datetime, timezone
 
 import pandas as pd
@@ -48,28 +50,35 @@ def test_filter_monitoring_results_uses_dataset_date_and_search_filters():
 
 
 def test_result_rows_calculates_missing_and_duplicate_rates_from_saved_quality():
-    results = [{
-        "id": "run-1",
-        "dataset_id": "dataset-a",
-        "check_type": "quality",
-        "created_at": datetime(2026, 10, 10, tzinfo=timezone.utc).timestamp(),
-        "result": {
-            "results": {
-                "quality": {
-                    "report": {
-                        "rows": 2,
-                        "columns": 2,
-                        "total_nulls": 1,
-                        "duplicates": 1,
+    results = [
+        {
+            "id": "run-1",
+            "dataset_id": "dataset-a",
+            "check_type": "quality",
+            "created_at": datetime(
+                2026, 10, 10, tzinfo=timezone.utc
+            ).timestamp(),
+            "result": {
+                "results": {
+                    "quality": {
+                        "report": {
+                            "rows": 2,
+                            "columns": 2,
+                            "total_nulls": 1,
+                            "duplicates": 1,
+                        },
+                        "quality_score": {"overall_score": 75},
                     },
-                    "quality_score": {"overall_score": 75},
+                    "drift": {
+                        "overall_drift_score": 0.5,
+                        "drift_detected": False,
+                    },
+                    "anomalies": {"total_anomalies": 1},
                 },
-                "drift": {"overall_drift_score": 0.5, "drift_detected": False},
-                "anomalies": {"total_anomalies": 1},
+                "root_cause": {"status": "warning"},
             },
-            "root_cause": {"status": "warning"},
-        },
-    }]
+        }
+    ]
 
     row = _result_rows(results)[0]
 
@@ -87,7 +96,10 @@ def test_monitoring_run_forwards_openai_summary_opt_in(monkeypatch):
     monkeypatch.setattr(
         monitoring_dashboard,
         "_dataset_frame",
-        lambda *_args: ({"data": [{"value": 1}]}, pd.DataFrame({"value": [1]})),
+        lambda *_args: (
+            {"data": [{"value": 1}]},
+            pd.DataFrame({"value": [1]}),
+        ),
     )
     monkeypatch.setattr(
         monitoring_dashboard.st,
@@ -102,9 +114,13 @@ def test_monitoring_run_forwards_openai_summary_opt_in(monkeypatch):
     monkeypatch.setattr(
         monitoring_dashboard.st,
         "checkbox",
-        lambda label, **_kwargs: label == "Use an OpenAI-generated quality summary",
+        lambda label, **_kwargs: (
+            label == "Use an OpenAI-generated quality summary"
+        ),
     )
-    monkeypatch.setattr(monitoring_dashboard.st, "button", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        monitoring_dashboard.st, "button", lambda *_args, **_kwargs: True
+    )
     monkeypatch.setattr(monitoring_dashboard.st, "rerun", lambda: None)
     monkeypatch.setattr(
         monitoring_dashboard,
@@ -112,7 +128,7 @@ def test_monitoring_run_forwards_openai_summary_opt_in(monkeypatch):
         lambda _api_base_url, _headers, payload: requests.append(payload) or True,
     )
 
-    _render_monitoring_run(
+    monitoring_dashboard._render_monitoring_run(
         "http://api",
         {},
         "analyst",
