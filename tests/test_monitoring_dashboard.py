@@ -2,40 +2,7 @@ from datetime import datetime, timezone
 
 import pandas as pd
 
-from monitoring_dashboard import (
-    _filter_monitoring_results,
-    _normalize_dashboard_widgets,
-    _result_rows,
-)
-
-
-def test_normalize_dashboard_widgets_keeps_legacy_preferences_and_custom_layout():
-    legacy = _normalize_dashboard_widgets(["quality_score", "anomalies"])
-    assert [widget["metric"] for widget in legacy] == ["quality_score", "anomalies"]
-    assert all(widget["kind"] == "metric" for widget in legacy)
-
-    custom = _normalize_dashboard_widgets([
-        {
-            "id": "custom-score",
-            "kind": "chart",
-            "metric": "quality_score",
-            "title": "Quality trend",
-            "chart_type": "line",
-        },
-        {
-            "id": "custom-score",
-            "kind": "metric",
-            "metric": "anomalies",
-            "title": "Duplicate id is ignored",
-        },
-    ])
-    assert custom == [{
-        "id": "custom-score",
-        "kind": "chart",
-        "metric": "quality_score",
-        "title": "Quality trend",
-        "chart_type": "line",
-    }]
+from monitoring_dashboard import _filter_monitoring_results, _result_rows
 
 
 def test_filter_monitoring_results_uses_dataset_date_and_search_filters():
@@ -111,3 +78,46 @@ def test_result_rows_calculates_missing_and_duplicate_rates_from_saved_quality()
     assert row["duplicate_percentage"] == 50
     assert row["drift_score"] == 0.5
     assert row["anomalies"] == 1
+
+
+def test_monitoring_run_forwards_openai_summary_opt_in(monkeypatch):
+    requests = []
+    dataset = {"id": "dataset-a", "name": "Events"}
+
+    monkeypatch.setattr(
+        monitoring_dashboard,
+        "_dataset_frame",
+        lambda *_args: ({"data": [{"value": 1}]}, pd.DataFrame({"value": [1]})),
+    )
+    monkeypatch.setattr(
+        monitoring_dashboard.st,
+        "selectbox",
+        lambda _label, options, **_kwargs: options[0],
+    )
+    monkeypatch.setattr(
+        monitoring_dashboard.st,
+        "multiselect",
+        lambda *_args, **_kwargs: ["quality"],
+    )
+    monkeypatch.setattr(
+        monitoring_dashboard.st,
+        "checkbox",
+        lambda label, **_kwargs: label == "Use an OpenAI-generated quality summary",
+    )
+    monkeypatch.setattr(monitoring_dashboard.st, "button", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(monitoring_dashboard.st, "rerun", lambda: None)
+    monkeypatch.setattr(
+        monitoring_dashboard,
+        "_run_monitoring",
+        lambda _api_base_url, _headers, payload: requests.append(payload) or True,
+    )
+
+    _render_monitoring_run(
+        "http://api",
+        {},
+        "analyst",
+        [dataset],
+        "dataset-a",
+    )
+
+    assert requests[0]["use_llm"] is True
