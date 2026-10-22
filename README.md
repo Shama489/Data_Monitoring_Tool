@@ -107,6 +107,12 @@ behavior depends on the browser/provider. The transcript is sent to this API
 only after recognition. The assistant analyzes the selected saved dataset
 snapshot; “today” does not imply a separate time-filtered query.
 
+When running a quality check from the dashboard, enable **Use an OpenAI-generated
+quality summary** to opt in to the OpenAI summary path. It requires
+`OPENAI_API_KEY`; only aggregate quality metrics are sent. The default remains
+the built-in rule-based summary, which is also used if OpenAI is unavailable or
+the request fails.
+
 ## Dataset lineage, versions, and comparison
 
 Datasets are immutable after creation. Create a new version with
