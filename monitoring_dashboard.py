@@ -1941,6 +1941,23 @@ def _render_quality_page(
     if not report:
         st.info("No quality analysis is available for this dataset and time range. Run a quality check to populate this page.")
         return
+    ai_summary = quality.get("ai_summary")
+    if isinstance(ai_summary, dict):
+        summary_text = ai_summary.get("summary")
+        if isinstance(summary_text, str) and summary_text:
+            st.markdown("#### Quality summary")
+            st.info(summary_text)
+        risk_level = ai_summary.get("risk_level")
+        if isinstance(risk_level, str) and risk_level:
+            st.caption(f"Risk level: {risk_level}")
+        findings = ai_summary.get("key_findings")
+        if isinstance(findings, list) and findings:
+            st.markdown("**Key findings**")
+            st.markdown("\n".join(f"- {finding}" for finding in findings))
+        actions = ai_summary.get("recommended_actions")
+        if isinstance(actions, list) and actions:
+            st.markdown("**Recommended actions**")
+            st.markdown("\n".join(f"- {action}" for action in actions))
     score = (quality.get("quality_score") or {}).get("overall_score")
     columns = st.columns(4)
     columns[0].metric("Quality score", "Unavailable" if score is None else f"{score:.1f}/100")
@@ -2379,6 +2396,17 @@ def _render_monitoring_run(
     if "explain" in checks and not frame.empty:
         target_column = st.selectbox("Explainability target column", list(frame.columns))
     notify = st.checkbox("Send configured alerts when findings are detected", value=False)
+    use_llm = False
+    if "quality" in checks:
+        use_llm = st.checkbox(
+            "Use an OpenAI-generated quality summary",
+            value=False,
+            help=(
+                "Requires OPENAI_API_KEY. Only aggregate quality metrics are sent; "
+                "if OpenAI is unavailable, the built-in summary is used."
+            ),
+            key="run-monitoring-use-llm",
+        )
     if st.button("Run selected checks", type="primary", disabled=not checks, key="run-monitoring"):
         if "drift" in checks and baseline is None:
             st.error("Select a baseline dataset before running drift analysis.")
@@ -2393,6 +2421,7 @@ def _render_monitoring_run(
             "dataset_id": dataset["id"],
             "checks": checks,
             "notify": notify,
+            "use_llm": use_llm,
         }
         if baseline:
             request_payload["baseline_dataset_id"] = all_labels[baseline]["id"]
