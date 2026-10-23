@@ -663,7 +663,9 @@ def answer_monitoring_question(
         anomaly_report = detect_anomalies_isolation_forest(df)
 
     quality_score = None
-    if df is not None:
+    if isinstance(monitoring_results, dict) and "quality_score" in monitoring_results:
+        quality_score = monitoring_results["quality_score"]
+    elif df is not None:
         quality_score = calculate_data_quality_score(df)
 
     missing_total = 0
@@ -723,7 +725,7 @@ def answer_monitoring_question(
         }
 
     if has_intent("quality"):
-        score = quality_score.get("overall_score", 0) if quality_score else 0
+        score = quality_score.get("overall_score") if isinstance(quality_score, dict) else None
         if score is not None:
             profile = (
                 ("low" if score < 60 else "moderate" if score < 85 else "strong")

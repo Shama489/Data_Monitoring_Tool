@@ -272,6 +272,7 @@ For example, cluster a dataset with
 - **Data Quality Analysis**: Detect null values, duplicates, and generate automated recommendations for cleaning the dataset.  
 - **Data Quality API Integration**: Expose ready-to-use FastAPI endpoints for dataset quality checks from external apps and services.  
 - **Enterprise Source Monitoring**: Analyze multiple local files, SQL databases, MongoDB collections, and cloud objects in one request.
+- **Read-only SQL sources**: SQL input is parsed as a single SELECT statement and executed in a read-only transaction (SQLite, PostgreSQL, and MySQL).
 - **Persistent Monitoring State**: Store datasets, analysis results, alert rules and history, configuration, and audit records in SQLite.
 - **Advanced Monitoring Dashboard**: Unified authenticated workspace for quality scores, drift and anomaly trends, configurable monitoring runs, forecasts, XAI reports, alerts, and historical results.
 - **Data Lineage & Pipeline Monitoring**: Owner-scoped provenance, immutable version links, monitoring/comparison pipeline stages, and recorded failures.

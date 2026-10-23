@@ -13,6 +13,9 @@ from urllib.parse import parse_qsl, urlsplit
 
 import pandas as pd
 import requests
+import sqlglot
+from sqlglot import exp
+from sqlglot.errors import ParseError
 from sqlalchemy import create_engine, text
 
 
@@ -247,86 +250,46 @@ def load_local_file(
     return _read_file_bytes(content, extension, file_path.name, sheet_name, max_rows, max_columns)
 
 
-def _strip_sql_leading_comments(query: str) -> str:
-    cleaned = query.lstrip()
-    while True:
-        if cleaned.startswith("--"):
-            newline_index = cleaned.find("\n")
-            if newline_index == -1:
-                return ""
-            cleaned = cleaned[newline_index + 1 :].lstrip()
-            continue
-        if cleaned.startswith("/*"):
-            comment_end = cleaned.find("*/")
-            if comment_end == -1:
-                return ""
-            cleaned = cleaned[comment_end + 2 :].lstrip()
-            continue
-        return cleaned
+def _validate_read_only_sql(query: str, dialect: str) -> None:
+    dialects = {
+        "mariadb": "mysql",
+        "postgresql": "postgres",
+    }
+    try:
+        statements = sqlglot.parse(query, read=dialects.get(dialect, dialect))
+    except ParseError as error:
+        raise DataSourceError("Only SELECT queries are allowed") from error
+
+    if len(statements) != 1 or not isinstance(statements[0], exp.Query):
+        raise DataSourceError("Only SELECT queries are allowed")
+
+    forbidden_node_names = {
+        "Alter",
+        "Command",
+        "Create",
+        "Drop",
+        "Into",
+        "Lock",
+        "Transaction",
+        "TruncateTable",
+    }
+    for node in statements[0].walk():
+        if isinstance(node, exp.DML) or type(node).__name__ in forbidden_node_names:
+            raise DataSourceError("Only SELECT queries are allowed")
 
 
-def _find_sql_statement_terminator(query: str) -> int | None:
-    in_single_quote = False
-    in_double_quote = False
-    in_line_comment = False
-    in_block_comment = False
-    index = 0
-    while index < len(query):
-        character = query[index]
-        next_character = query[index + 1] if index + 1 < len(query) else ""
-
-        if in_line_comment:
-            if character == "\n":
-                in_line_comment = False
-            index += 1
-            continue
-
-        if in_block_comment:
-            if character == "*" and next_character == "/":
-                in_block_comment = False
-                index += 2
-                continue
-            index += 1
-            continue
-
-        if in_single_quote:
-            if character == "'" and next_character == "'":
-                index += 2
-                continue
-            if character == "'":
-                in_single_quote = False
-            index += 1
-            continue
-
-        if in_double_quote:
-            if character == '"' and next_character == '"':
-                index += 2
-                continue
-            if character == '"':
-                in_double_quote = False
-            index += 1
-            continue
-
-        if character == "-" and next_character == "-":
-            in_line_comment = True
-            index += 2
-            continue
-        if character == "/" and next_character == "*":
-            in_block_comment = True
-            index += 2
-            continue
-        if character == "'":
-            in_single_quote = True
-            index += 1
-            continue
-        if character == '"':
-            in_double_quote = True
-            index += 1
-            continue
-        if character == ";":
-            return index
-        index += 1
-    return None
+def _enable_read_only_transaction(connection: Any) -> None:
+    dialect = connection.dialect.name
+    if dialect == "sqlite":
+        connection.exec_driver_sql("PRAGMA query_only = ON")
+    elif dialect == "postgresql":
+        connection.exec_driver_sql("SET TRANSACTION READ ONLY")
+    elif dialect in {"mysql", "mariadb"}:
+        connection.exec_driver_sql("START TRANSACTION READ ONLY")
+    else:
+        raise DataSourceError(
+            "Read-only SQL queries require a SQLite, PostgreSQL, or MySQL database"
+        )
 
 
 def _read_sql_bounded(
@@ -368,26 +331,12 @@ def load_sql_query(
     if not database_url.strip():
         raise DataSourceError("database_url is required")
 
-    normalized_query = _strip_sql_leading_comments(query).strip()
-    lowered_query = normalized_query.lower()
-    if not normalized_query:
-        raise DataSourceError("Only SELECT queries are allowed")
-    if not (lowered_query.startswith("select") or lowered_query.startswith("with")):
-        raise DataSourceError("Only SELECT queries are allowed")
-
-    statement_terminator = _find_sql_statement_terminator(normalized_query)
-    if statement_terminator is not None:
-        suffix = normalized_query[statement_terminator + 1 :].lstrip()
-        if suffix:
-            raise DataSourceError("Only SELECT queries are allowed")
-        normalized_query = normalized_query[:statement_terminator].rstrip()
-        if not normalized_query:
-            raise DataSourceError("Only SELECT queries are allowed")
-
     engine = None
     try:
         engine = create_engine(database_url, pool_pre_ping=True)
+        _validate_read_only_sql(query, engine.dialect.name)
         with engine.connect() as connection:
+            _enable_read_only_transaction(connection)
             return _read_sql_bounded(
                 connection,
                 query,
