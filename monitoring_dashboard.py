@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -256,8 +257,13 @@ def _render_voice_assistant(
         list(dataset_by_label),
         key="assistant_dataset",
     )
+    monitoring_date = st.date_input(
+        "Monitoring date",
+        value=date.today(),
+        key="assistant_monitoring_date",
+    )
     st.caption(
-        "Quality questions, including “today’s score,” use the selected saved dataset snapshot."
+        "Quality-score questions use the selected dataset's saved monitoring result for this date."
     )
 
     voice_value = _voice_command_component(
@@ -319,6 +325,8 @@ def _render_voice_assistant(
             "question": question,
             "language": language_code,
             "data": dataset_response.get("data", []),
+            "dataset_id": dataset_id,
+            "monitoring_date": monitoring_date.isoformat(),
         },
     )
     if answer is None:

@@ -1,6 +1,7 @@
 
 import monitoring_dashboard
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pandas as pd
 
@@ -87,6 +88,17 @@ def test_result_rows_calculates_missing_and_duplicate_rates_from_saved_quality()
     assert row["duplicate_percentage"] == 50
     assert row["drift_score"] == 0.5
     assert row["anomalies"] == 1
+
+
+def test_voice_component_explains_unsupported_browser_and_denied_microphone():
+    component = (
+        Path(__file__).parents[1] / "voice_component" / "index.html"
+    ).read_text(encoding="utf-8")
+
+    assert "if (!SpeechRecognition)" in component
+    assert "Voice input is unavailable in this browser. Type your question instead." in component
+    assert '"not-allowed": "Microphone permission was denied. Type your question instead."' in component
+    assert "error.name === \"NotAllowedError\"" in component
 
 
 def test_monitoring_run_forwards_openai_summary_opt_in(monkeypatch):

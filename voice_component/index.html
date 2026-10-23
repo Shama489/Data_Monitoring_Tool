@@ -88,6 +88,7 @@
           const messages = {
             "not-allowed": "Microphone permission was denied. Type your question instead.",
             "service-not-allowed": "Speech recognition is blocked by the browser. Type your question instead.",
+            "audio-capture": "No microphone is available. Check your microphone and type your question if needed.",
             "no-speech": "No speech was detected. Try again or type your question.",
           };
           status.textContent = messages[event.error] || `Voice input failed: ${event.error}.`;
@@ -95,7 +96,14 @@
         recognition.onend = () => {
           listenButton.disabled = false;
         };
-        recognition.start();
+        try {
+          recognition.start();
+        } catch (error) {
+          listenButton.disabled = false;
+          status.textContent = error.name === "NotAllowedError"
+            ? "Microphone permission was denied. Type your question instead."
+            : `Voice input could not start: ${error.message || error.name}. Type your question instead.`;
+        }
       });
 
       speakButton.addEventListener("click", () => {

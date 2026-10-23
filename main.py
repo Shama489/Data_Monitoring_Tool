@@ -5,6 +5,7 @@ import math
 import os
 import time
 from contextlib import asynccontextmanager, suppress
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlsplit
@@ -551,6 +552,65 @@ def assistant_ask_endpoint(payload: dict[str, Any]):
     if not isinstance(language, str) or language not in {"en", "es", "fr", "hi"}:
         _bad_request("language must be one of: en, es, fr, hi")
 
+    dataset_id = payload.get("dataset_id")
+    monitoring_date = payload.get("monitoring_date", date.today().isoformat())
+    dataset = None
+    monitoring_results = None
+    historical_result = None
+    selected_date = None
+    if dataset_id is not None:
+        if not isinstance(dataset_id, str) or not dataset_id.strip():
+            _bad_request("dataset_id must be a non-empty string")
+        if not isinstance(monitoring_date, str):
+            _bad_request("monitoring_date must be an ISO date")
+        try:
+            selected_date = date.fromisoformat(monitoring_date)
+        except ValueError:
+            _bad_request("monitoring_date must be an ISO date")
+        if selected_date.isoformat() != monitoring_date:
+            _bad_request("monitoring_date must be an ISO date")
+
+        dataset = get_dataset(dataset_id, owner_id=current_user_scope())
+        if dataset is None:
+            raise HTTPException(status_code=404, detail="Dataset was not found")
+        matching_results = list_monitoring_results(
+            limit=500,
+            dataset_id=dataset_id,
+            owner_id=current_user_scope(),
+        )
+        for item in matching_results:
+            try:
+                result_date = datetime.fromtimestamp(float(item["created_at"])).date()
+            except (TypeError, ValueError, OSError, OverflowError):
+                continue
+            result = item.get("result")
+            quality = (
+                result.get("results", {}).get("quality")
+                if isinstance(result, dict)
+                and isinstance(result.get("results"), dict)
+                else None
+            )
+            score = quality.get("quality_score") if isinstance(quality, dict) else None
+            if (
+                result_date == selected_date
+                and isinstance(score, dict)
+                and score.get("overall_score") is not None
+            ):
+                historical_result = item
+                break
+        quality_result = (
+            historical_result["result"]["results"]["quality"]
+            if historical_result is not None
+            else None
+        )
+        monitoring_results = {
+            "quality_score": (
+                quality_result.get("quality_score")
+                if isinstance(quality_result, dict)
+                else None
+            )
+        }
+
     df_value = payload.get("data") or payload.get("dataset") or payload.get("records")
     df = None
     if df_value is not None:
@@ -580,8 +640,43 @@ def assistant_ask_endpoint(payload: dict[str, Any]):
         quality_report=quality_report,
         drift_report=drift_report,
         anomaly_report=anomaly_report,
+        monitoring_results=monitoring_results,
         language=language,
     )
+    context = response.get("context")
+    if (
+        dataset is not None
+        and selected_date is not None
+        and isinstance(context, dict)
+        and "quality_score" in context
+    ):
+        dataset_name = dataset.get("name", dataset_id)
+        if historical_result is None:
+            source_note = (
+                f"No quality monitoring run was recorded for {selected_date.isoformat()} "
+                f"for dataset {dataset_name} ({dataset_id}); the saved snapshot score "
+                "was not substituted."
+            )
+            context["source"] = {
+                "type": "monitoring_history",
+                "date": selected_date.isoformat(),
+                "dataset_id": dataset_id,
+                "dataset_name": dataset_name,
+                "result_id": None,
+            }
+        else:
+            source_note = (
+                f"Based on monitoring history for {selected_date.isoformat()} "
+                f"using dataset {dataset_name} ({dataset_id})."
+            )
+            context["source"] = {
+                "type": "monitoring_history",
+                "date": selected_date.isoformat(),
+                "dataset_id": dataset_id,
+                "dataset_name": dataset_name,
+                "result_id": historical_result["id"],
+            }
+        response["answer"] = f"{response['answer']} {source_note}"
     return {"question": question, **response}
 
 

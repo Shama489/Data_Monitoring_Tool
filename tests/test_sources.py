@@ -1,4 +1,5 @@
 import json
+from datetime import date, timedelta
 
 import pandas as pd
 import pytest
@@ -72,6 +73,22 @@ def test_sql_loader_rejects_multi_statement_select_queries():
         load_sql_query("sqlite://", "SELECT 1; DELETE FROM events")
 
 
+@pytest.mark.parametrize(
+    "query",
+    [
+        "WITH changed AS (DELETE FROM events RETURNING *) SELECT * FROM changed",
+        "WITH changed AS (UPDATE events SET value = 1 RETURNING *) SELECT * FROM changed",
+        "WITH changed AS (INSERT INTO events (value) VALUES (1) RETURNING *) SELECT * FROM changed",
+        "WITH changed AS (SELECT 1) DELETE FROM events",
+        "WITH changed AS (SELECT 1) UPDATE events SET value = 1",
+        "WITH changed AS (SELECT 1) INSERT INTO events (value) SELECT * FROM changed",
+    ],
+)
+def test_sql_loader_rejects_data_modifying_ctes_and_with_statements(query):
+    with pytest.raises(DataSourceError, match="Only SELECT queries"):
+        load_sql_query("sqlite://", query)
+
+
 def test_sql_loader_accepts_multiline_select_queries():
     frame = load_sql_query(
         "sqlite://",
@@ -89,6 +106,29 @@ def test_sql_loader_accepts_commented_select_queries_with_embedded_semicolons():
         frame,
         pd.DataFrame({"value": ["alpha;beta", "gamma;delta"]}),
     )
+
+
+def test_sql_loader_rejects_write_attempts_on_read_only_connection(monkeypatch, tmp_path):
+    from sqlalchemy import create_engine
+
+    database_path = tmp_path / "readonly.db"
+    engine = create_engine(f"sqlite:///{database_path}")
+    with engine.begin() as connection:
+        connection.exec_driver_sql("CREATE TABLE events (value INTEGER)")
+    engine.dispose()
+
+    def attempt_write(connection, *_args, **_kwargs):
+        connection.exec_driver_sql("INSERT INTO events (value) VALUES (1)")
+        return pd.DataFrame()
+
+    monkeypatch.setattr("data_sources._read_sql_bounded", attempt_write)
+    with pytest.raises(DataSourceError, match="Database query failed"):
+        load_sql_query(f"sqlite:///{database_path}", "SELECT 1")
+
+    engine = create_engine(f"sqlite:///{database_path}")
+    with engine.connect() as connection:
+        assert connection.exec_driver_sql("SELECT COUNT(*) FROM events").scalar_one() == 0
+    engine.dispose()
 
 
 def test_sql_loader_rejects_results_above_the_configured_row_limit():
@@ -518,6 +558,95 @@ def test_assistant_endpoint_returns_answer_in_requested_language():
     assert response.status_code == 200
     assert response.json()["category"] == "quality"
     assert "/100" in response.json()["answer"]
+
+
+def test_assistant_uses_date_scoped_monitoring_history_for_quality_score():
+    dataset_response = client.post(
+        "/api/datasets",
+        json={"name": "quality-history", "data": [{"value": 1}, {"value": 2}]},
+    )
+    assert dataset_response.status_code == 201
+    dataset_id = dataset_response.json()["id"]
+
+    from monitoring_store import persist_monitoring_run
+
+    _, result_id = persist_monitoring_run(
+        [{"key": "current", "id": dataset_id}],
+        "monitoring",
+        {
+            "results": {
+                "quality": {
+                    "quality_score": {"overall_score": 91},
+                    "report": {"rows": 2, "columns": 1, "total_nulls": 0},
+                }
+            }
+        },
+        owner_id="test-admin-user",
+    )
+
+    response = client.post(
+        "/api/assistant/ask",
+        json={
+            "question": "What is today's quality score?",
+            "dataset_id": dataset_id,
+            "monitoring_date": date.today().isoformat(),
+            "data": [{"value": 1}],
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert "91.0/100" in body["answer"]
+    assert date.today().isoformat() in body["answer"]
+    assert dataset_id in body["answer"]
+    assert body["context"]["source"] == {
+        "type": "monitoring_history",
+        "date": date.today().isoformat(),
+        "dataset_id": dataset_id,
+        "dataset_name": "quality-history",
+        "result_id": result_id,
+    }
+
+
+def test_assistant_does_not_substitute_snapshot_when_date_has_no_quality_run():
+    dataset_response = client.post(
+        "/api/datasets",
+        json={"name": "no-quality-run", "data": [{"value": 1}, {"value": 2}]},
+    )
+    dataset_id = dataset_response.json()["id"]
+    requested_date = (date.today() + timedelta(days=1)).isoformat()
+
+    response = client.post(
+        "/api/assistant/ask",
+        json={
+            "question": "What is today's quality score?",
+            "dataset_id": dataset_id,
+            "monitoring_date": requested_date,
+            "data": [{"value": 1}, {"value": 2}],
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert "not available" in body["answer"]
+    assert requested_date in body["answer"]
+    assert "saved snapshot score was not substituted" in body["answer"]
+    assert body["context"]["quality_score"] is None
+    assert body["context"]["source"]["result_id"] is None
+
+
+def test_assistant_rejects_invalid_monitoring_date():
+    response = client.post(
+        "/api/assistant/ask",
+        json={
+            "question": "today's quality score",
+            "dataset_id": "dataset-a",
+            "monitoring_date": "not-a-date",
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "monitoring_date must be an ISO date"
 
 
 def test_assistant_endpoint_rejects_invalid_language_type():
