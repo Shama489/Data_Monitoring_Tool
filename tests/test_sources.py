@@ -13,6 +13,7 @@ from data_sources import (
     load_uploaded_file,
     load_sql_query,
     source_capabilities,
+    _validate_read_only_sql,
 )
 from main import app
 from notifications import ALERT_HISTORY, reset_alert_state
@@ -87,6 +88,22 @@ def test_sql_loader_rejects_multi_statement_select_queries():
 def test_sql_loader_rejects_data_modifying_ctes_and_with_statements(query):
     with pytest.raises(DataSourceError, match="Only SELECT queries"):
         load_sql_query("sqlite://", query)
+
+
+@pytest.mark.parametrize("dialect", ["sqlite", "postgres", "mysql"])
+@pytest.mark.parametrize(
+    "query",
+    [
+        "WITH changed AS (DELETE FROM events RETURNING *) SELECT * FROM changed",
+        "WITH changed AS (UPDATE events SET value = 1 RETURNING *) SELECT * FROM changed",
+        "WITH changed AS (INSERT INTO events (value) VALUES (1) RETURNING *) SELECT * FROM changed",
+    ],
+)
+def test_read_only_sql_validation_rejects_modifying_ctes_for_each_dialect(
+    dialect, query
+):
+    with pytest.raises(DataSourceError, match="Only SELECT queries"):
+        _validate_read_only_sql(query, dialect)
 
 
 def test_sql_loader_accepts_multiline_select_queries():
@@ -535,6 +552,19 @@ def test_quality_endpoint_forwards_optional_llm_flag(monkeypatch):
     assert calls == [False, True]
 
 
+def test_quality_endpoint_identifies_the_builtin_summary_method():
+    response = client.post(
+        "/api/data-quality/analyze",
+        json={"data": [{"value": 1}, {"value": None}]},
+    )
+
+    assert response.status_code == 200
+    summary = response.json()["ai_summary"]
+    assert summary["method"] == "built_in"
+    assert summary["fallback_used"] is False
+    assert summary["fallback_reason"] is None
+
+
 def test_quality_endpoint_rejects_non_boolean_llm_flag():
     response = client.post(
         "/api/data-quality/analyze",
@@ -680,6 +710,88 @@ def test_advanced_ml_endpoint_runs_clustering_and_persists_report():
     stored = client.get(f"/api/monitoring/results/{body['result_id']}")
     assert stored.status_code == 200
     assert stored.json()["result"]["report"] == body["report"]
+
+
+def test_advanced_ml_endpoint_runs_automatic_cluster_selection():
+    response = client.post(
+        "/api/analytics/advanced-ml",
+        json={
+            "analysis": "clustering",
+            "n_clusters": "auto",
+            "data": [
+                {"temperature": 10.0},
+                {"temperature": 10.2},
+                {"temperature": 9.8},
+                {"temperature": 10.1},
+                {"temperature": 90.0},
+                {"temperature": 90.2},
+                {"temperature": 89.8},
+                {"temperature": 90.1},
+            ],
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    report = response.json()["report"]
+    assert report["requested_clusters"] == "auto"
+    assert report["cluster_selection"]["method"] == "silhouette"
+    assert report["selected_clusters"] == 2
+
+
+def test_advanced_ml_endpoint_classifies_all_dataset_columns():
+    response = client.post(
+        "/api/analytics/advanced-ml",
+        json={
+            "analysis": "column_classification",
+            "data": [
+                {"value": 1.5, "record_id": 1001, "empty": None},
+                {"value": 2.5, "record_id": 1002, "empty": None},
+            ],
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    report = response.json()["report"]
+    assert report["analysis"] == "column_classification"
+    assert {item["column"] for item in report["columns"]} == {
+        "value",
+        "record_id",
+        "empty",
+    }
+    assert {item["classification"] for item in report["columns"]} == {
+        "numeric",
+        "identifier",
+        "all_missing",
+    }
+
+
+def test_advanced_ml_endpoint_runs_pipeline_failure_prediction():
+    failure_labels = [int(value % 5 == 0) for value in range(30)]
+    response = client.post(
+        "/api/analytics/advanced-ml",
+        json={
+            "analysis": "pipeline_failure_prediction",
+            "target_column": "failure",
+            "feature_columns": ["error_rate"],
+            "timestamp_column": "started_at",
+            "model_names": ["decision_tree"],
+            "data": [
+                {
+                    "started_at": f"2026-01-{value + 1:02d}",
+                    "error_rate": failure * 10 + value / 100,
+                    "failure": failure,
+                }
+                for value, failure in enumerate(failure_labels)
+            ],
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    report = response.json()["report"]
+    assert report["analysis"] == "pipeline_failure_prediction"
+    assert report["failure_class"] == 1
+    assert report["validation"]["method"] == "chronological"
+    assert report["failure_metrics"]["failure_recall"] >= 0
 
 
 def test_advanced_ml_endpoint_rejects_unknown_analysis():

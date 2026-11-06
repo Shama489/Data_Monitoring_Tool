@@ -104,14 +104,20 @@ a browser with Web Speech API support and microphone permission; typed questions
 remain available when speech recognition is unsupported or denied. Recognition
 is handled by the browser's speech service, whose audio-processing and privacy
 behavior depends on the browser/provider. The transcript is sent to this API
-only after recognition. The assistant analyzes the selected saved dataset
-snapshot; “today” does not imply a separate time-filtered query.
+only after recognition. For a quality-score question, the dashboard sends the
+selected dataset and date; the API resolves the score from that dataset's
+persisted quality-monitoring history and identifies the date, dataset, and
+result used. If no quality run exists for that date, the assistant reports that
+the score is unavailable rather than substituting the current saved snapshot.
 
 When running a quality check from the dashboard, enable **Use an OpenAI-generated
 quality summary** to opt in to the OpenAI summary path. It requires
 `OPENAI_API_KEY`; only aggregate quality metrics are sent. The default remains
-the built-in rule-based summary, which is also used if OpenAI is unavailable or
-the request fails.
+the built-in rule-based summary. Responses identify their method; if the
+credentials are missing/invalid, the request fails, or the returned summary
+does not match the required schema, the built-in summary is used and marked as
+a fallback. The API validates the summary text, risk level, findings, and
+recommendations before returning an OpenAI-generated result.
 
 ## Dataset lineage, versions, and comparison
 
@@ -247,10 +253,23 @@ dataset and report. Set `analysis` to one of:
 
 - `clustering`: K-means segments rows; supports `n_clusters` and optional
   `feature_columns`, and reports cluster profiles, row assignments, and a
-  sampled silhouette score.
+  sampled silhouette score. Set `n_clusters` to `"auto"` to evaluate k=2
+  through min(10, rows-1) and select the valid clustering with the best
+  silhouette score.
+- `column_classification`: classifies every column as numeric, boolean,
+  datetime, categorical, high-cardinality categorical, identifier, constant,
+  or all-missing, and reports type, missing, and distinct-value counts.
 - `fraud_detection`: Isolation Forest ranks unusual records for review; supports
   `contamination` and optional `feature_columns`. Flags indicate anomalies, not
   confirmed fraud.
+- `pipeline_failure_prediction`: requires a binary `target_column` containing
+  historical failure labels. `failure_value` can identify the positive failure
+  class when it cannot be inferred (recognized labels include `1`, `true`,
+  `yes`, `failed`, `failure`, `error`, and `crashed`). Optionally supply
+  `feature_columns` and a `timestamp_column`; the latter holds out the latest
+  records chronologically and is excluded from model features. Reports include
+  failure-class precision, recall, and F1. Without a timestamp, validation uses
+  a random holdout.
 - `predictive_maintenance`: compares supervised models for a failure/event
   target (`task: "classification"`) or remaining-useful-life/numeric target
   (`task: "regression"`); accepts `target_column`, `metric`, `test_size`, and
@@ -263,6 +282,14 @@ dataset and report. Set `analysis` to one of:
 For example, cluster a dataset with
 `{"analysis":"clustering","n_clusters":2,"data":[{"temperature":18},{"temperature":19},{"temperature":41},{"temperature":42}]}`.
 
+Acceptance criteria: automatic clustering must select from the documented k
+range using valid silhouette scores; column classification must return one
+classification for every input column, including constant and all-missing
+columns; pipeline-failure prediction must require two target classes, exclude
+the timestamp from model inputs, and report class-specific metrics using a
+chronological holdout when a timestamp is supplied. These contracts are covered
+by dedicated tests.
+
 ---
 
 ## Key Features
@@ -272,7 +299,7 @@ For example, cluster a dataset with
 - **Data Quality Analysis**: Detect null values, duplicates, and generate automated recommendations for cleaning the dataset.  
 - **Data Quality API Integration**: Expose ready-to-use FastAPI endpoints for dataset quality checks from external apps and services.  
 - **Enterprise Source Monitoring**: Analyze multiple local files, SQL databases, MongoDB collections, and cloud objects in one request.
-- **Read-only SQL sources**: SQL input is parsed as a single SELECT statement and executed in a read-only transaction (SQLite, PostgreSQL, and MySQL).
+- **Read-only SQL sources**: SQL input is parsed as one read-only query; data-changing statements inside CTEs are rejected. Queries also run in a database-level read-only transaction (SQLite, PostgreSQL, and MySQL). Configure the source account with least-privilege read-only database permissions as an additional safeguard.
 - **Persistent Monitoring State**: Store datasets, analysis results, alert rules and history, configuration, and audit records in SQLite.
 - **Advanced Monitoring Dashboard**: Unified authenticated workspace for quality scores, drift and anomaly trends, configurable monitoring runs, forecasts, XAI reports, alerts, and historical results.
 - **Data Lineage & Pipeline Monitoring**: Owner-scoped provenance, immutable version links, monitoring/comparison pipeline stages, and recorded failures.
@@ -474,7 +501,7 @@ API usage:
 - `POST /api/data-quality/analyze` with a dataset payload to get null counts, duplicates, score, and AI guidance.
 - `POST /api/data-quality/analyze-csv` with `csv` content for quality analysis.
 
-Quality endpoints accept optional `use_llm: true` to request an OpenAI quality summary. Set `OPENAI_API_KEY` and optionally `OPENAI_MODEL` to enable it; without configuration, or if the request fails, the built-in summary is returned.
+Quality endpoints accept optional `use_llm: true` to request an OpenAI quality summary. Set `OPENAI_API_KEY` and optionally `OPENAI_MODEL` to enable it. Responses label the summary method and whether the validated built-in fallback was used, including when credentials are missing or rejected.
 - `POST /api/drift/analyze` with `baseline` and `current` JSON arrays or dictionaries.  
 - `POST /api/drift/analyze-csv` with `baseline_csv` and `current_csv` content.
 
