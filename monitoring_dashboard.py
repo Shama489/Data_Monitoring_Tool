@@ -405,6 +405,7 @@ def _filter_monitoring_results(
     start_date: Any,
     end_date: Any,
 ) -> list[dict[str, Any]]:
+    normalized_search = str(search or "").strip().lower()
     filtered = []
     for item in results:
         item_dataset_id = item.get("dataset_id")
@@ -419,7 +420,7 @@ def _filter_monitoring_results(
             str(item_dataset_id or ""),
             dataset_name_by_id.get(item_dataset_id, ""),
         )).lower()
-        if search and search not in searchable:
+        if normalized_search and normalized_search not in searchable:
             continue
         filtered.append(item)
     return filtered
