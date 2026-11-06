@@ -50,6 +50,34 @@ def test_filter_monitoring_results_uses_dataset_date_and_search_filters():
     assert [item["id"] for item in selected] == ["quality-run"]
 
 
+def test_filter_monitoring_results_is_case_insensitive_for_search_text():
+    results = [
+        {
+            "id": "quality-run",
+            "dataset_id": "dataset-a",
+            "check_type": "quality",
+            "created_at": datetime(2026, 10, 10, tzinfo=timezone.utc).timestamp(),
+        },
+        {
+            "id": "drift-run",
+            "dataset_id": "dataset-a",
+            "check_type": "drift",
+            "created_at": datetime(2026, 10, 10, tzinfo=timezone.utc).timestamp(),
+        },
+    ]
+
+    selected = _filter_monitoring_results(
+        results,
+        {"dataset-a": "EVENTS"},
+        "dataset-a",
+        "QUALITY",
+        pd.Timestamp("2026-10-01").date(),
+        pd.Timestamp("2026-10-11").date(),
+    )
+
+    assert [item["id"] for item in selected] == ["quality-run"]
+
+
 def test_result_rows_calculates_missing_and_duplicate_rates_from_saved_quality():
     results = [
         {
