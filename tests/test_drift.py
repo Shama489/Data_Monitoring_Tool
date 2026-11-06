@@ -12,9 +12,11 @@ from profiler import (
     answer_monitoring_question,
     calculate_data_quality_score,
     check_data_quality,
+    classify_columns,
     classify_drift_severity,
     analyze_clusters,
     analyze_predictive_maintenance,
+    analyze_pipeline_failure_prediction,
     compare_models,
     detect_fraud_patterns,
     detect_anomalies_isolation_forest,
@@ -98,6 +100,8 @@ def test_data_quality_and_ai_summary_are_generated():
     assert "summary" in ai_summary
     assert "key_findings" in ai_summary
     assert "recommended_actions" in ai_summary
+    assert ai_summary["method"] == "built_in"
+    assert ai_summary["fallback_used"] is False
 
 
 def test_monitoring_assistant_answers_quality_and_drift_questions():
@@ -188,6 +192,8 @@ def test_generate_ai_quality_summary_uses_llm_when_available(monkeypatch):
     assert ai_summary["summary"] == "AI-driven summary"
     assert ai_summary["risk_level"] == "medium"
     assert ai_summary["key_findings"] == ["LLM found data issues"]
+    assert ai_summary["method"] == "openai"
+    assert ai_summary["fallback_used"] is False
 
 
 def test_trends_and_health_forecasts_are_generated():
@@ -385,6 +391,104 @@ def test_advanced_clustering_reports_assignments_and_cluster_profiles():
     assert report["silhouette_score"] > 0
 
 
+def test_advanced_clustering_selects_cluster_count_automatically():
+    df = pd.DataFrame({
+        "temperature": [10, 10.2, 9.8, 10.1, 10.3, 9.9, 90, 90.2, 89.8, 90.1, 90.3, 89.9],
+    })
+
+    report = analyze_clusters(df, n_clusters="auto")
+
+    assert report["requested_clusters"] == "auto"
+    assert report["selected_clusters"] == 2
+    assert report["cluster_selection"]["method"] == "silhouette"
+    assert [item["n_clusters"] for item in report["cluster_selection"]["candidates"]] == list(range(2, 11))
+    assert all(
+        item["silhouette_score"] is not None
+        for item in report["cluster_selection"]["candidates"]
+    )
+
+
+def test_column_classification_profiles_every_supported_column_kind():
+    row_count = 25
+    df = pd.DataFrame({
+        "amount": [value + 0.5 for value in range(row_count)],
+        "active": [value % 2 == 0 for value in range(row_count)],
+        "created_at": pd.date_range("2026-01-01", periods=row_count, freq="D"),
+        "segment": ["north" if value % 2 else "south" for value in range(row_count)],
+        "category_code": [f"category-{value}" for value in range(row_count)],
+        "record_id": list(range(1001, 1001 + row_count)),
+        "constant": ["same"] * row_count,
+        "empty": [None] * row_count,
+    })
+
+    report = classify_columns(df)
+
+    classifications = {
+        item["column"]: item["classification"] for item in report["columns"]
+    }
+    assert classifications == {
+        "amount": "numeric",
+        "active": "boolean",
+        "created_at": "datetime",
+        "segment": "categorical",
+        "category_code": "high_cardinality_categorical",
+        "record_id": "identifier",
+        "constant": "constant",
+        "empty": "all_missing",
+    }
+    assert len(report["columns"]) == len(df.columns)
+    assert report["classification_counts"]["all_missing"] == 1
+
+
+def test_pipeline_failure_prediction_uses_binary_label_and_chronological_holdout():
+    failures = [int(value % 5 == 0) for value in range(30)]
+    df = pd.DataFrame({
+        "started_at": pd.date_range("2026-01-01", periods=30, freq="D"),
+        "error_rate": [failure * 10 + value / 100 for value, failure in enumerate(failures)],
+        "failure": failures,
+    })
+
+    report = analyze_pipeline_failure_prediction(
+        df,
+        "failure",
+        feature_columns=["error_rate"],
+        timestamp_column="started_at",
+        model_names=["decision_tree"],
+    )
+
+    assert report["analysis"] == "pipeline_failure_prediction"
+    assert report["failure_class"] == 1
+    assert report["validation"] == {
+        "method": "chronological",
+        "train_rows": 24,
+        "test_rows": 6,
+        "split_column": "started_at",
+    }
+    assert set(report["failure_metrics"]) == {
+        "failure_precision",
+        "failure_recall",
+        "failure_f1",
+    }
+    assert all(
+        item["feature"] != "started_at"
+        for item in report["models"][0]["feature_importance"]
+    )
+
+
+def test_pipeline_failure_prediction_requires_binary_labels_and_clear_positive_value():
+    with pytest.raises(ValueError, match="binary target column"):
+        analyze_pipeline_failure_prediction(
+            pd.DataFrame({"value": [1, 2, 3, 4, 5], "failure": [0, 0, 1, 1, 2]}),
+            "failure",
+        )
+
+    with pytest.raises(ValueError, match="provide failure_value"):
+        analyze_pipeline_failure_prediction(
+            pd.DataFrame({"value": [1, 2, 3, 4, 5, 6], "status": ["ok", "bad"] * 3}),
+            "status",
+        )
+
+
 def test_fraud_detection_flags_outlier_and_describes_caveat():
     df = pd.DataFrame({
         "amount": list(range(39)) + [10000],
@@ -463,6 +567,7 @@ def test_generate_ai_quality_summary_warns_when_llm_fails(monkeypatch):
     def fake_failure(_metrics):
         raise RuntimeError("llm unavailable")
 
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.setattr("profiler._call_openai_quality_summary", fake_failure)
 
     with pytest.warns(RuntimeWarning, match="falling back"):
@@ -470,6 +575,65 @@ def test_generate_ai_quality_summary_warns_when_llm_fails(monkeypatch):
 
     assert "summary" in summary
     assert "risk_level" in summary
+    assert summary["method"] == "built_in"
+    assert summary["fallback_used"] is True
+    assert summary["fallback_reason"] == "openai_not_configured"
+
+
+def test_generate_ai_quality_summary_reports_missing_credentials(monkeypatch):
+    df = pd.DataFrame({"value": [1, 2, 3]})
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    with pytest.warns(RuntimeWarning, match="built-in summary"):
+        summary = generate_ai_quality_summary(df, use_llm=True)
+
+    assert summary["method"] == "built_in"
+    assert summary["fallback_used"] is True
+    assert summary["fallback_reason"] == "openai_not_configured"
+
+
+def test_generate_ai_quality_summary_reports_rejected_credentials(monkeypatch):
+    class AuthenticationError(RuntimeError):
+        status_code = 401
+
+    df = pd.DataFrame({"value": [1, 2, 3]})
+    monkeypatch.setenv("OPENAI_API_KEY", "invalid-test-key")
+
+    def reject_credentials(_metrics):
+        raise AuthenticationError("invalid API key")
+
+    monkeypatch.setattr(
+        "profiler._call_openai_quality_summary",
+        reject_credentials,
+    )
+
+    with pytest.warns(RuntimeWarning, match="openai_credentials_rejected"):
+        summary = generate_ai_quality_summary(df, use_llm=True)
+
+    assert summary["method"] == "built_in"
+    assert summary["fallback_used"] is True
+    assert summary["fallback_reason"] == "openai_credentials_rejected"
+
+
+def test_generate_ai_quality_summary_rejects_invalid_llm_output(monkeypatch):
+    df = pd.DataFrame({"value": [1, 2, 3]})
+    monkeypatch.setenv("OPENAI_API_KEY", "invalid-test-key")
+    monkeypatch.setattr(
+        "profiler._call_openai_quality_summary",
+        lambda _metrics: {
+            "summary": "Invalid output",
+            "risk_level": "unknown",
+            "key_findings": "not a list",
+            "recommended_actions": [],
+        },
+    )
+
+    with pytest.warns(RuntimeWarning, match="invalid_openai_response"):
+        summary = generate_ai_quality_summary(df, use_llm=True)
+
+    assert summary["method"] == "built_in"
+    assert summary["fallback_used"] is True
+    assert summary["fallback_reason"] == "invalid_openai_response"
 
 
 def test_data_quality_report_includes_schema_freshness_and_rule_validation():

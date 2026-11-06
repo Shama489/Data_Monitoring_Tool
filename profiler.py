@@ -446,6 +446,51 @@ def _call_openai_quality_summary(metrics):
     return parsed
 
 
+def _validated_quality_summary(summary):
+    if not isinstance(summary, dict):
+        raise ValueError("OpenAI returned an unexpected format")
+
+    text = summary.get("summary")
+    risk_level = summary.get("risk_level")
+    findings = summary.get("key_findings")
+    actions = summary.get("recommended_actions")
+    if not isinstance(text, str) or not text.strip() or len(text) > 2000:
+        raise ValueError("OpenAI summary must be a non-empty string of at most 2,000 characters")
+    if not isinstance(risk_level, str) or risk_level.strip().lower() not in {
+        "low",
+        "medium",
+        "high",
+        "critical",
+    }:
+        raise ValueError("OpenAI risk_level must be low, medium, high, or critical")
+    for field_name, items in (
+        ("key_findings", findings),
+        ("recommended_actions", actions),
+    ):
+        if (
+            not isinstance(items, list)
+            or len(items) > 20
+            or any(
+                not isinstance(item, str) or not item.strip() or len(item) > 500
+                for item in items
+            )
+        ):
+            raise ValueError(
+                f"OpenAI {field_name} must be a list of at most 20 non-empty strings "
+                "of at most 500 characters"
+            )
+
+    return {
+        "summary": text.strip(),
+        "risk_level": risk_level.strip().lower(),
+        "key_findings": [item.strip() for item in findings],
+        "recommended_actions": [item.strip() for item in actions],
+        "method": "openai",
+        "fallback_used": False,
+        "fallback_reason": None,
+    }
+
+
 def generate_ai_quality_summary(df, report=None, quality_score=None, use_llm=False):
     if report is None:
         report = check_data_quality(df)
@@ -469,15 +514,27 @@ def generate_ai_quality_summary(df, report=None, quality_score=None, use_llm=Fal
         "all_null_columns": report.get("all_null_columns", []),
     }
 
+    fallback_used = False
+    fallback_reason = None
     if use_llm:
         try:
-            ai_result = _call_openai_quality_summary(metrics)
-            required_fields = {"summary", "risk_level", "key_findings", "recommended_actions"}
-            if required_fields.issubset(ai_result.keys()):
-                return ai_result
+            return _validated_quality_summary(_call_openai_quality_summary(metrics))
         except Exception as exc:
+            fallback_used = True
+            if isinstance(exc, ValueError):
+                fallback_reason = "invalid_openai_response"
+            elif (
+                type(exc).__name__ in {"AuthenticationError", "PermissionDeniedError"}
+                or getattr(exc, "status_code", None) in {401, 403}
+            ):
+                fallback_reason = "openai_credentials_rejected"
+            elif not os.getenv("OPENAI_API_KEY") or OpenAI is None:
+                fallback_reason = "openai_not_configured"
+            else:
+                fallback_reason = "openai_request_failed"
             warnings.warn(
-                f"OpenAI quality summary failed; falling back to built-in summary. Details: {exc}",
+                "OpenAI quality summary failed; falling back to the built-in summary "
+                f"({fallback_reason}; {type(exc).__name__}).",
                 RuntimeWarning,
                 stacklevel=2,
             )
@@ -516,7 +573,7 @@ def generate_ai_quality_summary(df, report=None, quality_score=None, use_llm=Fal
     summary = (
         f"The dataset quality score is {overall_score:.1f}/100 with a {risk_level} risk profile. "
         f"Missing values account for {null_rate:.1f}% of cells and duplicates account for {duplicate_rate:.1f}% of rows. "
-        "AI-assisted review recommends targeted cleanup before using the dataset in reporting or ML workflows."
+        "Rule-based checks recommend targeted cleanup before using the dataset in reporting or ML workflows."
     )
 
     return {
@@ -524,6 +581,9 @@ def generate_ai_quality_summary(df, report=None, quality_score=None, use_llm=Fal
         "risk_level": risk_level,
         "key_findings": findings,
         "recommended_actions": recommended_actions,
+        "method": "built_in",
+        "fallback_used": fallback_used,
+        "fallback_reason": fallback_reason,
     }
 
 
@@ -1516,7 +1576,17 @@ def _metric_direction(task: str, metric: str) -> str:
     return "higher"
 
 
-def compare_models(df, target_column, task="classification", metric=None, test_size=0.2, model_names=None):
+def compare_models(
+    df,
+    target_column,
+    task="classification",
+    metric=None,
+    test_size=0.2,
+    model_names=None,
+    feature_columns=None,
+    split_column=None,
+    positive_label=None,
+):
     """Compare a shortlist of candidate models and return the best performer."""
     if target_column not in df.columns:
         raise ValueError(f"Target column '{target_column}' was not found in the dataset.")
@@ -1530,10 +1600,32 @@ def compare_models(df, target_column, task="classification", metric=None, test_s
     if not 0.1 <= test_size <= 0.5:
         raise ValueError("test_size must be between 0.1 and 0.5.")
 
+    if split_column is not None and split_column not in df.columns:
+        raise ValueError(f"Split column '{split_column}' was not found in the dataset.")
+    if feature_columns is not None:
+        if not isinstance(feature_columns, (list, tuple)) or not feature_columns:
+            raise ValueError("feature_columns must be a non-empty list when provided.")
+        missing_columns = [column for column in feature_columns if column not in df.columns]
+        if missing_columns:
+            raise ValueError(f"Feature columns were not found: {missing_columns}")
+        if target_column in feature_columns or split_column in feature_columns:
+            raise ValueError("Feature columns must not include the target or split column.")
+        feature_columns = list(dict.fromkeys(feature_columns))
+
     working = df.dropna(subset=[target_column]).copy()
+    timestamps = None
+    if split_column is not None:
+        timestamps = pd.to_datetime(working[split_column], errors="coerce", utc=True)
+        valid_timestamps = timestamps.notna()
+        working = working.loc[valid_timestamps].copy()
+        timestamps = timestamps.loc[valid_timestamps]
     if len(working) < 5:
         raise ValueError("At least five labeled rows are required for model comparison.")
     target = working.pop(target_column)
+    if split_column is not None:
+        working = working.drop(columns=[split_column])
+    if feature_columns is not None:
+        working = working.loc[:, feature_columns]
     for column_name in working.columns:
         if pd.api.types.is_datetime64_any_dtype(working[column_name]):
             working[column_name] = working[column_name].astype("int64") / 10**9
@@ -1541,23 +1633,51 @@ def compare_models(df, target_column, task="classification", metric=None, test_s
     if features.shape[1] == 0:
         raise ValueError("At least one usable feature is required for model comparison.")
 
+    if positive_label is not None:
+        if task != "classification":
+            raise ValueError("positive_label can only be used for classification.")
+        if positive_label not in target.unique():
+            raise ValueError("positive_label was not found in the target column.")
+
     stratify = None
     if task == "classification":
         class_counts = target.value_counts()
         test_rows = math.ceil(len(target) * test_size)
         train_rows = len(target) - test_rows
-        if class_counts.min() >= 2 and test_rows >= len(class_counts) and train_rows >= len(class_counts):
+        if (
+            split_column is None
+            and class_counts.min() >= 2
+            and test_rows >= len(class_counts)
+            and train_rows >= len(class_counts)
+        ):
             stratify = target
-    try:
-        train_features, test_features, train_target, test_target = train_test_split(
-            features,
-            target,
-            test_size=test_size,
-            random_state=42,
-            stratify=stratify,
-        )
-    except ValueError as error:
-        raise ValueError(f"Could not create a holdout split: {error}") from error
+    if split_column is not None:
+        sorted_indices = timestamps.sort_values(kind="mergesort").index
+        test_rows = math.ceil(len(sorted_indices) * test_size)
+        train_indices = sorted_indices[:-test_rows]
+        test_indices = sorted_indices[-test_rows:]
+        train_features = features.loc[train_indices]
+        test_features = features.loc[test_indices]
+        train_target = target.loc[train_indices]
+        test_target = target.loc[test_indices]
+        if task == "classification" and (
+            train_target.nunique() < 2 or test_target.nunique() < 2
+        ):
+            raise ValueError(
+                "Chronological validation requires both target classes in the "
+                "training and test partitions."
+            )
+    else:
+        try:
+            train_features, test_features, train_target, test_target = train_test_split(
+                features,
+                target,
+                test_size=test_size,
+                random_state=42,
+                stratify=stratify,
+            )
+        except ValueError as error:
+            raise ValueError(f"Could not create a holdout split: {error}") from error
 
     default_metric = "accuracy" if task == "classification" else "r2"
     chosen_metric = default_metric if metric is None else str(metric)
@@ -1578,19 +1698,33 @@ def compare_models(df, target_column, task="classification", metric=None, test_s
             fitted = model.fit(train_features, train_target)
             predictions = fitted.predict(test_features)
             metric_value = _metric_value(test_target, predictions, task, chosen_metric)
+            metrics = {
+                "accuracy": accuracy_score(test_target, predictions) if task == "classification" else None,
+                "precision_weighted": precision_recall_fscore_support(test_target, predictions, average="weighted", zero_division=0)[0] if task == "classification" else None,
+                "recall_weighted": precision_recall_fscore_support(test_target, predictions, average="weighted", zero_division=0)[1] if task == "classification" else None,
+                "f1_weighted": f1_score(test_target, predictions, average="weighted", zero_division=0) if task == "classification" else None,
+                "mae": mean_absolute_error(test_target, predictions) if task == "regression" else None,
+                "rmse": float(np.sqrt(mean_squared_error(test_target, predictions))) if task == "regression" else None,
+                "r2": r2_score(test_target, predictions) if task == "regression" else None,
+                chosen_metric: float(metric_value),
+            }
+            if positive_label is not None:
+                positive_metrics = precision_recall_fscore_support(
+                    test_target,
+                    predictions,
+                    average="binary",
+                    pos_label=positive_label,
+                    zero_division=0,
+                )
+                metrics.update({
+                    "failure_precision": float(positive_metrics[0]),
+                    "failure_recall": float(positive_metrics[1]),
+                    "failure_f1": float(positive_metrics[2]),
+                })
             model_results.append({
                 "model": name,
                 "score": float(metric_value),
-                "metrics": {
-                    "accuracy": accuracy_score(test_target, predictions) if task == "classification" else None,
-                    "precision_weighted": precision_recall_fscore_support(test_target, predictions, average="weighted", zero_division=0)[0] if task == "classification" else None,
-                    "recall_weighted": precision_recall_fscore_support(test_target, predictions, average="weighted", zero_division=0)[1] if task == "classification" else None,
-                    "f1_weighted": f1_score(test_target, predictions, average="weighted", zero_division=0) if task == "classification" else None,
-                    "mae": mean_absolute_error(test_target, predictions) if task == "regression" else None,
-                    "rmse": float(np.sqrt(mean_squared_error(test_target, predictions))) if task == "regression" else None,
-                    "r2": r2_score(test_target, predictions) if task == "regression" else None,
-                    chosen_metric: float(metric_value),
-                },
+                "metrics": metrics,
                 "feature_importance": _feature_importance_for_model(fitted, features.columns.tolist())[:10],
             })
         except Exception as error:
@@ -1619,6 +1753,12 @@ def compare_models(df, target_column, task="classification", metric=None, test_s
         "target": target_column,
         "metric": chosen_metric,
         "direction": direction,
+        "validation": {
+            "method": "chronological" if split_column is not None else "random_holdout",
+            "train_rows": int(len(train_target)),
+            "test_rows": int(len(test_target)),
+            "split_column": split_column,
+        },
         "model_failures": model_failures,
         "selected_model": best_entry["model"],
         "best_score": round(float(best_entry["score"]), 6),
@@ -1689,6 +1829,76 @@ def _advanced_feature_matrix(df, feature_columns=None, exclude_columns=()):
     return features
 
 
+def classify_columns(df):
+    """Classify every dataset column using dtype, value, cardinality, and name cues."""
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        raise ValueError("A non-empty dataframe is required.")
+
+    profile = []
+    identifier_name = re.compile(r"(?:^|_)(?:id|uuid|guid|key)(?:$|_)", re.IGNORECASE)
+    date_text = re.compile(
+        r"\d{4}[-/]\d{1,2}|\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|T\d{2}:",
+        re.IGNORECASE,
+    )
+    for column in df.columns:
+        series = df[column]
+        non_null = series.dropna()
+        distinct_count = int(non_null.nunique(dropna=True))
+        column_name = str(column)
+
+        if non_null.empty:
+            classification = "all_missing"
+        elif distinct_count <= 1:
+            classification = "constant"
+        elif pd.api.types.is_bool_dtype(series):
+            classification = "boolean"
+        elif pd.api.types.is_datetime64_any_dtype(series):
+            classification = "datetime"
+        elif identifier_name.search(column_name):
+            classification = "identifier"
+        elif pd.api.types.is_numeric_dtype(series):
+            classification = "numeric"
+        else:
+            text_values = non_null.astype("string").str.strip()
+            numeric_values = pd.to_numeric(text_values, errors="coerce")
+            date_like = text_values.str.contains(date_text, na=False).mean() >= 0.8
+            parsed_dates = (
+                pd.to_datetime(text_values, errors="coerce", utc=True)
+                if date_like
+                else pd.Series(dtype="datetime64[ns, UTC]")
+            )
+            if len(numeric_values) and numeric_values.notna().all():
+                classification = "numeric"
+            elif len(parsed_dates) and parsed_dates.notna().mean() >= 0.8:
+                classification = "datetime"
+            elif distinct_count >= 20 and distinct_count / len(non_null) >= 0.5:
+                classification = "high_cardinality_categorical"
+            else:
+                classification = "categorical"
+
+        profile.append({
+            "column": column_name,
+            "pandas_dtype": str(series.dtype),
+            "classification": classification,
+            "rows": int(len(series)),
+            "non_null": int(len(non_null)),
+            "missing": int(series.isna().sum()),
+            "distinct": distinct_count,
+        })
+
+    counts = pd.Series(
+        [column["classification"] for column in profile]
+    ).value_counts().sort_index()
+    return {
+        "analysis": "column_classification",
+        "rows": int(len(df)),
+        "columns": profile,
+        "classification_counts": {
+            str(name): int(count) for name, count in counts.items()
+        },
+    }
+
+
 def _json_safe_value(value):
     if value is None or value is pd.NA:
         return None
@@ -1703,32 +1913,67 @@ def _json_safe_value(value):
 
 def analyze_clusters(df, n_clusters=3, feature_columns=None):
     """Cluster rows and report assignments, cluster sizes, and separation quality."""
-    if isinstance(n_clusters, bool):
-        raise ValueError("n_clusters must be an integer of at least 2.")
-    try:
-        n_clusters = int(n_clusters)
-    except (TypeError, ValueError) as error:
-        raise ValueError("n_clusters must be an integer of at least 2.") from error
-    if n_clusters < 2:
-        raise ValueError("n_clusters must be at least 2.")
-    if len(df) <= n_clusters:
-        raise ValueError("n_clusters must be smaller than the number of rows.")
-
     features = _advanced_feature_matrix(df, feature_columns=feature_columns)
     scaler = StandardScaler()
     scaled_features = scaler.fit_transform(features)
+    automatic = isinstance(n_clusters, str) and n_clusters.strip().lower() == "auto"
+    if isinstance(n_clusters, bool):
+        raise ValueError("n_clusters must be an integer of at least 2 or 'auto'.")
+    if automatic:
+        if len(df) < 3:
+            raise ValueError("Automatic clustering requires at least three rows.")
+        candidate_counts = range(2, min(10, len(df) - 1) + 1)
+    else:
+        try:
+            n_clusters = int(n_clusters)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                "n_clusters must be an integer of at least 2 or 'auto'."
+            ) from error
+        if n_clusters < 2:
+            raise ValueError("n_clusters must be at least 2.")
+        if len(df) <= n_clusters:
+            raise ValueError("n_clusters must be smaller than the number of rows.")
+        candidate_counts = (n_clusters,)
+
+    scored_candidates = []
+    selected_count = None
+    selected_score = None
+    for candidate_count in candidate_counts:
+        candidate_model = KMeans(
+            n_clusters=candidate_count,
+            n_init=10,
+            random_state=42,
+        )
+        candidate_labels = candidate_model.fit_predict(scaled_features)
+        candidate_label_count = len(np.unique(candidate_labels))
+        score = None
+        if 1 < candidate_label_count < len(candidate_labels):
+            score = float(silhouette_score(
+                scaled_features,
+                candidate_labels,
+                sample_size=min(2000, len(candidate_labels)),
+                random_state=42,
+            ))
+            if selected_score is None or score > selected_score:
+                selected_count = candidate_count
+                selected_score = score
+        scored_candidates.append({
+            "n_clusters": candidate_count,
+            "silhouette_score": round(score, 6) if score is not None else None,
+        })
+
+    if automatic and selected_count is None:
+        raise ValueError("Automatic clustering could not find a valid silhouette score.")
+
+    n_clusters = selected_count if automatic else n_clusters
     model = KMeans(n_clusters=n_clusters, n_init=10, random_state=42)
     labels = model.fit_predict(scaled_features)
     cluster_counts = pd.Series(labels).value_counts().sort_index()
 
-    score = None
-    if 1 < len(cluster_counts) < len(labels):
-        score = float(silhouette_score(
-            scaled_features,
-            labels,
-            sample_size=min(2000, len(labels)),
-            random_state=42,
-        ))
+    score = selected_score
+    if not automatic:
+        score = scored_candidates[0]["silhouette_score"]
 
     centers = scaler.inverse_transform(model.cluster_centers_)
     cluster_summaries = []
@@ -1761,9 +2006,14 @@ def analyze_clusters(df, n_clusters=3, feature_columns=None):
         "rows": int(len(df)),
         "feature_count": int(features.shape[1]),
         "features": [str(column) for column in features.columns],
-        "requested_clusters": n_clusters,
+        "requested_clusters": "auto" if automatic else n_clusters,
+        "selected_clusters": int(n_clusters),
         "actual_clusters": int(len(cluster_counts)),
         "silhouette_score": round(score, 6) if score is not None else None,
+        "cluster_selection": {
+            "method": "silhouette" if automatic else "user_specified",
+            "candidates": scored_candidates if automatic else [],
+        },
         "clusters": cluster_summaries,
         "assignments": assignments,
         "assignments_truncated": len(df) > len(assignments),
@@ -1846,6 +2096,95 @@ def analyze_predictive_maintenance(
         "Model rankings estimate predictive performance on a held-out sample; "
         "validate against time-based splits before operational use."
     )
+    return comparison
+
+
+def analyze_pipeline_failure_prediction(
+    df,
+    target_column,
+    feature_columns=None,
+    timestamp_column=None,
+    failure_value=None,
+    test_size=0.2,
+    model_names=None,
+):
+    """Evaluate binary pipeline-failure prediction with optional time-ordered validation."""
+    if not isinstance(df, pd.DataFrame) or target_column not in df.columns:
+        raise ValueError(f"Target column '{target_column}' was not found in the dataset.")
+    if timestamp_column is not None and timestamp_column not in df.columns:
+        raise ValueError(
+            f"Timestamp column '{timestamp_column}' was not found in the dataset."
+        )
+
+    target_values = df[target_column].dropna().unique().tolist()
+    if len(target_values) != 2:
+        raise ValueError("Pipeline failure prediction requires a binary target column.")
+    if failure_value is None:
+        failure_tokens = {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "failed",
+            "failure",
+            "error",
+            "crashed",
+        }
+        failure_value = next(
+            (
+                value
+                for value in target_values
+                if str(_json_safe_value(value)).strip().lower() in failure_tokens
+            ),
+            None,
+        )
+        if failure_value is None:
+            raise ValueError(
+                "Could not infer the failure label; provide failure_value explicitly."
+            )
+    else:
+        if isinstance(failure_value, (dict, list)):
+            raise ValueError("failure_value must be a scalar target value.")
+        try:
+            failure_value_found = any(
+                bool(value == failure_value) for value in target_values
+            )
+        except (TypeError, ValueError):
+            failure_value_found = False
+        if not failure_value_found:
+            raise ValueError("failure_value must match one of the target column's classes.")
+
+    comparison = compare_models(
+        df,
+        target_column,
+        task="classification",
+        metric="f1_macro",
+        test_size=test_size,
+        model_names=model_names,
+        feature_columns=feature_columns,
+        split_column=timestamp_column,
+        positive_label=failure_value,
+    )
+    selected_model = next(
+        model
+        for model in comparison["models"]
+        if model["model"] == comparison["selected_model"]
+    )
+    comparison.update({
+        "analysis": "pipeline_failure_prediction",
+        "failure_class": _json_safe_value(failure_value),
+        "failure_rate": round(
+            float((df[target_column] == failure_value).mean()), 6
+        ),
+        "failure_metrics": {
+            key: selected_model["metrics"][key]
+            for key in ("failure_precision", "failure_recall", "failure_f1")
+        },
+        "interpretation": (
+            "This is a supervised estimate based on labeled historical runs, not "
+            "a live failure guarantee. Use representative data and monitor drift."
+        ),
+    })
     return comparison
 
 

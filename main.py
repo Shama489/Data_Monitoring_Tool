@@ -26,11 +26,13 @@ from api_runtime import (
 from profiler import (
     analyze_clusters,
     analyze_dataset_drift,
+    analyze_pipeline_failure_prediction,
     analyze_predictive_maintenance,
     analyze_trends,
     answer_monitoring_question,
     calculate_data_quality_score,
     check_data_quality,
+    classify_columns,
     compare_models,
     detect_fraud_patterns,
     forecast_data_health,
@@ -1897,18 +1899,22 @@ def advanced_ml_endpoint(payload: dict[str, Any]):
         _bad_request("Dataset is required.")
     if analysis not in {
         "clustering",
+        "column_classification",
         "fraud_detection",
+        "pipeline_failure_prediction",
         "predictive_maintenance",
         "recommendation",
     }:
         _bad_request(
-            "analysis must be clustering, fraud_detection, "
-            "predictive_maintenance, or recommendation."
+            "analysis must be clustering, column_classification, fraud_detection, "
+            "pipeline_failure_prediction, predictive_maintenance, or recommendation."
         )
 
     try:
         frame = pd.DataFrame(dataset)
-        if analysis == "clustering":
+        if analysis == "column_classification":
+            report = classify_columns(frame)
+        elif analysis == "clustering":
             report = analyze_clusters(
                 frame,
                 payload.get("n_clusters", 3),
@@ -1919,6 +1925,19 @@ def advanced_ml_endpoint(payload: dict[str, Any]):
                 frame,
                 payload.get("feature_columns"),
                 payload.get("contamination", 0.05),
+            )
+        elif analysis == "pipeline_failure_prediction":
+            target_column = payload.get("target_column")
+            if not isinstance(target_column, str) or not target_column:
+                _bad_request("target_column is required for pipeline failure prediction.")
+            report = analyze_pipeline_failure_prediction(
+                frame,
+                target_column,
+                payload.get("feature_columns"),
+                payload.get("timestamp_column"),
+                payload.get("failure_value"),
+                payload.get("test_size", 0.2),
+                payload.get("model_names"),
             )
         elif analysis == "predictive_maintenance":
             target_column = payload.get("target_column")
