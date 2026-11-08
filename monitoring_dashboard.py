@@ -224,6 +224,18 @@ def _run_monitoring(
         return False
     st.session_state["dashboard_latest_run_id"] = result["result_id"]
     st.success(f"Monitoring completed · result `{result['result_id']}`")
+    agent = result.get("agent")
+    st.session_state["dashboard_latest_agent_summary"] = (
+        agent.get("answer") if isinstance(agent, dict) else None
+    )
+    if isinstance(agent, dict):
+        answer = agent.get("answer")
+        if isinstance(answer, str) and answer:
+            st.info(answer)
+        if agent.get("mode") == "deterministic_fallback":
+            st.warning(
+                "OpenAI agent planning was unavailable; approved deterministic checks were used."
+            )
     return True
 
 
@@ -2375,6 +2387,9 @@ def _render_monitoring_run(
     selected_dataset_id: str | None,
 ) -> None:
     st.subheader("Run monitoring")
+    latest_agent_summary = st.session_state.get("dashboard_latest_agent_summary")
+    if isinstance(latest_agent_summary, str) and latest_agent_summary:
+        st.info(latest_agent_summary)
     if role == "viewer":
         st.info("Viewer access is read-only. An analyst or administrator can start monitoring runs.")
         return
@@ -2398,24 +2413,41 @@ def _render_monitoring_run(
     if payload is None:
         return
     all_labels = {f"{item['name']} · {item['id']}": item for item in datasets}
+    agentic = st.checkbox(
+        "Enable LLM-directed monitoring",
+        value=False,
+        help=(
+            "Opt in to send your question to OpenAI for tool selection. Dataset records and "
+            "analysis results are not sent to OpenAI; tool results are summarized locally. "
+            "The separate OpenAI quality-summary option sends aggregate quality metrics."
+        ),
+        key="run-monitoring-agentic",
+    )
+    if agentic:
+        checks = []
+        st.caption(
+            "The agent selects approved quality, missing-value, anomaly, drift, history, "
+            "and profiling tools from your question."
+        )
+    else:
+        checks = st.multiselect(
+            "Monitoring checks",
+            ["quality", "drift", "anomalies", "forecast", "explain"],
+            default=["quality", "anomalies"],
+            key="run-monitoring-checks",
+        )
     baseline_labels = [
         label for label, item in all_labels.items() if item["id"] != dataset["id"]
     ]
-    checks = st.multiselect(
-        "Monitoring checks",
-        ["quality", "drift", "anomalies", "forecast", "explain"],
-        default=["quality", "anomalies"],
-        key="run-monitoring-checks",
-    )
     baseline = None
-    if "drift" in checks:
+    if agentic or "drift" in checks:
         if baseline_labels:
             baseline = st.selectbox("Baseline dataset", baseline_labels, key="run-drift-baseline")
-        else:
+        elif "drift" in checks:
             st.warning("A second saved dataset is required for drift analysis.")
     date_column = None
     value_column = None
-    if "forecast" in checks:
+    if not agentic and "forecast" in checks:
         date_columns = _date_columns(frame)
         numeric_columns = [str(item) for item in frame.select_dtypes(include="number").columns]
         if not date_columns:
@@ -2424,11 +2456,18 @@ def _render_monitoring_run(
             date_column = st.selectbox("Forecast date/time column", date_columns)
             value_column = st.selectbox("Forecast metric", ["Row volume"] + numeric_columns)
     target_column = None
-    if "explain" in checks and not frame.empty:
+    if not agentic and "explain" in checks and not frame.empty:
         target_column = st.selectbox("Explainability target column", list(frame.columns))
     notify = st.checkbox("Send configured alerts when findings are detected", value=False)
+    agent_question = ""
+    if agentic:
+        agent_question = st.text_input(
+            "What should the monitoring agent investigate?",
+            placeholder="Check data quality, missing values, anomalies, and today's history",
+            key="run-monitoring-agent-question",
+        )
     use_llm = False
-    if "quality" in checks:
+    if "quality" in checks or agentic:
         use_llm = st.checkbox(
             "Use an OpenAI-generated quality summary",
             value=False,
@@ -2438,7 +2477,12 @@ def _render_monitoring_run(
             ),
             key="run-monitoring-use-llm",
         )
-    if st.button("Run selected checks", type="primary", disabled=not checks, key="run-monitoring"):
+    if st.button(
+        "Run selected checks",
+        type="primary",
+        disabled=not checks and not agentic,
+        key="run-monitoring",
+    ):
         if "drift" in checks and baseline is None:
             st.error("Select a baseline dataset before running drift analysis.")
             return
@@ -2448,12 +2492,19 @@ def _render_monitoring_run(
         if "explain" in checks and target_column is None:
             st.error("Select a target column for explainability.")
             return
+        if agentic and not agent_question.strip():
+            st.error("Enter a question for the monitoring agent.")
+            return
         request_payload: dict[str, Any] = {
             "dataset_id": dataset["id"],
-            "checks": checks,
             "notify": notify,
             "use_llm": use_llm,
+            "agentic": agentic,
         }
+        if agentic:
+            request_payload["question"] = agent_question.strip()
+        else:
+            request_payload["checks"] = checks
         if baseline:
             request_payload["baseline_dataset_id"] = all_labels[baseline]["id"]
         if "forecast" in checks:

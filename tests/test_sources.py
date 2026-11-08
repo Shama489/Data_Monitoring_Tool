@@ -649,7 +649,7 @@ def test_assistant_does_not_substitute_snapshot_when_date_has_no_quality_run():
     response = client.post(
         "/api/assistant/ask",
         json={
-            "question": "What is today's quality score?",
+            "question": "What is the quality score for this date?",
             "dataset_id": dataset_id,
             "monitoring_date": requested_date,
             "data": [{"value": 1}, {"value": 2}],
