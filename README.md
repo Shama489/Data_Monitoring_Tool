@@ -109,6 +109,9 @@ selected dataset and date; the API resolves the score from that dataset's
 persisted quality-monitoring history and identifies the date, dataset, and
 result used. If no quality run exists for that date, the assistant reports that
 the score is unavailable rather than substituting the current saved snapshot.
+Questions that explicitly ask for "today" use the current server date even if
+another date is selected in the dashboard. The assistant returns the latest
+completed quality run for that dataset on that date and never starts a run.
 
 When running a quality check from the dashboard, enable **Use an OpenAI-generated
 quality summary** to opt in to the OpenAI summary path. It requires
@@ -507,7 +510,7 @@ Quality endpoints accept optional `use_llm: true` to request an OpenAI quality s
 
 ## Agentic Monitoring Workflow
 
-`POST /api/monitoring/analyze` orchestrates the existing deterministic monitoring functions through a tool registry. It accepts inline records (`data`, `dataset`, or `records`) or a single configured `source`; a `baseline` enables drift analysis automatically. Use `checks` to select `quality`, `drift`, `forecast`, and/or `explain`. Drift requires a baseline, while forecast and explain require `date_column` and `target_column`, respectively. The current dataset may be supplied as `current`.
+`POST /api/monitoring/analyze` orchestrates approved monitoring functions through a tool registry. It accepts inline records (`data`, `dataset`, or `records`) or a single configured `source`; a `baseline` enables drift analysis in deterministic mode. Use `checks` to select `quality`, `drift`, `anomalies`, `forecast`, and/or `explain`. Drift requires a baseline, while forecast and explain require `date_column` and `target_column`, respectively. The current dataset may be supplied as `current`.
 
 ```json
 {
@@ -518,7 +521,9 @@ Quality endpoints accept optional `use_llm: true` to request an OpenAI quality s
 }
 ```
 
-The response includes the selected checks, executed tool trace, quality and drift results, and root-cause findings with evidence taken from those results. Notifications are sent only when `notify` is `true` and findings exist; provide `channels` to choose recipients. `GET /api/monitoring/tools` lists the registered deterministic tools. The workflow planner uses explicit request fields and rules; it does not require an LLM, and `use_llm` only opts into the existing quality-summary feature.
+The response includes the selected checks, executed tool trace, results, and root-cause findings with evidence taken from those results. Notifications remain disabled unless `notify` is explicitly `true` and findings exist; provide `channels` to choose recipients. `GET /api/monitoring/tools` lists the registered tools.
+
+Deterministic planning is the default and does not require OpenAI credentials. To opt in to query-directed planning, send `agentic: true` and a non-empty `question`. The LLM can select up to five approved tools for quality, missing values, anomalies, drift (when a baseline is supplied), dataset profiling, and owner-scoped monitoring history. Tool names and arguments are validated; arbitrary Python, SQL, and notification tools are not available to the LLM. The API records each selected tool and its status in the persisted tool trace without logging arguments. The planner receives the question and tool descriptions only; dataset rows and tool outputs remain in the API. The final answer is assembled locally from actual tool results. If OpenAI is unavailable or planning fails, the API reports the fallback and uses deterministic query matching. `use_llm` remains a separate opt-in for OpenAI quality summaries and sends aggregate quality metrics.
 
 ## Enterprise Source Monitoring
 

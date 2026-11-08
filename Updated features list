@@ -30,6 +30,8 @@
 - Load data from local files, SQL databases, PostgreSQL, MySQL, MongoDB, S3, Dropbox, Google Drive, and allowlisted HTTPS JSON APIs when provider configuration is available.
 - Check source capabilities and analyze multiple sources through the API.
 - Run configurable monitoring workflows for quality, drift, forecasting, and explanations, with tool traces and evidence-based findings.
+- Opt in to bounded, OpenAI-directed monitoring across quality, missing values, anomalies, drift, profiling, and owner-scoped history; deterministic execution remains the default.
+- Validate agent tool calls, cap each request at five calls, keep notifications explicitly user-confirmed, and fall back to deterministic query matching when the LLM is unavailable.
 - Ask questions about a selected dataset through the monitoring assistant.
 
 ## Monitoring, history, and reports
@@ -47,6 +49,7 @@
 - Use the FastAPI service and interactive API documentation for authenticated monitoring and dataset operations.
 - Explore quality, anomalies, drift, trends and forecasts, explanations, runs, schedules, reports, alerts, comparisons, lineage, and history in the Streamlit dashboards.
 - Use the voice assistant for typed questions or browser speech input, with spoken answers when browser support is available.
+- Resolve questions about "today" against the latest completed quality run for the current date; report when no run exists without starting one.
 - Set per-account dashboard language (English, Spanish, French, or Hindi), theme, and overview metric widgets; the dashboard adapts to narrow screens.
 - Authenticate with bearer tokens and use admin, analyst, or viewer roles with owner-scoped dataset and result access.
 - Protect stored datasets and results with encryption at rest; use password hashing, request-size limits, rate limiting, and admin audit access.

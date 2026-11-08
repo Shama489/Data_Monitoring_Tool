@@ -556,6 +556,11 @@ def assistant_ask_endpoint(payload: dict[str, Any]):
 
     dataset_id = payload.get("dataset_id")
     monitoring_date = payload.get("monitoring_date", date.today().isoformat())
+    normalized_question = question.casefold()
+    asks_for_today = any(
+        phrase in normalized_question
+        for phrase in ("today", "hoy", "aujourd'hui", "aujourd’hui", "आज")
+    )
     dataset = None
     monitoring_results = None
     historical_result = None
@@ -571,6 +576,8 @@ def assistant_ask_endpoint(payload: dict[str, Any]):
             _bad_request("monitoring_date must be an ISO date")
         if selected_date.isoformat() != monitoring_date:
             _bad_request("monitoring_date must be an ISO date")
+        if asks_for_today:
+            selected_date = date.today()
 
         dataset = get_dataset(dataset_id, owner_id=current_user_scope())
         if dataset is None:
