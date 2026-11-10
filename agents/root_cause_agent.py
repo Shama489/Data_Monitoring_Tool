@@ -12,6 +12,35 @@ def _as_int(value: Any, default: int = 0) -> int:
         return default
 
 
+def _recommendation_priority(finding: dict[str, Any]) -> tuple[str, int]:
+    signal = finding.get("signal")
+    severity_by_signal = {
+        "schema_mismatch": "high",
+        "stale_data": "high",
+        "business_rule_violations": "high",
+        "anomaly_spike": "high",
+        "missing_values": "medium",
+        "duplicate_rows": "medium",
+        "forecast_shift": "medium",
+        "feature_dominance": "low",
+    }
+    if signal == "distribution_drift":
+        evidence = _as_dict(finding.get("evidence"))
+        severity = str(evidence.get("overall_severity", "medium")).lower()
+        if severity not in {"critical", "high", "medium", "low"}:
+            severity = "medium"
+    else:
+        severity = severity_by_signal.get(signal, "low")
+
+    priority_score = {
+        "critical": 100,
+        "high": 75,
+        "medium": 50,
+        "low": 25,
+    }[severity]
+    return severity, priority_score
+
+
 def investigate(results: dict[str, Any]) -> dict[str, Any]:
     findings = []
     quality = _as_dict(results.get("quality"))
@@ -31,6 +60,18 @@ def investigate(results: dict[str, Any]) -> dict[str, Any]:
             },
             "recommended_investigation": "Inspect the affected columns and the latest ingestion or transformation step.",
         })
+    else:
+        missing_values = _as_dict(results.get("missing_values"))
+        total_nulls = _as_int(missing_values.get("total"), 0)
+        if total_nulls:
+            findings.append({
+                "signal": "missing_values",
+                "evidence": {
+                    "total_nulls": total_nulls,
+                    "by_column": _as_dict(missing_values.get("by_column")),
+                },
+                "recommended_investigation": "Inspect the affected columns and the latest ingestion or transformation step.",
+            })
 
     duplicates = _as_int(quality_report.get("duplicates"), 0)
     if duplicates:
@@ -161,9 +202,22 @@ def investigate(results: dict[str, Any]) -> dict[str, Any]:
         if signal and signal not in likely_causes:
             likely_causes.append(signal)
 
+    recommendations = []
+    for finding in findings:
+        severity, priority_score = _recommendation_priority(finding)
+        recommendations.append({
+            "signal": finding["signal"],
+            "priority": severity,
+            "priority_score": priority_score,
+            "action": finding["recommended_investigation"],
+            "evidence": finding["evidence"],
+        })
+    recommendations.sort(key=lambda item: -item["priority_score"])
+
     return {
         "status": "attention_required" if findings else "healthy",
         "findings": findings,
+        "recommendations": recommendations,
         "likely_causes": likely_causes,
         "basis": "Findings and evidence are derived only from deterministic monitoring tool outputs.",
     }

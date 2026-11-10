@@ -87,6 +87,10 @@ use. Available management endpoints include:
 Monitoring workflows automatically persist their input datasets and result.
 Saved datasets can be monitored again by passing their `dataset_id` to
 `POST /api/monitoring/analyze`.
+Each monitoring response includes deterministic, cross-module recommendations
+under `root_cause.recommendations`, ordered by priority score and carrying the
+finding signal, severity, evidence, and suggested investigation. The same
+prioritized actions are included in generated PDF, Excel, and PowerPoint reports.
 
 Generate encrypted, owner-scoped PDF, Excel (`xlsx`), and PowerPoint (`pptx`)
 reports from a saved result with `POST /api/reports`, passing `result_id` and
@@ -145,6 +149,27 @@ are scoped to the dataset owner; analysts can create versions of their own
 datasets, while viewers have read-only access. The dashboard's **Lineage &
 versions** tab supports history inspection, side-by-side comparisons, and
 version creation.
+
+## ETL pipeline observability
+
+External orchestrators can report runs to authenticated
+`POST /api/pipelines/runs`. Send a stable `run_id`, `pipeline`, `job`, and
+provider-specific `status`; updates with the same run ID replace that user's
+current run record. Include `started_at` and `finished_at` as Unix timestamps
+or ISO-8601 datetimes, and `records_processed` to report elapsed latency and
+records-per-second throughput. Optional `dataset_id` links a run to an owned
+dataset, and `details` can carry JSON-compatible provider metadata. Status
+values are retained as supplied so external job systems can use their own
+states.
+
+Use `GET /api/pipelines/runs` to inspect recent runs, with optional `pipeline`
+and `status` filters and `limit`/`offset` pagination. Each run includes its
+duration and throughput when the timestamps and record count are available;
+the response summary aggregates latency, processed rows, throughput, and
+failed/error/cancelled runs for the returned page. Pipeline runs are scoped to
+the reporting account. The built-in scheduler also records each scheduled
+monitoring execution, including success/failure status, latency, and source
+row counts when a source refresh is configured.
 
 ## Real-time and scheduled monitoring
 
@@ -254,11 +279,12 @@ Authenticated analysts can submit specialized workflows to
 `POST /api/analytics/advanced-ml`. Every successful analysis persists its input
 dataset and report. Set `analysis` to one of:
 
-- `clustering`: K-means segments rows; supports `n_clusters` and optional
-  `feature_columns`, and reports cluster profiles, row assignments, and a
-  sampled silhouette score. Set `n_clusters` to `"auto"` to evaluate k=2
-  through min(10, rows-1) and select the valid clustering with the best
-  silhouette score.
+- `clustering`: supports K-means (`algorithm: "kmeans"`), agglomerative
+  clustering (`"agglomerative"`), and Gaussian mixtures (`"gaussian_mixture"`).
+  It accepts `n_clusters` and optional `feature_columns`, and reports cluster
+  profiles, row assignments, and a sampled silhouette score. Set `n_clusters`
+  to `"auto"` to evaluate k=2 through min(10, rows-1) for the selected
+  algorithm and choose the valid clustering with the best silhouette score.
 - `column_classification`: classifies every column as numeric, boolean,
   datetime, categorical, high-cardinality categorical, identifier, constant,
   or all-missing, and reports type, missing, and distinct-value counts.

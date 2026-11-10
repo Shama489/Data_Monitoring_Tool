@@ -34,7 +34,8 @@ from sklearn.metrics import (
     r2_score,
     silhouette_score,
 )
-from sklearn.cluster import KMeans
+from sklearn.cluster import AgglomerativeClustering, KMeans
+from sklearn.mixture import GaussianMixture
 from sklearn.model_selection import train_test_split
 from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
 from sklearn.metrics.pairwise import cosine_similarity
@@ -1911,8 +1912,14 @@ def _json_safe_value(value):
     return value
 
 
-def analyze_clusters(df, n_clusters=3, feature_columns=None):
+def analyze_clusters(df, n_clusters=3, feature_columns=None, algorithm="kmeans"):
     """Cluster rows and report assignments, cluster sizes, and separation quality."""
+    algorithm = str(algorithm).strip().lower().replace("-", "_")
+    if algorithm not in {"kmeans", "agglomerative", "gaussian_mixture"}:
+        raise ValueError(
+            "algorithm must be kmeans, agglomerative, or gaussian_mixture."
+        )
+
     features = _advanced_feature_matrix(df, feature_columns=feature_columns)
     scaler = StandardScaler()
     scaled_features = scaler.fit_transform(features)
@@ -1936,16 +1943,33 @@ def analyze_clusters(df, n_clusters=3, feature_columns=None):
             raise ValueError("n_clusters must be smaller than the number of rows.")
         candidate_counts = (n_clusters,)
 
+    def fit_labels(cluster_count):
+        if algorithm == "kmeans":
+            model = KMeans(
+                n_clusters=cluster_count,
+                n_init=10,
+                random_state=42,
+            )
+            labels = model.fit_predict(scaled_features)
+        elif algorithm == "agglomerative":
+            model = AgglomerativeClustering(n_clusters=cluster_count)
+            labels = model.fit_predict(scaled_features)
+        else:
+            model = GaussianMixture(
+                n_components=cluster_count,
+                n_init=3,
+                random_state=42,
+                reg_covar=1e-6,
+            )
+            model.fit(scaled_features)
+            labels = model.predict(scaled_features)
+        return model, labels
+
     scored_candidates = []
     selected_count = None
     selected_score = None
     for candidate_count in candidate_counts:
-        candidate_model = KMeans(
-            n_clusters=candidate_count,
-            n_init=10,
-            random_state=42,
-        )
-        candidate_labels = candidate_model.fit_predict(scaled_features)
+        _, candidate_labels = fit_labels(candidate_count)
         candidate_label_count = len(np.unique(candidate_labels))
         score = None
         if 1 < candidate_label_count < len(candidate_labels):
@@ -1965,20 +1989,23 @@ def analyze_clusters(df, n_clusters=3, feature_columns=None):
 
     if automatic and selected_count is None:
         raise ValueError("Automatic clustering could not find a valid silhouette score.")
-
     n_clusters = selected_count if automatic else n_clusters
-    model = KMeans(n_clusters=n_clusters, n_init=10, random_state=42)
-    labels = model.fit_predict(scaled_features)
+    _, labels = fit_labels(n_clusters)
     cluster_counts = pd.Series(labels).value_counts().sort_index()
 
     score = selected_score
     if not automatic:
         score = scored_candidates[0]["silhouette_score"]
 
-    centers = scaler.inverse_transform(model.cluster_centers_)
+    cluster_ids = [int(cluster_id) for cluster_id in cluster_counts.index]
+    scaled_centers = np.vstack([
+        scaled_features[np.asarray(labels) == cluster_id].mean(axis=0)
+        for cluster_id in cluster_ids
+    ])
+    centers = scaler.inverse_transform(scaled_centers)
     cluster_summaries = []
-    for cluster_id, count in cluster_counts.items():
-        center = centers[cluster_id]
+    for cluster_position, (cluster_id, count) in enumerate(cluster_counts.items()):
+        center = centers[cluster_position]
         representative_features = sorted(
             zip(features.columns, center),
             key=lambda item: abs(float(item[1])),
@@ -2003,6 +2030,7 @@ def analyze_clusters(df, n_clusters=3, feature_columns=None):
     ]
     return {
         "analysis": "clustering",
+        "algorithm": algorithm,
         "rows": int(len(df)),
         "feature_count": int(features.shape[1]),
         "features": [str(column) for column in features.columns],
@@ -2012,6 +2040,7 @@ def analyze_clusters(df, n_clusters=3, feature_columns=None):
         "silhouette_score": round(score, 6) if score is not None else None,
         "cluster_selection": {
             "method": "silhouette" if automatic else "user_specified",
+            "algorithm": algorithm,
             "candidates": scored_candidates if automatic else [],
         },
         "clusters": cluster_summaries,

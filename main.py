@@ -5,7 +5,7 @@ import math
 import os
 import time
 from contextlib import asynccontextmanager, suppress
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlsplit
@@ -81,10 +81,12 @@ from monitoring_store import (
     list_monitoring_reports,
     list_monitoring_results,
     list_monitoring_schedules,
+    list_pipeline_runs,
     list_users,
     login_retry_after,
     open_database,
     persist_monitoring_run,
+    record_pipeline_run,
     record_lineage_event,
     record_login_failure,
     save_dataset,
@@ -161,6 +163,28 @@ async def request_metrics_middleware(request: Request, call_next):
 
 def _bad_request(message: str) -> None:
     raise HTTPException(status_code=400, detail=message)
+
+
+def _pipeline_timestamp(value: Any, field: str) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        _bad_request(f"{field} must be a Unix timestamp or ISO-8601 datetime")
+    if isinstance(value, (int, float)):
+        timestamp = float(value)
+    elif isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            _bad_request(f"{field} must be a Unix timestamp or ISO-8601 datetime")
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        timestamp = parsed.timestamp()
+    else:
+        _bad_request(f"{field} must be a Unix timestamp or ISO-8601 datetime")
+    if not math.isfinite(timestamp):
+        _bad_request(f"{field} must be a finite timestamp")
+    return timestamp
 
 
 def _quality_options(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1088,6 +1112,119 @@ def get_dataset_lineage_endpoint(dataset_id: str):
     return lineage
 
 
+@app.post("/api/pipelines/runs", status_code=201)
+def record_pipeline_run_endpoint(payload: dict[str, Any]):
+    required_fields = ("run_id", "pipeline", "job", "status")
+    for field in required_fields:
+        value = payload.get(field)
+        if not isinstance(value, str) or not value.strip() or len(value) > 255:
+            _bad_request(f"{field} must be a non-empty string of at most 255 characters")
+
+    started_at = _pipeline_timestamp(payload.get("started_at"), "started_at")
+    finished_at = _pipeline_timestamp(payload.get("finished_at"), "finished_at")
+    if (
+        started_at is not None
+        and finished_at is not None
+        and finished_at < started_at
+    ):
+        _bad_request("finished_at must not be earlier than started_at")
+
+    records_processed = payload.get("records_processed")
+    if records_processed is not None and (
+        isinstance(records_processed, bool)
+        or not isinstance(records_processed, int)
+        or records_processed < 0
+    ):
+        _bad_request("records_processed must be a non-negative integer")
+    status = payload["status"].strip()
+    if len(status) > 64:
+        _bad_request("status must not exceed 64 characters")
+
+    details = payload.get("details")
+    if details is not None and not isinstance(details, dict):
+        _bad_request("details must be an object")
+    if details is not None:
+        try:
+            json.dumps(details, allow_nan=False)
+        except (TypeError, ValueError):
+            _bad_request("details must contain only JSON-compatible values")
+
+    dataset_id = payload.get("dataset_id")
+    if dataset_id is not None:
+        if not isinstance(dataset_id, str) or not dataset_id:
+            _bad_request("dataset_id must be a non-empty string")
+        if get_dataset(dataset_id, owner_id=current_user_scope()) is None:
+            raise HTTPException(status_code=404, detail="Dataset was not found")
+
+    try:
+        return record_pipeline_run(
+            run_id=payload["run_id"].strip(),
+            pipeline=payload["pipeline"].strip(),
+            job=payload["job"].strip(),
+            status=status,
+            owner_id=current_user_id(),
+            started_at=started_at,
+            finished_at=finished_at,
+            records_processed=records_processed,
+            details=details,
+            dataset_id=dataset_id,
+        )
+    except ValueError as error:
+        _bad_request(str(error))
+
+
+@app.get("/api/pipelines/runs")
+def list_pipeline_runs_endpoint(
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    pipeline: str | None = None,
+    status: str | None = None,
+):
+    runs = list_pipeline_runs(
+        limit=limit,
+        offset=offset,
+        pipeline=pipeline,
+        status=status,
+        owner_id=current_user_scope(),
+    )
+    completed_runs = [
+        run for run in runs if run["duration_seconds"] is not None
+    ]
+    records_processed = sum(
+        run["records_processed"] or 0
+        for run in completed_runs
+    )
+    elapsed_seconds = sum(
+        run["duration_seconds"] or 0
+        for run in completed_runs
+    )
+    return {
+        "runs": runs,
+        "summary": {
+            "runs": len(runs),
+            "failed_runs": sum(
+                run["status"].lower() in {"failed", "error", "cancelled"}
+                for run in runs
+            ),
+            "average_latency_seconds": (
+                round(
+                    sum(run["duration_seconds"] for run in completed_runs)
+                    / len(completed_runs),
+                    6,
+                )
+                if completed_runs
+                else None
+            ),
+            "records_processed": records_processed,
+            "throughput_records_per_second": (
+                round(records_processed / elapsed_seconds, 6)
+                if elapsed_seconds > 0
+                else None
+            ),
+        },
+    }
+
+
 @app.get("/api/datasets/{dataset_id}")
 def get_dataset_endpoint(dataset_id: str):
     dataset = get_dataset(dataset_id, owner_id=current_user_scope())
@@ -1926,6 +2063,7 @@ def advanced_ml_endpoint(payload: dict[str, Any]):
                 frame,
                 payload.get("n_clusters", 3),
                 payload.get("feature_columns"),
+                algorithm=payload.get("algorithm", "kmeans"),
             )
         elif analysis == "fraud_detection":
             report = detect_fraud_patterns(
