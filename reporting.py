@@ -67,6 +67,9 @@ def _summary(result: dict[str, Any]) -> dict[str, Any]:
     findings = root_cause.get("findings", [])
     if not isinstance(findings, list):
         findings = []
+    recommendations = root_cause.get("recommendations", [])
+    if not isinstance(recommendations, list):
+        recommendations = []
     notifications = monitoring.get("notifications", {})
     if not isinstance(notifications, dict):
         notifications = {}
@@ -81,6 +84,9 @@ def _summary(result: dict[str, Any]) -> dict[str, Any]:
         "results": results,
         "checks": monitoring.get("checks", []),
         "findings": [item for item in findings if isinstance(item, dict)],
+        "recommendations": [
+            item for item in recommendations if isinstance(item, dict)
+        ],
         "quality_score": quality_score.get("overall_score") if isinstance(quality_score, dict) else None,
         "missing_values": quality_report.get("total_nulls") if isinstance(quality_report, dict) else None,
         "drift_score": drift.get("overall_drift_score") if isinstance(drift, dict) else None,
@@ -161,6 +167,19 @@ def _pdf_report(summary: dict[str, Any], title: str, chart: bytes) -> bytes:
     ]))
     story.append(table)
     story.append(Spacer(1, 12))
+    story.append(Paragraph("Prioritized recommendations", styles["Heading2"]))
+    if summary["recommendations"]:
+        for recommendation in summary["recommendations"]:
+            signal = _escape(recommendation.get("signal", "finding"))
+            priority = _escape(recommendation.get("priority", "low"))
+            action = _escape(recommendation.get("action", ""))
+            story.append(Paragraph(
+                f"<b>{priority.title()} — {signal.replace('_', ' ').title()}</b>: {action}",
+                styles["BodyText"],
+            ))
+    else:
+        story.append(Paragraph("No recommendations were reported.", styles["BodyText"]))
+    story.append(Spacer(1, 8))
     story.append(Paragraph("Findings", styles["Heading2"]))
     if summary["findings"]:
         for finding in summary["findings"]:
@@ -216,6 +235,25 @@ def _excel_report(summary: dict[str, Any], title: str, chart: bytes) -> bytes:
             for finding in findings
         ], columns=["Signal", "Evidence", "Recommended investigation"])
         findings_frame.to_excel(writer, sheet_name="Findings", index=False)
+        recommendations_frame = pd.DataFrame([
+            {
+                "Priority": item.get("priority"),
+                "Priority score": item.get("priority_score"),
+                "Signal": item.get("signal"),
+                "Recommended action": item.get("action"),
+                "Evidence": json.dumps(item.get("evidence", {}), ensure_ascii=False, default=str),
+            }
+            for item in summary["recommendations"]
+        ], columns=[
+            "Priority",
+            "Priority score",
+            "Signal",
+            "Recommended action",
+            "Evidence",
+        ])
+        recommendations_frame.to_excel(
+            writer, sheet_name="Recommendations", index=False
+        )
         pd.DataFrame([summary["notifications"]]).to_excel(
             writer, sheet_name="Alerts", index=False
         )
@@ -277,10 +315,17 @@ def _pptx_report(summary: dict[str, Any], title: str, chart: bytes) -> bytes:
     ).text_frame
     text.word_wrap = True
     entries = [
+        (
+            f"Recommendation ({item.get('priority', 'low')}): "
+            f"{item.get('signal', 'finding')} — {item.get('action', '')}"
+        )
+        for item in summary["recommendations"]
+    ]
+    entries.extend(
         f"{finding.get('signal', 'Finding')}: "
         f"{json.dumps(finding.get('evidence', {}), ensure_ascii=False, default=str)}"
         for finding in summary["findings"]
-    ]
+    )
     alert = summary["notifications"]
     entries.append(
         _alert_summary(alert)

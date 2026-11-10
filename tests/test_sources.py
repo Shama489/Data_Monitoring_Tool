@@ -447,6 +447,8 @@ def test_monitoring_agent_runs_anomaly_check_and_persists_result():
     anomaly_report = body["results"]["anomalies"]
     assert anomaly_report["available"] is True
     assert anomaly_report["total_anomalies"] >= 1
+    assert body["root_cause"]["recommendations"][0]["signal"] == "anomaly_spike"
+    assert body["root_cause"]["recommendations"][0]["priority"] == "high"
     assert "anomalies.analyze" in [
         item["tool"] for item in body["tool_trace"]
     ]
@@ -706,10 +708,33 @@ def test_advanced_ml_endpoint_runs_clustering_and_persists_report():
     assert response.status_code == 200
     body = response.json()
     assert body["report"]["analysis"] == "clustering"
+    assert body["report"]["algorithm"] == "kmeans"
     assert len(body["report"]["assignments"]) == 4
     stored = client.get(f"/api/monitoring/results/{body['result_id']}")
     assert stored.status_code == 200
     assert stored.json()["result"]["report"] == body["report"]
+
+
+def test_advanced_ml_endpoint_accepts_clustering_algorithm():
+    response = client.post(
+        "/api/analytics/advanced-ml",
+        json={
+            "analysis": "clustering",
+            "algorithm": "agglomerative",
+            "n_clusters": 2,
+            "data": [
+                {"temperature": 10.0},
+                {"temperature": 10.2},
+                {"temperature": 90.0},
+                {"temperature": 90.2},
+            ],
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    report = response.json()["report"]
+    assert report["algorithm"] == "agglomerative"
+    assert report["selected_clusters"] == 2
 
 
 def test_advanced_ml_endpoint_runs_automatic_cluster_selection():

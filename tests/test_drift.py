@@ -408,6 +408,31 @@ def test_advanced_clustering_selects_cluster_count_automatically():
     )
 
 
+@pytest.mark.parametrize(
+    "algorithm",
+    ["kmeans", "agglomerative", "gaussian_mixture"],
+)
+def test_advanced_clustering_supports_multiple_algorithms(algorithm):
+    df = pd.DataFrame({
+        "temperature": [10, 10.2, 9.8, 10.1, 90, 90.2, 89.8, 90.1],
+    })
+
+    report = analyze_clusters(df, n_clusters="auto", algorithm=algorithm)
+
+    assert report["algorithm"] == algorithm
+    assert report["cluster_selection"]["algorithm"] == algorithm
+    assert report["selected_clusters"] == 2
+    assert report["actual_clusters"] == 2
+    assert report["silhouette_score"] > 0
+
+
+def test_advanced_clustering_rejects_unsupported_algorithm():
+    df = pd.DataFrame({"value": [1, 2, 10, 11]})
+
+    with pytest.raises(ValueError, match="algorithm must be"):
+        analyze_clusters(df, algorithm="dbscan")
+
+
 def test_column_classification_profiles_every_supported_column_kind():
     row_count = 25
     df = pd.DataFrame({

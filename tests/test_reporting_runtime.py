@@ -1,7 +1,9 @@
 import sqlite3
 import time
+from io import BytesIO
 
 from fastapi.testclient import TestClient
+from openpyxl import load_workbook
 
 from conftest import admin_headers
 from main import app
@@ -61,6 +63,11 @@ def test_monitoring_reports_generate_download_and_remain_encrypted():
         )
         assert download.status_code == 200
         assert download.content.startswith(signature)
+        if report_format == "xlsx":
+            workbook = load_workbook(BytesIO(download.content), read_only=True)
+            assert "Recommendations" in workbook.sheetnames
+            assert workbook["Recommendations"].max_row > 1
+            workbook.close()
 
     listed = client.get("/api/reports").json()["reports"]
     assert listed[0]["id"] == report["id"]

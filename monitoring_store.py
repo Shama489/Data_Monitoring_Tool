@@ -153,6 +153,24 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             created_at REAL NOT NULL,
             owner_id TEXT
         );
+        CREATE TABLE IF NOT EXISTS pipeline_runs (
+            id TEXT PRIMARY KEY,
+            owner_id TEXT NOT NULL,
+            run_id TEXT NOT NULL,
+            pipeline TEXT NOT NULL,
+            job TEXT NOT NULL,
+            status TEXT NOT NULL,
+            started_at REAL NOT NULL,
+            finished_at REAL,
+            records_processed INTEGER,
+            details TEXT NOT NULL,
+            dataset_id TEXT,
+            UNIQUE(owner_id, run_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_pipeline_runs_owner_started
+            ON pipeline_runs(owner_id, started_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_pipeline_runs_pipeline_started
+            ON pipeline_runs(pipeline, started_at DESC);
         CREATE INDEX IF NOT EXISTS idx_lineage_events_dataset
             ON lineage_events(dataset_id, created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_lineage_events_owner
@@ -1222,6 +1240,147 @@ def record_lineage_event(
             error,
             owner_id,
         )
+
+
+def record_pipeline_run(
+    run_id: str,
+    pipeline: str,
+    job: str,
+    status: str,
+    owner_id: str,
+    started_at: float | None = None,
+    finished_at: float | None = None,
+    records_processed: int | None = None,
+    details: Any = None,
+    dataset_id: str | None = None,
+) -> dict[str, Any]:
+    now = time.time()
+    with connect_database() as connection:
+        existing = connection.execute(
+            "SELECT id, started_at, finished_at, records_processed, details, dataset_id "
+            "FROM pipeline_runs WHERE owner_id = ? AND run_id = ?",
+            (owner_id, run_id),
+        ).fetchone()
+        run = {
+            "id": existing["id"] if existing else uuid.uuid4().hex,
+            "owner_id": owner_id,
+            "run_id": run_id,
+            "pipeline": pipeline,
+            "job": job,
+            "status": status,
+            "started_at": (
+                started_at if started_at is not None
+                else existing["started_at"] if existing else now
+            ),
+            "finished_at": (
+                finished_at if finished_at is not None
+                else existing["finished_at"] if existing else None
+            ),
+            "records_processed": (
+                records_processed if records_processed is not None
+                else existing["records_processed"] if existing else None
+            ),
+            "details": (
+                details if details is not None
+                else _decode(existing["details"], {}) if existing else {}
+            ),
+            "dataset_id": (
+                dataset_id if dataset_id is not None
+                else existing["dataset_id"] if existing else None
+            ),
+        }
+        if (
+            run["finished_at"] is not None
+            and float(run["finished_at"]) < float(run["started_at"])
+        ):
+            raise ValueError("finished_at must not be earlier than started_at")
+        connection.execute(
+            "INSERT INTO pipeline_runs "
+            "(id, owner_id, run_id, pipeline, job, status, started_at, finished_at, "
+            "records_processed, details, dataset_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(owner_id, run_id) DO UPDATE SET "
+            "pipeline = excluded.pipeline, job = excluded.job, status = excluded.status, "
+            "started_at = excluded.started_at, finished_at = excluded.finished_at, "
+            "records_processed = excluded.records_processed, details = excluded.details, "
+            "dataset_id = excluded.dataset_id",
+            (
+                run["id"],
+                run["owner_id"],
+                run["run_id"],
+                run["pipeline"],
+                run["job"],
+                run["status"],
+                run["started_at"],
+                run["finished_at"],
+                run["records_processed"],
+                _encode(run["details"]),
+                run["dataset_id"],
+            ),
+        )
+    return _pipeline_run_response(run)
+
+
+def _pipeline_run_response(run: Any) -> dict[str, Any]:
+    started_at = float(run["started_at"])
+    finished_at = run["finished_at"]
+    duration = (
+        float(finished_at) - started_at
+        if finished_at is not None and float(finished_at) >= started_at
+        else None
+    )
+    records_processed = run["records_processed"]
+    return {
+        "id": run["id"],
+        "run_id": run["run_id"],
+        "pipeline": run["pipeline"],
+        "job": run["job"],
+        "status": run["status"],
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "duration_seconds": round(duration, 6) if duration is not None else None,
+        "records_processed": records_processed,
+        "throughput_records_per_second": (
+            round(int(records_processed) / duration, 6)
+            if records_processed is not None and duration is not None and duration > 0
+            else None
+        ),
+        "dataset_id": run["dataset_id"],
+        "details": _decode(run["details"], {})
+        if isinstance(run["details"], str)
+        else run["details"],
+    }
+
+
+def list_pipeline_runs(
+    limit: int = 100,
+    offset: int = 0,
+    pipeline: str | None = None,
+    status: str | None = None,
+    owner_id: str | None = None,
+) -> list[dict[str, Any]]:
+    query = (
+        "SELECT id, run_id, pipeline, job, status, started_at, finished_at, "
+        "records_processed, details, dataset_id FROM pipeline_runs"
+    )
+    filters = []
+    params: list[Any] = []
+    if owner_id is not None:
+        filters.append("owner_id = ?")
+        params.append(owner_id)
+    if pipeline is not None:
+        filters.append("pipeline = ?")
+        params.append(pipeline)
+    if status is not None:
+        filters.append("status = ?")
+        params.append(status)
+    if filters:
+        query += " WHERE " + " AND ".join(filters)
+    query += " ORDER BY started_at DESC, id DESC LIMIT ? OFFSET ?"
+    params.extend((limit, offset))
+    with connect_database() as connection:
+        rows = connection.execute(query, params).fetchall()
+    return [_pipeline_run_response(row) for row in rows]
 
 
 def list_datasets(

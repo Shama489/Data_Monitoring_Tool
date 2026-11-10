@@ -55,6 +55,17 @@ def test_schedule_runs_recurring_freshness_check_and_alerts(monkeypatch):
         connection.close()
 
     assert run_due_schedules() == 1
+    observed_runs = client.get(
+        "/api/pipelines/runs",
+        params={"pipeline": "scheduled_monitoring"},
+    ).json()["runs"]
+    observed_run = next(
+        run for run in observed_runs
+        if run["details"].get("schedule_id") == schedule_id
+    )
+    assert observed_run["status"] == "succeeded"
+    assert observed_run["duration_seconds"] is not None
+
     schedules = client.get("/api/schedules").json()["schedules"]
     schedule = next(item for item in schedules if item["id"] == schedule_id)
     assert schedule["last_status"] == "succeeded"

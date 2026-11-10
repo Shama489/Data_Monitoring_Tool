@@ -6,6 +6,8 @@ import asyncio
 import json
 import logging
 import os
+import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
@@ -17,6 +19,7 @@ from monitoring_store import (
     create_monitoring_report,
     finish_monitoring_schedule,
     record_lineage_event,
+    record_pipeline_run,
 )
 from reporting import generate_monitoring_reports
 
@@ -26,12 +29,25 @@ logger = logging.getLogger(__name__)
 def _execute_schedule(item: dict[str, Any]) -> None:
     config: dict[str, Any] = item["schedule"]
     dataset_id = item["dataset_id"]
+    started_at = time.time()
+    run_id = f"{item['id']}:{uuid.uuid4().hex}"
+    records_processed = None
+    record_pipeline_run(
+        run_id,
+        "scheduled_monitoring",
+        item["id"],
+        "running",
+        item["owner_id"],
+        started_at=started_at,
+        details={"schedule_id": item["id"]},
+    )
     source = config.get("source")
     if isinstance(source, dict):
         try:
             frame = load_source(source)
             if frame.empty:
                 raise DataSourceError("Source dataset must not be empty")
+            records_processed = len(frame)
             source_metadata = {
                 key: source[key]
                 for key in (
@@ -64,6 +80,19 @@ def _execute_schedule(item: dict[str, Any]) -> None:
                 item["id"],
                 succeeded=False,
                 error=safe_error,
+            )
+            record_pipeline_run(
+                run_id,
+                "scheduled_monitoring",
+                item["id"],
+                "failed",
+                item["owner_id"],
+                finished_at=time.time(),
+                details={
+                    "schedule_id": item["id"],
+                    "stage": "source_refresh",
+                    "error": safe_error,
+                },
             )
             try:
                 record_lineage_event(
@@ -134,6 +163,20 @@ def _execute_schedule(item: dict[str, Any]) -> None:
             succeeded=False,
             error=f"{type(error).__name__}: {error}",
         )
+        record_pipeline_run(
+            run_id,
+            "scheduled_monitoring",
+            item["id"],
+            "failed",
+            item["owner_id"],
+            finished_at=time.time(),
+            records_processed=records_processed,
+            details={
+                "schedule_id": item["id"],
+                "stage": "monitoring",
+                "error": f"{type(error).__name__}: {error}"[:500],
+            },
+        )
         try:
             record_lineage_event(
                 dataset_id,
@@ -152,6 +195,16 @@ def _execute_schedule(item: dict[str, Any]) -> None:
             )
     else:
         finish_monitoring_schedule(item["id"], succeeded=True)
+        record_pipeline_run(
+            run_id,
+            "scheduled_monitoring",
+            item["id"],
+            "succeeded",
+            item["owner_id"],
+            finished_at=time.time(),
+            records_processed=records_processed,
+            details={"schedule_id": item["id"]},
+        )
 
 
 def run_due_schedules(now: float | None = None, limit: int = 20) -> int:
