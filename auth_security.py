@@ -65,6 +65,7 @@ _WRITE_PATHS = {
     "/api/analytics/advanced-ml",
     "/api/reports",
     "/api/preferences",
+    "/api/pipelines/runs",
 }
 MAX_PASSWORD_LENGTH = 1024
 logger = logging.getLogger(__name__)

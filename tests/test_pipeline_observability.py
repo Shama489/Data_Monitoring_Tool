@@ -105,6 +105,8 @@ def test_pipeline_runs_are_scoped_for_non_admin_users():
             "status": "queued",
         },
     )
+    print("STATUS:", recorded.status_code)
+    print("RESPONSE:", recorded.text)
     assert recorded.status_code == 201
     assert analyst_client.get("/api/pipelines/runs").json()["summary"]["runs"] == 1
     assert client.get(
