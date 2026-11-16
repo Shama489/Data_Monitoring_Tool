@@ -1357,8 +1357,8 @@ def _validate_dashboard_widgets(widgets: Any) -> list[str] | list[dict[str, str]
         "missing_values",
         "duplicate_rows",
     }
-    if not isinstance(widgets, list) or not widgets or len(widgets) > 24:
-        _bad_request("widgets must contain between 1 and 24 dashboard widgets")
+    if not isinstance(widgets, list) or len(widgets) > 24:
+        _bad_request("widgets must contain at most 24 dashboard widgets")
 
     if all(isinstance(item, str) for item in widgets):
         if not all(item in supported_metrics for item in widgets):

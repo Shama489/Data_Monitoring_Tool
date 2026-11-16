@@ -7,9 +7,31 @@ import pandas as pd
 
 from monitoring_dashboard import (
     _filter_monitoring_results,
+    _normalize_dashboard_widgets,
     _quality_summary_method_label,
     _result_rows,
 )
+
+
+def test_dashboard_widget_layout_preserves_custom_order_and_empty_layout():
+    widgets = [
+        {
+            "id": "custom-drift",
+            "kind": "chart",
+            "metric": "drift_score",
+            "title": "Drift since baseline",
+            "chart_type": "bar",
+        },
+        {
+            "id": "custom-quality",
+            "kind": "metric",
+            "metric": "quality_score",
+            "title": "Customer data quality",
+        },
+    ]
+
+    assert _normalize_dashboard_widgets(widgets) == widgets
+    assert _normalize_dashboard_widgets([]) == []
 
 
 def test_filter_monitoring_results_uses_dataset_date_and_search_filters():

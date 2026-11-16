@@ -219,10 +219,11 @@ The monitoring dashboard has per-account saved preferences for English,
 Spanish, French, or Hindi and a system/light/dark/high-contrast theme. Its
 overview includes a widget builder for metric cards and line/bar trend charts
 for quality, drift, anomalies, missing values, and duplicate rows. Drag widgets
-to rearrange them, add custom titles, or remove widgets; layouts are saved with
-the account's dashboard preferences. It adjusts metric cards for narrow/mobile
-viewports. The voice assistant supports the same languages. Preferences are
-available through authenticated `GET`/`POST /api/preferences`.
+to rearrange them, add custom titles, or remove widgets (including clearing the
+overview); layouts are saved with the account's dashboard preferences. It
+adjusts metric cards for narrow/mobile viewports. The voice assistant supports
+the same languages. Preferences are available through authenticated
+`GET`/`POST /api/preferences`.
 
 ## Runtime reliability and deployment
 
@@ -613,6 +614,15 @@ POST /api/notifications/send
 ```
 
 Use `dry_run: true` to validate the payload without contacting providers. Configure secrets with environment variables: `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `ALERT_FROM_EMAIL`, `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_SMS_FROM`, `TWILIO_WHATSAPP_FROM`, `SLACK_WEBHOOK_URL`, and `TEAMS_WEBHOOK_URL`. Slack and Teams recipients may be omitted when their webhook URL is configured.
+
+Administrators can use **Monitoring history → Notification setup and test** in
+the dashboard to send a real test message to a selected provider after setting
+the corresponding variables on the API server. The form shows the required
+variables and never asks for SMTP or Twilio credentials; webhook URLs can be
+entered for a one-off test or configured in the server environment. Test sends
+are recorded in alert history. Provider delivery failures, including SMTP
+connection errors, are returned in the API response rather than crashing the
+request.
 
 
 <img width="1920" height="965" alt="Screenshot 2026-03-26 192137" src="https://github.com/user-attachments/assets/88d54c28-8602-45f2-9e7c-251667701fca" />
