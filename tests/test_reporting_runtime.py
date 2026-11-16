@@ -170,6 +170,13 @@ def test_dashboard_preferences_health_and_metrics_endpoints():
     assert custom_layout.json()["preferences"]["widgets"] == custom_widgets
     assert client.get("/api/preferences").json()["preferences"]["widgets"] == custom_widgets
 
+    empty_layout = client.post(
+        "/api/preferences",
+        json={"preferences": {"widgets": []}},
+    )
+    assert empty_layout.status_code == 200
+    assert empty_layout.json()["preferences"]["widgets"] == []
+
     invalid_layout = client.post(
         "/api/preferences",
         json={

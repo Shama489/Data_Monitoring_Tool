@@ -311,10 +311,13 @@ def send_email(recipient: str, subject: str, message: str) -> dict[str, Any]:
     email["To"] = recipient
     email["Subject"] = subject
     email.set_content(message)
-    with smtplib.SMTP(config["SMTP_HOST"], int(config["SMTP_PORT"]), timeout=15) as server:
-        server.starttls()
-        server.login(config["SMTP_USERNAME"], config["SMTP_PASSWORD"])
-        server.send_message(email)
+    try:
+        with smtplib.SMTP(config["SMTP_HOST"], int(config["SMTP_PORT"]), timeout=15) as server:
+            server.starttls()
+            server.login(config["SMTP_USERNAME"], config["SMTP_PASSWORD"])
+            server.send_message(email)
+    except (smtplib.SMTPException, OSError) as error:
+        raise NotificationError(f"Email delivery failed: {error}") from error
     return {"channel": "email", "recipient": recipient, "status": "sent"}
 
 

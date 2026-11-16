@@ -53,6 +53,8 @@ _DEFAULT_DASHBOARD_WIDGETS = [
 def _normalize_dashboard_widgets(widgets: Any) -> list[dict[str, str]]:
     if not isinstance(widgets, list):
         return [dict(widget) for widget in _DEFAULT_DASHBOARD_WIDGETS]
+    if not widgets:
+        return []
 
     normalized: list[dict[str, str]] = []
     seen_ids: set[str] = set()
@@ -728,6 +730,56 @@ def _render_history(
     if role != "admin":
         st.info("Alert history is administrator-only because it can contain delivery recipients.")
         return
+    st.subheader("Notification setup and test")
+    st.caption(
+        "Configure credentials on the API server with environment variables, then send a real test message."
+    )
+    channel_setup = {
+        "email": "SMTP_HOST, SMTP_PORT, SMTP_USERNAME, SMTP_PASSWORD, ALERT_FROM_EMAIL",
+        "sms": "TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_SMS_FROM",
+        "whatsapp": "TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_WHATSAPP_FROM",
+        "slack": "SLACK_WEBHOOK_URL or a webhook URL below",
+        "teams": "TEAMS_WEBHOOK_URL or a webhook URL below",
+    }
+    with st.form("notification-provider-test"):
+        channel = st.selectbox(
+            "Notification provider",
+            ["email", "sms", "whatsapp", "slack", "teams"],
+        )
+        recipient = st.text_input(
+            "Recipient or webhook URL",
+            type="password" if channel in {"slack", "teams"} else "default",
+            help=(
+                "For Slack and Teams, leave blank to use the server environment variable."
+                if channel in {"slack", "teams"}
+                else "Enter the email address or phone number that should receive the test."
+            ),
+        ).strip()
+        st.caption(f"Required API-server configuration: {channel_setup[channel]}")
+        send_test = st.form_submit_button("Send test notification", type="primary")
+    if send_test:
+        if channel in {"email", "sms", "whatsapp"} and not recipient:
+            st.error("Enter a recipient before sending the test.")
+        else:
+            result = _post(
+                api_base_url,
+                headers,
+                "/api/notifications/send",
+                {
+                    "subject": "Data monitoring provider test",
+                    "message": f"Test notification from the monitoring dashboard ({uuid.uuid4().hex[:8]}).",
+                    "channels": [{"channel": channel, "recipient": recipient}],
+                },
+                timeout=30,
+            )
+            if result is not None:
+                if result.get("success"):
+                    st.success(f"{channel.title()} test notification delivered.")
+                    st.json(result.get("sent", []))
+                else:
+                    st.error(f"{channel.title()} test notification failed.")
+                    st.json(result.get("failed", []))
+
     alerts = _get(api_base_url, headers, "/api/alerts/history", {"limit": 100})
     if alerts is not None:
         alert_rows = alerts.get("history") or []
@@ -1408,7 +1460,9 @@ def _render_dashboard_preferences(
         id_by_widget_label = {
             label: widget_id for widget_id, label in widget_labels_by_id.items()
         }
-        if widgets:
+        if not widgets:
+            st.info("Your overview is empty. Add a widget above to get started.")
+        else:
             sortable_labels = list(widget_labels_by_id.values())
             sorted_labels = sort_items(
                 sortable_labels,
@@ -1443,33 +1497,32 @@ def _render_dashboard_preferences(
                     st.success("Dashboard layout saved.")
                     st.rerun()
 
-            if len(widgets) > 1:
-                remove_label = st.selectbox(
-                    "Widget to remove",
-                    list(widget_labels_by_id.values()),
-                    key="dashboard-remove-widget",
+            remove_label = st.selectbox(
+                "Widget to remove",
+                list(widget_labels_by_id.values()),
+                key="dashboard-remove-widget",
+            )
+            if st.button("Remove widget", key="dashboard-remove-widget-button"):
+                remaining_widgets = [
+                    widget for widget in widgets
+                    if widget["id"] != id_by_widget_label[remove_label]
+                ]
+                save_response = _post(
+                    api_base_url,
+                    headers,
+                    "/api/preferences",
+                    {
+                        "preferences": {
+                            "language": preferences["language"],
+                            "theme": preferences["theme"],
+                            "widgets": remaining_widgets,
+                        }
+                    },
+                    timeout=20,
                 )
-                if st.button("Remove widget", key="dashboard-remove-widget-button"):
-                    remaining_widgets = [
-                        widget for widget in widgets
-                        if widget["id"] != id_by_widget_label[remove_label]
-                    ]
-                    save_response = _post(
-                        api_base_url,
-                        headers,
-                        "/api/preferences",
-                        {
-                            "preferences": {
-                                "language": preferences["language"],
-                                "theme": preferences["theme"],
-                                "widgets": remaining_widgets,
-                            }
-                        },
-                        timeout=20,
-                    )
-                    if save_response is not None:
-                        st.success("Widget removed.")
-                        st.rerun()
+                if save_response is not None:
+                    st.success("Widget removed.")
+                    st.rerun()
 
     theme = preferences["theme"]
     palette = {
