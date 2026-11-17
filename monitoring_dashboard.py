@@ -1215,6 +1215,7 @@ _DASHBOARD_COPY = {
             "Explainable AI": "Explainable AI",
             "Run monitoring": "Run monitoring",
             "Scheduled monitoring": "Scheduled monitoring",
+            "Pipeline monitoring": "Pipeline monitoring",
             "Automated reports": "Automated reports",
             "AI assistant": "AI assistant",
             "Alerts & notifications": "Alerts & notifications",
@@ -1250,6 +1251,7 @@ _DASHBOARD_COPY = {
             "Explainable AI": "IA explicable",
             "Run monitoring": "Ejecutar supervisión",
             "Scheduled monitoring": "Supervisión programada",
+            "Pipeline monitoring": "Supervisión de canalizaciones",
             "Automated reports": "Informes automáticos",
             "AI assistant": "Asistente de IA",
             "Alerts & notifications": "Alertas y notificaciones",
@@ -1285,6 +1287,7 @@ _DASHBOARD_COPY = {
             "Explainable AI": "IA explicable",
             "Run monitoring": "Lancer la surveillance",
             "Scheduled monitoring": "Surveillance planifiée",
+            "Pipeline monitoring": "Surveillance des pipelines",
             "Automated reports": "Rapports automatisés",
             "AI assistant": "Assistant IA",
             "Alerts & notifications": "Alertes et notifications",
@@ -1320,6 +1323,7 @@ _DASHBOARD_COPY = {
             "Explainable AI": "व्याख्येय AI",
             "Run monitoring": "निगरानी चलाएं",
             "Scheduled monitoring": "निर्धारित निगरानी",
+            "Pipeline monitoring": "पाइपलाइन निगरानी",
             "Automated reports": "स्वचालित रिपोर्ट",
             "AI assistant": "AI सहायक",
             "Alerts & notifications": "अलर्ट और सूचनाएं",
@@ -2778,6 +2782,73 @@ def _render_settings(role: str, health_ok: bool) -> None:
     )
 
 
+def _render_pipeline_monitoring(
+    api_base_url: str,
+    headers: dict[str, str],
+) -> None:
+    st.caption(
+        "External orchestrators can report runs to the authenticated pipeline API. "
+        "Provider-specific status values are preserved."
+    )
+    with st.form("pipeline-run-filters"):
+        pipeline_filter = st.text_input("Pipeline", placeholder="Exact pipeline name").strip()
+        status_filter = st.text_input("Status", placeholder="Exact provider status").strip()
+        submitted = st.form_submit_button("Apply filters")
+
+    params: dict[str, Any] = {"limit": 500}
+    if submitted or pipeline_filter or status_filter:
+        if pipeline_filter:
+            params["pipeline"] = pipeline_filter
+        if status_filter:
+            params["status"] = status_filter
+
+    payload = _get(api_base_url, headers, "/api/pipelines/runs", params)
+    if payload is None:
+        return
+    runs = payload.get("runs") or []
+    summary = payload.get("summary") or {}
+
+    metric_columns = st.columns(4)
+    metric_columns[0].metric("Pipeline runs", summary.get("runs", 0))
+    metric_columns[1].metric("Failed runs", summary.get("failed_runs", 0))
+    average_latency = summary.get("average_latency_seconds")
+    metric_columns[2].metric(
+        "Average latency",
+        f"{average_latency:,.3f} s" if average_latency is not None else "—",
+    )
+    throughput = summary.get("throughput_records_per_second")
+    metric_columns[3].metric(
+        "Throughput",
+        f"{throughput:,.3f} records/s" if throughput is not None else "—",
+    )
+
+    if not runs:
+        st.info("No pipeline runs match these filters.")
+        return
+
+    rows = []
+    for run in runs:
+        rows.append(
+            {
+                "Started (UTC)": (
+                    pd.to_datetime(run["started_at"], unit="s", utc=True)
+                    if run.get("started_at") is not None
+                    else None
+                ),
+                "Pipeline": run.get("pipeline"),
+                "Job": run.get("job"),
+                "Status": run.get("status"),
+                "Latency (s)": run.get("duration_seconds"),
+                "Records processed": run.get("records_processed"),
+                "Throughput (records/s)": run.get("throughput_records_per_second"),
+                "Run ID": run.get("run_id"),
+                "Dataset ID": run.get("dataset_id"),
+                "Details": json.dumps(run.get("details") or {}, sort_keys=True),
+            }
+        )
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+
 def render_monitoring_dashboard(
     api_base_url: str,
     headers: dict[str, str],
@@ -2796,6 +2867,7 @@ def render_monitoring_dashboard(
             "Explainable AI",
             "Run monitoring",
             "Scheduled monitoring",
+            "Pipeline monitoring",
             "Automated reports",
             "AI assistant",
             "Alerts & notifications",
@@ -3025,6 +3097,8 @@ def render_monitoring_dashboard(
             st.caption(f"Most recent run: `{st.session_state['dashboard_latest_run_id']}`")
     elif selected_page == "Scheduled monitoring":
         _render_schedules(api_base_url, headers, role, datasets, schedules)
+    elif selected_page == "Pipeline monitoring":
+        _render_pipeline_monitoring(api_base_url, headers)
     elif selected_page == "Automated reports":
         _render_reports(api_base_url, headers, results, role)
     elif selected_page == "AI assistant":

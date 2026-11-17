@@ -1192,18 +1192,33 @@ def list_pipeline_runs_endpoint(
     ]
     records_processed = sum(
         run["records_processed"] or 0
-        for run in completed_runs
+        for run in runs
     )
-    elapsed_seconds = sum(
-        run["duration_seconds"] or 0
+    throughput_runs = [
+        run
         for run in completed_runs
-    )
+        if run["records_processed"] is not None
+        and run["duration_seconds"] > 0
+    ]
+    elapsed_seconds = sum(run["duration_seconds"] for run in throughput_runs)
     return {
         "runs": runs,
         "summary": {
             "runs": len(runs),
             "failed_runs": sum(
-                run["status"].lower() in {"failed", "error", "cancelled"}
+                run["status"].lower()
+                in {
+                    "failed",
+                    "failure",
+                    "error",
+                    "errored",
+                    "cancelled",
+                    "canceled",
+                    "aborted",
+                    "timeout",
+                    "timed_out",
+                    "crashed",
+                }
                 for run in runs
             ),
             "average_latency_seconds": (
@@ -1217,7 +1232,11 @@ def list_pipeline_runs_endpoint(
             ),
             "records_processed": records_processed,
             "throughput_records_per_second": (
-                round(records_processed / elapsed_seconds, 6)
+                round(
+                    sum(run["records_processed"] for run in throughput_runs)
+                    / elapsed_seconds,
+                    6,
+                )
                 if elapsed_seconds > 0
                 else None
             ),

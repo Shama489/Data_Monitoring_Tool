@@ -166,10 +166,13 @@ Use `GET /api/pipelines/runs` to inspect recent runs, with optional `pipeline`
 and `status` filters and `limit`/`offset` pagination. Each run includes its
 duration and throughput when the timestamps and record count are available;
 the response summary aggregates latency, processed rows, throughput, and
-failed/error/cancelled runs for the returned page. Pipeline runs are scoped to
-the reporting account. The built-in scheduler also records each scheduled
-monitoring execution, including success/failure status, latency, and source
-row counts when a source refresh is configured.
+known failed, cancelled, aborted, and timed-out statuses for the returned page.
+Throughput only uses runs with both a record count and a positive duration;
+provider-specific status strings are retained. Pipeline runs are scoped to the
+reporting account and are available in the dashboard's **Pipeline monitoring**
+page. The built-in scheduler also records each scheduled monitoring execution,
+including success/failure status, latency, and source row counts when a source
+refresh is configured.
 
 ## Real-time and scheduled monitoring
 

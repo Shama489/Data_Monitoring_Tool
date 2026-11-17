@@ -105,11 +105,60 @@ def test_pipeline_runs_are_scoped_for_non_admin_users():
             "status": "queued",
         },
     )
-    print("STATUS:", recorded.status_code)
-    print("RESPONSE:", recorded.text)
     assert recorded.status_code == 201
     assert analyst_client.get("/api/pipelines/runs").json()["summary"]["runs"] == 1
     assert client.get(
         "/api/pipelines/runs",
         params={"pipeline": "private-pipeline"},
     ).json()["summary"]["runs"] == 1
+
+
+def test_pipeline_summary_ignores_runs_missing_records_for_throughput():
+    recorded = client.post(
+        "/api/pipelines/runs",
+        json={
+            "run_id": "known-volume",
+            "pipeline": "summary-check",
+            "job": "orders",
+            "status": "COMPLETED_WITH_WARNINGS",
+            "started_at": 100,
+            "finished_at": 110,
+            "records_processed": 20,
+        },
+    )
+    assert recorded.status_code == 201
+    recorded_without_count = client.post(
+        "/api/pipelines/runs",
+        json={
+            "run_id": "unknown-volume",
+            "pipeline": "summary-check",
+            "job": "customers",
+            "status": "SUCCEEDED",
+            "started_at": 100,
+            "finished_at": 115,
+        },
+    )
+    assert recorded_without_count.status_code == 201
+    recorded_timeout = client.post(
+        "/api/pipelines/runs",
+        json={
+            "run_id": "timed-out",
+            "pipeline": "summary-check",
+            "job": "invoices",
+            "status": "TIMED_OUT",
+        },
+    )
+    assert recorded_timeout.status_code == 201
+
+    response = client.get(
+        "/api/pipelines/runs",
+        params={"pipeline": "summary-check"},
+    )
+    assert response.status_code == 200
+    assert response.json()["summary"] == {
+        "runs": 3,
+        "failed_runs": 1,
+        "average_latency_seconds": 12.5,
+        "records_processed": 20,
+        "throughput_records_per_second": 2,
+    }

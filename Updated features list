@@ -41,6 +41,7 @@
 - Compare saved datasets or versions and retain comparison results in monitoring history.
 - Schedule recurring checks against saved datasets or refreshable sources; source polls create immutable dataset versions and run the selected checks. Pause or resume schedules, edit intervals, and review run status.
 - Retry failed scheduled jobs with bounded concurrency and backoff.
+- Monitor external ETL pipeline runs, preserve provider-specific statuses, and review latency, record throughput, and failures in the dashboard.
 - Generate PDF, Excel, and PowerPoint reports, including reports after scheduled runs.
 - Configure alert rules and deliver notifications through email, SMS, WhatsApp, Slack, and Microsoft Teams.
 
