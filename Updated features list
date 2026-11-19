@@ -22,7 +22,7 @@
 - Compare candidate classification or regression models and select a best-performing model for a chosen metric.
 - Evaluate models on a holdout set with task-appropriate metrics and feature importance.
 - Generate per-row explanations with optional SHAP support.
-- Run K-means clustering, Isolation Forest-based fraud-pattern screening, predictive-maintenance modeling, and item recommendations.
+- Run K-means, agglomerative, or Gaussian-mixture clustering, with optional automatic cluster-count selection by silhouette score; also run Isolation Forest-based fraud-pattern screening, predictive-maintenance modeling, and item recommendations.
 
 ## Data sources and workflows
 
@@ -41,7 +41,7 @@
 - Compare saved datasets or versions and retain comparison results in monitoring history.
 - Schedule recurring checks against saved datasets or refreshable sources; source polls create immutable dataset versions and run the selected checks. Pause or resume schedules, edit intervals, and review run status.
 - Retry failed scheduled jobs with bounded concurrency and backoff.
-- Monitor external ETL pipeline runs, preserve provider-specific statuses, and review latency, record throughput, and failures in the dashboard.
+- Monitor external ETL pipeline runs, preserve provider-specific statuses, and review latency, record throughput, and failures in the dashboard. Forecast weekly failed-run counts from at least three weeks of recognized completed-run history; forecasts are trend estimates, not per-run probabilities.
 - Generate PDF, Excel, and PowerPoint reports, including reports after scheduled runs.
 - Configure alert rules and deliver notifications through email, SMS, WhatsApp, Slack, and Microsoft Teams.
 
@@ -51,7 +51,7 @@
 - Explore quality, anomalies, drift, trends and forecasts, explanations, runs, schedules, reports, alerts, comparisons, lineage, and history in the Streamlit dashboards.
 - Use the voice assistant for typed questions or browser speech input, with spoken answers when browser support is available.
 - Resolve questions about "today" against the latest completed quality run for the current date; report when no run exists without starting one.
-- Set per-account dashboard language (English, Spanish, French, or Hindi), theme, and overview metric widgets; the dashboard adapts to narrow screens.
+- Set per-account dashboard language (English, Spanish, French, or Hindi), theme, and overview metric/chart widgets; add, remove, and reorder saved widgets. The dashboard adapts to narrow screens, though full-screen localization and responsive coverage still need testing.
 - Authenticate with bearer tokens and use admin, analyst, or viewer roles with owner-scoped dataset and result access.
 - Protect stored datasets and results with encryption at rest; use password hashing, request-size limits, rate limiting, and admin audit access.
 - Check service health and readiness, inspect request metrics, and deploy the API with a separate schedule worker using Docker Compose.

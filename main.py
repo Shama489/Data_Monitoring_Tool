@@ -1244,6 +1244,149 @@ def list_pipeline_runs_endpoint(
     }
 
 
+@app.get("/api/pipelines/failure-forecast")
+def forecast_pipeline_failures_endpoint(
+    pipeline: str = Query(min_length=1, max_length=255),
+    periods: int = Query(default=4, ge=1, le=52),
+):
+    pipeline = pipeline.strip()
+    if not pipeline:
+        _bad_request("pipeline must contain a non-whitespace character")
+
+    runs = list_pipeline_runs(
+        limit=10000,
+        pipeline=pipeline,
+        owner_id=current_user_scope(),
+    )
+    failure_statuses = {
+        "failed",
+        "failure",
+        "error",
+        "errored",
+        "cancelled",
+        "canceled",
+        "aborted",
+        "timeout",
+        "timed_out",
+        "crashed",
+    }
+    successful_statuses = {
+        "completed",
+        "completed_with_warnings",
+        "success",
+        "successful",
+        "succeeded",
+    }
+
+    outcomes = []
+    unclassified_runs = 0
+    for run in runs:
+        status = run["status"].strip().casefold()
+        if status in failure_statuses:
+            failed = 1
+        elif status in successful_statuses:
+            failed = 0
+        else:
+            unclassified_runs += 1
+            continue
+        timestamp = (
+            run["finished_at"]
+            if run["finished_at"] is not None
+            else run["started_at"]
+        )
+        outcomes.append({
+            "date": pd.to_datetime(timestamp, unit="s", utc=True),
+            "failed": failed,
+            "duration_seconds": run["duration_seconds"],
+            "records_processed": run["records_processed"],
+            "throughput_records_per_second": run["throughput_records_per_second"],
+        })
+
+    if not outcomes:
+        raise HTTPException(
+            status_code=422,
+            detail="No completed runs with recognized success or failure statuses are available for this pipeline.",
+        )
+
+    outcome_frame = pd.DataFrame(outcomes)
+    weekly = (
+        outcome_frame.set_index("date")
+        .resample("W")
+        .agg(
+            total_runs=("failed", "count"),
+            failed_runs=("failed", "sum"),
+            average_latency_seconds=("duration_seconds", "mean"),
+            records_processed=("records_processed", "sum"),
+            throughput_records_per_second=(
+                "throughput_records_per_second",
+                "mean",
+            ),
+        )
+    )
+    weekly["failure_rate"] = (
+        weekly["failed_runs"] / weekly["total_runs"].replace(0, pd.NA)
+    )
+    weekly["total_runs"] = weekly["total_runs"].fillna(0).astype(int)
+    weekly["failed_runs"] = weekly["failed_runs"].fillna(0).astype(int)
+    weekly["records_processed"] = (
+        pd.to_numeric(weekly["records_processed"], errors="coerce")
+        .fillna(0)
+        .astype(int)
+    )
+
+    forecast_input = outcome_frame[["date", "failed"]].rename(
+        columns={"failed": "failed_runs"}
+    )
+    try:
+        forecast = forecast_metric(
+            forecast_input,
+            "date",
+            "failed_runs",
+            periods=periods,
+            frequency="W",
+            method="linear",
+        )
+    except (ValueError, RuntimeError) as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+    return {
+        "pipeline": pipeline,
+        "forecast_unit": "failed_runs_per_week",
+        "forecast": forecast,
+        "weekly_history": [
+            {
+                "week_ending": index.isoformat(),
+                "total_runs": int(row["total_runs"]),
+                "failed_runs": int(row["failed_runs"]),
+                "failure_rate": (
+                    round(float(row["failure_rate"]), 6)
+                    if pd.notna(row["failure_rate"])
+                    else None
+                ),
+                "average_latency_seconds": (
+                    round(float(row["average_latency_seconds"]), 6)
+                    if pd.notna(row["average_latency_seconds"])
+                    else None
+                ),
+                "records_processed": int(row["records_processed"]),
+                "throughput_records_per_second": (
+                    round(float(row["throughput_records_per_second"]), 6)
+                    if pd.notna(row["throughput_records_per_second"])
+                    else None
+                ),
+            }
+            for index, row in weekly.iterrows()
+        ],
+        "history_runs_analyzed": len(outcomes),
+        "unclassified_runs_ignored": unclassified_runs,
+        "interpretation": (
+            "Trend-based estimates of weekly failed-run counts from completed "
+            "history, not per-run probabilities or guarantees. Unknown provider "
+            "statuses and in-progress runs are excluded."
+        ),
+    }
+
+
 @app.get("/api/datasets/{dataset_id}")
 def get_dataset_endpoint(dataset_id: str):
     dataset = get_dataset(dataset_id, owner_id=current_user_scope())

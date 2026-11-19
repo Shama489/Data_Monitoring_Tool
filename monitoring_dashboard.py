@@ -2822,6 +2822,58 @@ def _render_pipeline_monitoring(
         f"{throughput:,.3f} records/s" if throughput is not None else "—",
     )
 
+    if pipeline_filter and st.button(
+        "Forecast weekly failures",
+        key="pipeline-failure-forecast",
+    ):
+        forecast_payload = _get(
+            api_base_url,
+            headers,
+            "/api/pipelines/failure-forecast",
+            {"pipeline": pipeline_filter, "periods": 4},
+        )
+        if forecast_payload is not None:
+            forecast = forecast_payload.get("forecast", {})
+            history = forecast.get("history", [])
+            future = forecast.get("forecast", [])
+            forecast_rows = [
+                {
+                    "Week": item["date"],
+                    "Estimated failed runs": item["value"],
+                    "Series": "History",
+                }
+                for item in history
+            ]
+            forecast_rows.extend(
+                {
+                    "Week": item["date"],
+                    "Estimated failed runs": item["value"],
+                    "Series": "Forecast",
+                }
+                for item in future
+            )
+            st.caption(forecast_payload.get("interpretation", ""))
+            if forecast_rows:
+                st.plotly_chart(
+                    px.line(
+                        pd.DataFrame(forecast_rows),
+                        x="Week",
+                        y="Estimated failed runs",
+                        color="Series",
+                        markers=True,
+                        title=f"Weekly failure forecast · {pipeline_filter}",
+                    ),
+                    use_container_width=True,
+                    key="pipeline-failure-forecast-chart",
+                )
+            st.dataframe(
+                pd.DataFrame(forecast_payload.get("weekly_history", [])),
+                use_container_width=True,
+                hide_index=True,
+            )
+    elif not pipeline_filter:
+        st.caption("Enter a pipeline name above to forecast its weekly failures.")
+
     if not runs:
         st.info("No pipeline runs match these filters.")
         return

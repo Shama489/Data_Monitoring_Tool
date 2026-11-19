@@ -78,6 +78,7 @@ use. Available management endpoints include:
 - `POST /api/assistant/ask` for text or voice-transcribed monitoring questions;
   `language` supports `en`, `es`, `fr`, and `hi`
 - `GET /api/monitoring/results` and `GET /api/monitoring/results/{id}`
+- `GET /api/pipelines/runs` and `GET /api/pipelines/failure-forecast`
 - `GET`/`POST`/`DELETE /api/alerts/rules` and `GET /api/alerts/history`
 - `GET`/`PUT /api/configurations` and `DELETE /api/configurations/{key}`
 - `GET /api/audit`
@@ -170,9 +171,14 @@ known failed, cancelled, aborted, and timed-out statuses for the returned page.
 Throughput only uses runs with both a record count and a positive duration;
 provider-specific status strings are retained. Pipeline runs are scoped to the
 reporting account and are available in the dashboard's **Pipeline monitoring**
-page. The built-in scheduler also records each scheduled monitoring execution,
-including success/failure status, latency, and source row counts when a source
-refresh is configured.
+page. That page can forecast weekly failed-run counts for a named pipeline from
+its completed run history, alongside weekly failure rates, latency, and
+throughput. Forecasts require at least three weeks of history with recognized
+success/failure statuses and are trend estimates—not per-run probabilities or
+guarantees; unrecognized provider-specific states and in-progress runs are
+excluded. The built-in scheduler also records each scheduled monitoring
+execution, including success/failure status, latency, and source row counts
+when a source refresh is configured.
 
 ## Real-time and scheduled monitoring
 
