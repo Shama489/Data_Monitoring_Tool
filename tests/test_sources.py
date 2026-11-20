@@ -819,6 +819,49 @@ def test_advanced_ml_endpoint_runs_pipeline_failure_prediction():
     assert report["failure_metrics"]["failure_recall"] >= 0
 
 
+def test_advanced_ml_endpoint_runs_fraud_pattern_screening():
+    response = client.post(
+        "/api/analytics/advanced-ml",
+        json={
+            "analysis": "fraud_detection",
+            "contamination": 0.05,
+            "data": [
+                {"amount": value, "merchant": "usual" if value < 39 else "unusual"}
+                for value in list(range(39)) + [10000]
+            ],
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    report = response.json()["report"]
+    assert report["analysis"] == "fraud_detection"
+    assert report["method"] == "isolation_forest"
+    assert report["total_flagged"] >= 1
+    assert "not confirmed fraud" in report["interpretation"]
+
+
+def test_advanced_ml_endpoint_runs_predictive_maintenance_regression():
+    response = client.post(
+        "/api/analytics/advanced-ml",
+        json={
+            "analysis": "predictive_maintenance",
+            "target_column": "remaining_life",
+            "task": "regression",
+            "model_names": ["decision_tree"],
+            "data": [
+                {"temperature": value, "remaining_life": 100 - value * 2}
+                for value in range(30)
+            ],
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    report = response.json()["report"]
+    assert report["analysis"] == "predictive_maintenance"
+    assert report["task"] == "regression"
+    assert report["models"][0]["metrics"]["rmse"] >= 0
+
+
 def test_advanced_ml_endpoint_rejects_unknown_analysis():
     response = client.post(
         "/api/analytics/advanced-ml",

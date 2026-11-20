@@ -422,7 +422,12 @@ def _call_openai_quality_summary(metrics):
                 temperature=0.2,
             )
             content = getattr(response, "output_text", None)
-    except Exception:
+    except Exception as error:
+        if (
+            type(error).__name__ in {"AuthenticationError", "PermissionDeniedError"}
+            or getattr(error, "status_code", None) in {401, 403}
+        ):
+            raise
         content = None
 
     if not content:
@@ -1837,6 +1842,9 @@ def classify_columns(df):
 
     profile = []
     identifier_name = re.compile(r"(?:^|_)(?:id|uuid|guid|key)(?:$|_)", re.IGNORECASE)
+    camel_case_identifier_name = re.compile(
+        r"(?:Id|ID|Uuid|UUID|Guid|GUID|Key|KEY)$"
+    )
     date_text = re.compile(
         r"\d{4}[-/]\d{1,2}|\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|T\d{2}:",
         re.IGNORECASE,
@@ -1855,7 +1863,10 @@ def classify_columns(df):
             classification = "boolean"
         elif pd.api.types.is_datetime64_any_dtype(series):
             classification = "datetime"
-        elif identifier_name.search(column_name):
+        elif (
+            identifier_name.search(column_name)
+            or camel_case_identifier_name.search(column_name)
+        ):
             classification = "identifier"
         elif pd.api.types.is_numeric_dtype(series):
             classification = "numeric"
@@ -1870,8 +1881,17 @@ def classify_columns(df):
             )
             if len(numeric_values) and numeric_values.notna().all():
                 classification = "numeric"
+            elif text_values.str.casefold().isin(
+                {"true", "false", "yes", "no", "y", "n", "on", "off"}
+            ).all():
+                classification = "boolean"
             elif len(parsed_dates) and parsed_dates.notna().mean() >= 0.8:
                 classification = "datetime"
+            elif (
+                text_values.str.len().median() >= 40
+                or text_values.str.split().str.len().median() >= 6
+            ):
+                classification = "text"
             elif distinct_count >= 20 and distinct_count / len(non_null) >= 0.5:
                 classification = "high_cardinality_categorical"
             else:
@@ -2083,6 +2103,7 @@ def detect_fraud_patterns(df, feature_columns=None, contamination=0.05):
             ],
         }
         suspicious.append(row)
+    suspicious.sort(key=lambda row: row["risk_score"], reverse=True)
 
     return {
         "analysis": "fraud_detection",
@@ -2159,11 +2180,20 @@ def analyze_pipeline_failure_prediction(
             "error",
             "crashed",
         }
+
+        def is_failure_label(value):
+            normalized_value = _json_safe_value(value)
+            if isinstance(normalized_value, (int, float)) and not isinstance(
+                normalized_value, bool
+            ):
+                return normalized_value == 1
+            return str(normalized_value).strip().lower() in failure_tokens
+
         failure_value = next(
             (
                 value
                 for value in target_values
-                if str(_json_safe_value(value)).strip().lower() in failure_tokens
+                if is_failure_label(value)
             ),
             None,
         )
@@ -2203,7 +2233,7 @@ def analyze_pipeline_failure_prediction(
         "analysis": "pipeline_failure_prediction",
         "failure_class": _json_safe_value(failure_value),
         "failure_rate": round(
-            float((df[target_column] == failure_value).mean()), 6
+            float((df[target_column].dropna() == failure_value).mean()), 6
         ),
         "failure_metrics": {
             key: selected_model["metrics"][key]
