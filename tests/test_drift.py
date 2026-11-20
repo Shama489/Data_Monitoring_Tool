@@ -406,6 +406,12 @@ def test_advanced_clustering_selects_cluster_count_automatically():
         item["silhouette_score"] is not None
         for item in report["cluster_selection"]["candidates"]
     )
+    best_candidate = max(
+        report["cluster_selection"]["candidates"],
+        key=lambda item: item["silhouette_score"],
+    )
+    assert report["selected_clusters"] == best_candidate["n_clusters"]
+    assert len(report["assignments"]) == len(df)
 
 
 @pytest.mark.parametrize(
@@ -442,6 +448,17 @@ def test_column_classification_profiles_every_supported_column_kind():
         "segment": ["north" if value % 2 else "south" for value in range(row_count)],
         "category_code": [f"category-{value}" for value in range(row_count)],
         "record_id": list(range(1001, 1001 + row_count)),
+        "customerId": [f"customer-{value}" for value in range(row_count)],
+        "numeric_text": [str(value + 0.5) for value in range(row_count)],
+        "created_text": [
+            value.strftime("%Y-%m-%d")
+            for value in pd.date_range("2026-01-01", periods=row_count, freq="D")
+        ],
+        "enabled_text": ["yes" if value % 2 else "no" for value in range(row_count)],
+        "notes": [
+            f"Operator observed an abnormal vibration in asset number {value}."
+            for value in range(row_count)
+        ],
         "constant": ["same"] * row_count,
         "empty": [None] * row_count,
     })
@@ -458,11 +475,56 @@ def test_column_classification_profiles_every_supported_column_kind():
         "segment": "categorical",
         "category_code": "high_cardinality_categorical",
         "record_id": "identifier",
+        "customerId": "identifier",
+        "numeric_text": "numeric",
+        "created_text": "datetime",
+        "enabled_text": "boolean",
+        "notes": "text",
         "constant": "constant",
         "empty": "all_missing",
     }
     assert len(report["columns"]) == len(df.columns)
     assert report["classification_counts"]["all_missing"] == 1
+
+
+def test_openai_authentication_failure_does_not_retry_with_chat_completions(monkeypatch):
+    calls = []
+
+    class AuthenticationError(RuntimeError):
+        status_code = 401
+
+    class FakeResponses:
+        def create(self, **_kwargs):
+            calls.append("responses")
+            raise AuthenticationError("invalid test credentials")
+
+    class FakeCompletions:
+        def create(self, **_kwargs):
+            calls.append("chat")
+            raise AssertionError("authentication failures should not be retried")
+
+    class FakeOpenAI:
+        def __init__(self, **_kwargs):
+            self.responses = FakeResponses()
+            self.chat = type(
+                "FakeChat",
+                (),
+                {"completions": FakeCompletions()},
+            )()
+
+    monkeypatch.setenv("OPENAI_API_KEY", "invalid-test-key")
+    monkeypatch.setattr("profiler.OpenAI", FakeOpenAI)
+
+    with pytest.warns(RuntimeWarning, match="openai_credentials_rejected"):
+        summary = generate_ai_quality_summary(
+            pd.DataFrame({"value": [1, 2, 3]}),
+            use_llm=True,
+        )
+
+    assert calls == ["responses"]
+    assert summary["method"] == "built_in"
+    assert summary["fallback_used"] is True
+    assert summary["fallback_reason"] == "openai_credentials_rejected"
 
 
 def test_pipeline_failure_prediction_uses_binary_label_and_chronological_holdout():
@@ -500,6 +562,26 @@ def test_pipeline_failure_prediction_uses_binary_label_and_chronological_holdout
     )
 
 
+def test_pipeline_failure_rate_uses_only_rows_with_known_labels():
+    failures = [int(value % 5 == 0) for value in range(30)]
+    failures[1] = None
+    df = pd.DataFrame({
+        "started_at": pd.date_range("2026-01-01", periods=30, freq="D"),
+        "error_rate": [value / 100 for value in range(30)],
+        "failure": failures,
+    })
+
+    report = analyze_pipeline_failure_prediction(
+        df,
+        "failure",
+        timestamp_column="started_at",
+        model_names=["decision_tree"],
+    )
+
+    assert report["failure_rate"] == round(6 / 29, 6)
+    assert report["validation"]["train_rows"] + report["validation"]["test_rows"] == 29
+
+
 def test_pipeline_failure_prediction_requires_binary_labels_and_clear_positive_value():
     with pytest.raises(ValueError, match="binary target column"):
         analyze_pipeline_failure_prediction(
@@ -525,7 +607,22 @@ def test_fraud_detection_flags_outlier_and_describes_caveat():
     assert report["analysis"] == "fraud_detection"
     assert report["total_flagged"] >= 1
     assert any(row["row_index"] == "39" for row in report["flagged_rows"])
+    assert [
+        row["risk_score"] for row in report["flagged_rows"]
+    ] == sorted(
+        (row["risk_score"] for row in report["flagged_rows"]),
+        reverse=True,
+    )
     assert "not confirmed fraud" in report["interpretation"]
+
+
+@pytest.mark.parametrize("contamination", [0, 0.501, float("nan")])
+def test_fraud_detection_rejects_invalid_contamination(contamination):
+    with pytest.raises(ValueError, match="contamination must be between"):
+        detect_fraud_patterns(
+            pd.DataFrame({"amount": [1, 2, 3]}),
+            contamination=contamination,
+        )
 
 
 def test_predictive_maintenance_uses_automl_model_selection():
@@ -544,6 +641,27 @@ def test_predictive_maintenance_uses_automl_model_selection():
     assert report["selected_model"] == "decision_tree"
     assert report["target_interpretation"] == "Failure/event classification"
     assert report["models"][0]["metrics"]["accuracy"] >= 0
+
+
+def test_predictive_maintenance_supports_remaining_life_regression():
+    df = pd.DataFrame({
+        "temperature": list(range(30)),
+        "remaining_life": [100 - value * 2 for value in range(30)],
+    })
+
+    report = analyze_predictive_maintenance(
+        df,
+        "remaining_life",
+        task="regression",
+        model_names=["decision_tree"],
+    )
+
+    assert report["task"] == "regression"
+    assert report["target_interpretation"] == (
+        "Remaining useful life or another numeric maintenance outcome"
+    )
+    assert report["validation"]["method"] == "random_holdout"
+    assert report["models"][0]["metrics"]["rmse"] >= 0
 
 
 def test_recommendations_exclude_seen_items_and_use_item_similarity():

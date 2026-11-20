@@ -296,8 +296,12 @@ dataset and report. Set `analysis` to one of:
   to `"auto"` to evaluate k=2 through min(10, rows-1) for the selected
   algorithm and choose the valid clustering with the best silhouette score.
 - `column_classification`: classifies every column as numeric, boolean,
-  datetime, categorical, high-cardinality categorical, identifier, constant,
-  or all-missing, and reports type, missing, and distinct-value counts.
+  datetime, text, categorical, high-cardinality categorical, identifier,
+  constant, or all-missing, and reports type, missing, and distinct-value
+  counts. String-encoded numbers, dates, and common boolean values are
+  recognized; camel-case identifier suffixes such as `customerId` are
+  supported. Free text is distinguished when the median value is at least 40
+  characters or has at least six whitespace-delimited tokens.
 - `fraud_detection`: Isolation Forest ranks unusual records for review; supports
   `contamination` and optional `feature_columns`. Flags indicate anomalies, not
   confirmed fraud.
@@ -307,8 +311,8 @@ dataset and report. Set `analysis` to one of:
   `yes`, `failed`, `failure`, `error`, and `crashed`). Optionally supply
   `feature_columns` and a `timestamp_column`; the latter holds out the latest
   records chronologically and is excluded from model features. Reports include
-  failure-class precision, recall, and F1. Without a timestamp, validation uses
-  a random holdout.
+  failure-class precision, recall, F1, and a failure rate calculated from rows
+  with known labels. Without a timestamp, validation uses a random holdout.
 - `predictive_maintenance`: compares supervised models for a failure/event
   target (`task: "classification"`) or remaining-useful-life/numeric target
   (`task: "regression"`); accepts `target_column`, `metric`, `test_size`, and
@@ -321,13 +325,21 @@ dataset and report. Set `analysis` to one of:
 For example, cluster a dataset with
 `{"analysis":"clustering","n_clusters":2,"data":[{"temperature":18},{"temperature":19},{"temperature":41},{"temperature":42}]}`.
 
-Acceptance criteria: automatic clustering must select from the documented k
-range using valid silhouette scores; column classification must return one
-classification for every input column, including constant and all-missing
-columns; pipeline-failure prediction must require two target classes, exclude
-the timestamp from model inputs, and report class-specific metrics using a
-chronological holdout when a timestamp is supplied. These contracts are covered
-by dedicated tests.
+Acceptance criteria: automatic clustering evaluates k=2 through
+min(10, rows-1), chooses the candidate with the highest valid silhouette score,
+and returns matching cluster profiles and row assignments. Column
+classification returns exactly one classification per input column, including
+string-encoded numeric/date/boolean values, camel-case identifiers, free text
+(median value length of 40 or more characters or at least six whitespace-
+delimited tokens), constant columns, and all-missing columns. Fraud screening
+validates its contamination range, returns ranked anomaly evidence, and
+explicitly treats flags as review candidates rather than fraud verdicts.
+Predictive-maintenance classification and remaining-life regression each
+return a selected model and task-appropriate held-out metrics. Pipeline-failure
+prediction requires two target classes, excludes the timestamp from model
+inputs, uses a chronological holdout when a timestamp is supplied, reports
+failure-class precision/recall/F1, and calculates the failure rate only over
+labeled rows. These contracts are covered by dedicated unit and API tests.
 
 ---
 
