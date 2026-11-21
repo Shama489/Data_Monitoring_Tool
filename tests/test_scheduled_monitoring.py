@@ -139,6 +139,86 @@ def test_source_schedule_creates_versions_and_monitors_each_refresh(tmp_path, mo
     )
 
 
+def test_incremental_source_schedule_updates_rows_and_advances_checkpoint(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("DATASET_ALLOWED_DIRS", str(tmp_path))
+    source_path = tmp_path / "incremental-events.csv"
+    source_path.write_text(
+        "id,updated_at,value\n"
+        "1,2026-01-01T00:00:00Z,first\n"
+        "2,2026-01-02T00:00:00Z,old\n",
+        encoding="utf-8",
+    )
+    created = client.post(
+        "/api/schedules",
+        json={
+            "source": {"type": "csv", "path": str(source_path)},
+            "incremental": {
+                "column": "updated_at",
+                "strategy": "timestamp",
+                "key_column": "id",
+            },
+            "interval_seconds": 60,
+            "checks": ["quality"],
+        },
+    )
+    assert created.status_code == 201, created.text
+    schedule = created.json()
+
+    source_path.write_text(
+        "id,updated_at,value\n"
+        "1,2026-01-01T00:00:00Z,first\n"
+        "2,2026-01-03T00:00:00Z,updated\n"
+        "3,2026-01-04T00:00:00Z,new\n",
+        encoding="utf-8",
+    )
+    connection = open_database()
+    try:
+        connection.execute(
+            "UPDATE monitoring_schedules SET next_run_at = ? WHERE id = ?",
+            (time.time() - 1, schedule["id"]),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    assert run_due_schedules() == 1
+    updated = next(
+        item for item in client.get("/api/schedules").json()["schedules"]
+        if item["id"] == schedule["id"]
+    )
+    latest_dataset_id = updated["schedule"]["latest_dataset_id"]
+    data = client.get(f"/api/datasets/{latest_dataset_id}").json()["data"]
+    assert data == [
+        {"id": 1, "updated_at": "2026-01-01T00:00:00Z", "value": "first"},
+        {"id": 2, "updated_at": "2026-01-03T00:00:00Z", "value": "updated"},
+        {"id": 3, "updated_at": "2026-01-04T00:00:00Z", "value": "new"},
+    ]
+
+    version_count = len(
+        client.get(
+            f"/api/datasets/{schedule['dataset_id']}/versions"
+        ).json()["versions"]
+    )
+    connection = open_database()
+    try:
+        connection.execute(
+            "UPDATE monitoring_schedules SET next_run_at = ? WHERE id = ?",
+            (time.time() - 1, schedule["id"]),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    assert run_due_schedules() == 1
+    assert len(
+        client.get(
+            f"/api/datasets/{schedule['dataset_id']}/versions"
+        ).json()["versions"]
+    ) == version_count
+
+
 def test_failed_source_poll_creates_no_version_and_retries(tmp_path, monkeypatch):
     monkeypatch.setenv("DATASET_ALLOWED_DIRS", str(tmp_path))
     source_path = tmp_path / "events.csv"
@@ -210,18 +290,29 @@ def test_scheduled_http_source_uses_environment_credentials_without_persisting_t
         status_code = 200
         is_redirect = False
 
+        def __init__(self, value):
+            self.value = value
+
         def raise_for_status(self):
             return None
 
         def iter_content(self, chunk_size):
-            yield json.dumps({"data": [{"value": 1}]}).encode()
+            yield json.dumps({"data": [self.value]}).encode()
 
         def close(self):
             return None
 
     def fake_get(url, **kwargs):
-        calls.append(kwargs["headers"].get("Authorization"))
-        return FakeResponse()
+        calls.append({
+            "authorization": kwargs["headers"].get("Authorization"),
+            "params": kwargs["params"],
+        })
+        value = (
+            {"id": 2, "value": "new"}
+            if "since_id" in kwargs["params"]
+            else {"id": 1, "value": "initial"}
+        )
+        return FakeResponse(value)
 
     secret = "test-scheduled-api-secret"
     monkeypatch.setenv("DATA_SOURCE_HTTP_ALLOWED_HOSTS", "api.example.test")
@@ -236,6 +327,12 @@ def test_scheduled_http_source_uses_environment_credentials_without_persisting_t
                 "url": "https://api.example.test/events",
                 "token_env": "SCHEDULED_API_TOKEN",
             },
+            "incremental": {
+                "column": "id",
+                "strategy": "id",
+                "key_column": "id",
+                "fetch_parameter": "since_id",
+            },
             "interval_seconds": 60,
         },
     )
@@ -243,7 +340,10 @@ def test_scheduled_http_source_uses_environment_credentials_without_persisting_t
     assert response.status_code == 201, response.text
     assert response.json()["schedule"]["source"]["token_env"] == "SCHEDULED_API_TOKEN"
     assert secret not in response.text
-    assert calls == [f"Bearer {secret}"]
+    assert calls == [{
+        "authorization": f"Bearer {secret}",
+        "params": {},
+    }]
     schedule_id = response.json()["id"]
     connection = open_database()
     try:
@@ -256,7 +356,10 @@ def test_scheduled_http_source_uses_environment_credentials_without_persisting_t
         connection.close()
 
     assert run_due_schedules() == 1
-    assert calls == [f"Bearer {secret}", f"Bearer {secret}"]
+    assert calls == [
+        {"authorization": f"Bearer {secret}", "params": {}},
+        {"authorization": f"Bearer {secret}", "params": {"since_id": 1}},
+    ]
 
 
 def test_source_schedule_rejects_inline_credentials(tmp_path, monkeypatch):

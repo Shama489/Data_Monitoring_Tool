@@ -1042,6 +1042,7 @@ def create_monitoring_schedule_dataset_version(
     data: Any,
     source: Any,
     change_summary: str,
+    checkpoint_value: int | float | str | None = None,
 ) -> str:
     """Atomically persist a fetched snapshot and advance its schedule pointer."""
     with connect_database() as connection:
@@ -1074,6 +1075,8 @@ def create_monitoring_schedule_dataset_version(
             change_summary=change_summary,
         )
         schedule["latest_dataset_id"] = version_id
+        if checkpoint_value is not None:
+            schedule["checkpoint_value"] = checkpoint_value
         connection.execute(
             "UPDATE monitoring_schedules SET schedule = ?, updated_at = ? "
             "WHERE id = ?",

@@ -509,6 +509,9 @@ def load_http_json(
     params: dict[str, Any] | None = None,
     max_rows: int | None = MAX_SOURCE_ROWS,
     max_columns: int | None = MAX_SOURCE_COLUMNS,
+    api_key_env: str | None = None,
+    api_key_header: str = "X-API-Key",
+    pagination: dict[str, Any] | None = None,
 ) -> pd.DataFrame:
     """Load tabular records from an allowlisted HTTPS JSON API."""
     if records_path is not None and (
@@ -521,8 +524,97 @@ def load_http_json(
         raise DataSourceError("HTTP API params must be an object")
     if params and any(_is_credential_name(key) for key in params):
         raise DataSourceError(
-            "Do not put credentials in HTTP query parameters; use token_env"
+            "Do not put credentials in HTTP query parameters; use a credential environment variable"
         )
+    if not isinstance(api_key_header, str) or not api_key_header or any(
+        character not in "!#$%&'*+-.^_`|~0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+        for character in api_key_header
+    ):
+        raise DataSourceError("api_key_header must be a valid HTTP header name")
+    if api_key_header.lower() in {
+        "authorization", "cookie", "host", "proxy-authorization", "set-cookie",
+    }:
+        raise DataSourceError("api_key_header cannot override a protected HTTP header")
+
+    pagination_settings: dict[str, Any] | None = None
+    if pagination is not None:
+        if not isinstance(pagination, dict):
+            raise DataSourceError("HTTP API pagination must be an object")
+        allowed_pagination_fields = {
+            "strategy",
+            "parameter",
+            "page_size_parameter",
+            "page_size",
+            "max_pages",
+            "start",
+            "next_cursor_path",
+        }
+        if set(pagination) - allowed_pagination_fields:
+            raise DataSourceError("HTTP API pagination contains unsupported fields")
+        strategy = pagination.get("strategy")
+        if strategy not in {"page", "offset", "cursor"}:
+            raise DataSourceError("HTTP API pagination strategy must be page, offset, or cursor")
+        try:
+            page_size = pagination.get("page_size", 100)
+            max_pages = pagination.get("max_pages", 100)
+            if (
+                isinstance(page_size, bool)
+                or not isinstance(page_size, int)
+                or not 1 <= page_size <= 10_000
+            ):
+                raise ValueError
+            if (
+                isinstance(max_pages, bool)
+                or not isinstance(max_pages, int)
+                or not 1 <= max_pages <= 1_000
+            ):
+                raise ValueError
+            start = pagination.get("start", 1 if strategy == "page" else 0)
+            if isinstance(start, bool) or not isinstance(start, (int, str)):
+                raise ValueError
+            if strategy != "cursor" and (not str(start).isdecimal()):
+                raise ValueError
+            if strategy != "cursor":
+                start = int(start)
+        except (TypeError, ValueError):
+            raise DataSourceError(
+                "HTTP API pagination page_size, max_pages, or start is invalid"
+            ) from None
+        parameter = pagination.get(
+            "parameter",
+            {"page": "page", "offset": "offset", "cursor": "cursor"}[strategy],
+        )
+        page_size_parameter = pagination.get(
+            "page_size_parameter",
+            "limit" if strategy == "offset" else "page_size",
+        )
+        if (
+            not isinstance(parameter, str)
+            or not parameter
+            or _is_credential_name(parameter)
+            or not isinstance(page_size_parameter, str)
+            or not page_size_parameter
+            or _is_credential_name(page_size_parameter)
+        ):
+            raise DataSourceError("HTTP API pagination parameter is invalid")
+        next_cursor_path = pagination.get("next_cursor_path")
+        if strategy == "cursor" and (
+            not isinstance(next_cursor_path, str)
+            or not next_cursor_path
+            or any(not part for part in next_cursor_path.split("."))
+        ):
+            raise DataSourceError(
+                "Cursor pagination requires a dotted next_cursor_path"
+            )
+        pagination_settings = {
+            "strategy": strategy,
+            "page_size": page_size,
+            "max_pages": max_pages,
+            "start": start,
+            "parameter": parameter,
+            "page_size_parameter": page_size_parameter,
+            "next_cursor_path": next_cursor_path,
+        }
     parsed_url = urlsplit(url)
     if (
         parsed_url.scheme.lower() != "https"
@@ -559,59 +651,134 @@ def load_http_json(
         raise DataSourceError("HTTP API host is not listed in DATA_SOURCE_HTTP_ALLOWED_HOSTS")
 
     headers = {"Accept": "application/json"}
-    if token_env:
+    if token_env is not None:
         headers["Authorization"] = (
             f"Bearer {_environment_value({'token_env': token_env}, 'token_env')}"
         )
-
-    response = None
-    try:
-        response = requests.get(
-            url,
-            params=params,
-            headers=headers,
-            timeout=(5, 30),
-            allow_redirects=False,
-            stream=True,
+    if api_key_env is not None:
+        headers[api_key_header] = _environment_value(
+            {"api_key_env": api_key_env}, "api_key_env"
         )
-        if response.is_redirect:
-            raise DataSourceError("HTTP API redirects are not supported")
-        response.raise_for_status()
-        content = bytearray()
-        for chunk in response.iter_content(chunk_size=64 * 1024):
-            content.extend(chunk)
-            if len(content) > MAX_SOURCE_BYTES:
-                raise DataSourceError(
-                    f"HTTP API response must not exceed {MAX_SOURCE_BYTES // (1024 * 1024)} MiB"
-                )
-        payload = json.loads(content)
-    except DataSourceError:
-        raise
-    except requests.RequestException as error:
-        logger.error("HTTP JSON source request failed (%s)", type(error).__name__)
-        status_code = getattr(response, "status_code", None)
-        if status_code is not None:
-            raise DataSourceError(f"HTTP API request failed with status {status_code}") from error
-        raise DataSourceError("HTTP API request failed; check the endpoint and connectivity") from error
-    except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as error:
-        logger.error("HTTP JSON source returned invalid JSON (%s)", type(error).__name__)
-        raise DataSourceError("HTTP API response was not valid JSON") from error
-    finally:
-        if response is not None:
-            response.close()
 
-    records: Any = payload
-    if records_path:
-        for key in records_path.split("."):
-            if not isinstance(records, dict) or key not in records:
-                raise DataSourceError("records_path does not exist in the HTTP API response")
-            records = records[key]
-    elif isinstance(records, dict):
-        records = records.get("data", records.get("results"))
-    if not isinstance(records, list) or any(not isinstance(item, dict) for item in records):
-        raise DataSourceError("HTTP API response must contain a list of record objects")
+    def extract_path(value: Any, path: str) -> Any:
+        for key in path.split("."):
+            if not isinstance(value, dict) or key not in value:
+                raise DataSourceError(f"HTTP API response path {path} does not exist")
+            value = value[key]
+        return value
+
+    frames: list[pd.DataFrame] = []
+    cursor: Any = None
+    page_number = pagination_settings["start"] if pagination_settings else None
+    for page_index in range(pagination_settings["max_pages"] if pagination_settings else 1):
+        request_params = dict(params or {})
+        if pagination_settings:
+            strategy = pagination_settings["strategy"]
+            if strategy == "page":
+                request_params[pagination_settings["parameter"]] = page_number
+                request_params.setdefault(
+                    pagination_settings["page_size_parameter"],
+                    pagination_settings["page_size"],
+                )
+            elif strategy == "offset":
+                request_params[pagination_settings["parameter"]] = (
+                    pagination_settings["start"] + page_index * pagination_settings["page_size"]
+                )
+                request_params.setdefault(
+                    pagination_settings["page_size_parameter"],
+                    pagination_settings["page_size"],
+                )
+            else:
+                request_params.setdefault(
+                    pagination_settings["page_size_parameter"],
+                    pagination_settings["page_size"],
+                )
+                if cursor is not None:
+                    request_params[pagination_settings["parameter"]] = cursor
+
+        response = None
+        try:
+            response = requests.get(
+                url,
+                params=request_params,
+                headers=headers,
+                timeout=(5, 30),
+                allow_redirects=False,
+                stream=True,
+            )
+            if response.is_redirect:
+                raise DataSourceError("HTTP API redirects are not supported")
+            response.raise_for_status()
+            content = bytearray()
+            for chunk in response.iter_content(chunk_size=64 * 1024):
+                content.extend(chunk)
+                if len(content) > MAX_SOURCE_BYTES:
+                    raise DataSourceError(
+                        f"HTTP API response must not exceed {MAX_SOURCE_BYTES // (1024 * 1024)} MiB"
+                    )
+            payload = json.loads(content)
+        except DataSourceError:
+            raise
+        except requests.RequestException as error:
+            logger.error("HTTP JSON source request failed (%s)", type(error).__name__)
+            status_code = getattr(response, "status_code", None)
+            if status_code is not None:
+                raise DataSourceError(
+                    f"HTTP API request failed with status {status_code}"
+                ) from error
+            raise DataSourceError(
+                "HTTP API request failed; check the endpoint and connectivity"
+            ) from error
+        except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as error:
+            logger.error("HTTP JSON source returned invalid JSON (%s)", type(error).__name__)
+            raise DataSourceError("HTTP API response was not valid JSON") from error
+        finally:
+            if response is not None:
+                response.close()
+
+        records: Any = extract_path(payload, records_path) if records_path else payload
+        if not records_path and isinstance(records, dict):
+            records = records.get("data", records.get("results"))
+        if not isinstance(records, list) or any(
+            not isinstance(item, dict) for item in records
+        ):
+            raise DataSourceError(
+                "HTTP API response must contain a list of record objects"
+            )
+        page_frame = _validate_frame_dimensions(
+            pd.DataFrame(records),
+            max_columns=max_columns,
+        )
+        frames.append(page_frame)
+        total_rows = sum(len(frame.index) for frame in frames)
+        if max_rows is not None and total_rows > max_rows:
+            raise DataSourceError(f"Dataset must not exceed {max_rows:,} rows")
+        if not pagination_settings:
+            break
+        if pagination_settings["strategy"] == "cursor":
+            next_cursor = extract_path(
+                payload, pagination_settings["next_cursor_path"]
+            )
+            if next_cursor in (None, ""):
+                break
+            if next_cursor == cursor:
+                raise DataSourceError("HTTP API cursor did not advance")
+            if page_index + 1 == pagination_settings["max_pages"]:
+                raise DataSourceError(
+                    "HTTP API pagination exceeded the configured max_pages"
+                )
+            cursor = next_cursor
+        else:
+            if len(records) < pagination_settings["page_size"]:
+                break
+            if page_index + 1 == pagination_settings["max_pages"]:
+                raise DataSourceError(
+                    "HTTP API pagination exceeded the configured max_pages"
+                )
+            if pagination_settings["strategy"] == "page":
+                page_number += 1
     return _validate_frame_dimensions(
-        pd.DataFrame(records),
+        pd.concat(frames, ignore_index=True),
         max_rows,
         max_columns,
     )
@@ -700,10 +867,105 @@ def load_source(
             source.get("params"),
             max_rows,
             max_columns,
+            source.get("api_key_env"),
+            source.get("api_key_header", "X-API-Key"),
+            source.get("pagination"),
         )
     else:
         raise DataSourceError(f"Unsupported source type: {source_type or 'unknown'}")
     return _validate_frame_dimensions(frame, max_rows, max_columns)
+
+
+def validate_incremental_config(
+    frame: pd.DataFrame, config: Any
+) -> tuple[dict[str, str], int | float | str]:
+    """Validate an incremental cursor and return its initial high-water mark."""
+    if not frame.columns.is_unique:
+        raise DataSourceError("Incremental source columns must be unique")
+    if not isinstance(config, dict) or set(config) - {
+        "column", "strategy", "key_column", "fetch_parameter",
+    } or not {"column", "strategy", "key_column"}.issubset(config):
+        raise DataSourceError(
+            "incremental must contain column, strategy, and key_column, with optional fetch_parameter"
+        )
+    column = config.get("column")
+    key_column = config.get("key_column")
+    strategy = config.get("strategy")
+    if (
+        not isinstance(column, str)
+        or not column
+        or not isinstance(key_column, str)
+        or not key_column
+    ):
+        raise DataSourceError("incremental column and key_column are required")
+    if not isinstance(strategy, str) or strategy not in {"timestamp", "id"}:
+        raise DataSourceError("incremental strategy must be timestamp or id")
+    fetch_parameter = config.get("fetch_parameter")
+    if fetch_parameter is not None and (
+        not isinstance(fetch_parameter, str)
+        or not fetch_parameter.isidentifier()
+        or _is_credential_name(fetch_parameter)
+    ):
+        raise DataSourceError(
+            "incremental fetch_parameter must be a non-credential parameter name"
+        )
+    if column not in frame.columns or key_column not in frame.columns:
+        raise DataSourceError("incremental columns must exist in the source dataset")
+    keys = frame[key_column]
+    if keys.isna().any() or keys.duplicated().any():
+        raise DataSourceError(
+            "incremental key_column values must be non-null and unique"
+        )
+
+    values = frame[column]
+    if strategy == "timestamp":
+        normalized = pd.to_datetime(values, utc=True, errors="coerce")
+        if normalized.isna().any():
+            raise DataSourceError("incremental timestamp values must be valid")
+        checkpoint = normalized.max().isoformat()
+    else:
+        normalized = pd.to_numeric(values, errors="coerce")
+        if normalized.isna().any() or not normalized.map(
+            lambda value: pd.notna(value) and float(value) not in (float("inf"), float("-inf"))
+        ).all():
+            raise DataSourceError("incremental ID values must be finite numbers")
+        maximum = normalized.max()
+        checkpoint = int(maximum) if float(maximum).is_integer() else float(maximum)
+    normalized_config = {
+        "column": column,
+        "strategy": strategy,
+        "key_column": key_column,
+    }
+    if fetch_parameter is not None:
+        normalized_config["fetch_parameter"] = fetch_parameter
+    return normalized_config, checkpoint
+
+
+def filter_incremental_records(
+    frame: pd.DataFrame,
+    config: dict[str, str],
+    checkpoint: int | float | str,
+) -> tuple[pd.DataFrame, int | float | str]:
+    """Return records beyond a checkpoint and the new high-water mark."""
+    validated, _ = validate_incremental_config(frame, config)
+    values = frame[validated["column"]]
+    if validated["strategy"] == "timestamp":
+        normalized = pd.to_datetime(values, utc=True, errors="coerce")
+        boundary = pd.to_datetime(checkpoint, utc=True, errors="coerce")
+        if pd.isna(boundary):
+            raise DataSourceError("incremental checkpoint is invalid")
+        next_checkpoint: int | float | str = normalized.max().isoformat()
+    else:
+        normalized = pd.to_numeric(values, errors="coerce")
+        try:
+            boundary = float(checkpoint)
+        except (TypeError, ValueError) as error:
+            raise DataSourceError("incremental checkpoint is invalid") from error
+        if not pd.notna(boundary) or boundary in (float("inf"), float("-inf")):
+            raise DataSourceError("incremental checkpoint is invalid")
+        maximum = normalized.max()
+        next_checkpoint = int(maximum) if float(maximum).is_integer() else float(maximum)
+    return frame.loc[normalized > boundary].copy(), next_checkpoint
 
 
 def source_capabilities() -> dict[str, Any]:
@@ -754,7 +1016,9 @@ def source_capabilities() -> dict[str, Any]:
             "dependencies": {"requests": "requests"},
             "required_fields": ["url"],
             "credential_env": ["DATA_SOURCE_HTTP_ALLOWED_HOSTS"],
-            "credential_setup": "Allowlist API hostnames in DATA_SOURCE_HTTP_ALLOWED_HOSTS; use token_env for optional bearer credentials.",
+            "auth_methods": ["bearer", "api_key"],
+            "pagination_strategies": ["page", "offset", "cursor"],
+            "credential_setup": "Allowlist API hostnames in DATA_SOURCE_HTTP_ALLOWED_HOSTS; use token_env or api_key_env for optional credentials.",
         },
     ]
 

@@ -217,7 +217,19 @@ do not create a version and use the scheduler's existing bounded retry policy.
 Scheduled SQL and MongoDB sources must use `url_env` and `uri_env` to name
 server-side environment variables; never put passwords or API credentials in
 the schedule request. HTTP API sources use `token_env` for an optional bearer
-token, and provider credentials such as Dropbox or AWS remain server-side.
+token or `api_key_env` and `api_key_header` for an API key; credentials remain
+server-side. Add an `incremental` object to a source schedule to load new or
+changed rows. It requires a timestamp or numeric ID cursor and a unique key
+column, for example
+`{"column":"updated_at","strategy":"timestamp","key_column":"event_id"}`.
+Rows beyond the saved checkpoint are merged into the latest dataset version by
+the unique key; failed polls do not advance the checkpoint, and unchanged polls
+do not create duplicate versions.
+For SQL and HTTP JSON sources, optionally set `fetch_parameter` in the
+incremental object and use that named parameter in the SQL query's `WHERE`
+clause or as an API query parameter to have the source return only rows beyond
+the checkpoint. For SQL, initialize `source.params[fetch_parameter]` with the
+starting cursor value; subsequent polls replace it with the saved checkpoint.
 
 For example, a recurring HTTP source can be scheduled with
 `{"source":{"type":"http_json","url":"https://api.example.com/events","token_env":"EVENTS_API_TOKEN"},"interval_seconds":3600,"checks":["quality","anomalies"]}`.
@@ -596,11 +608,25 @@ Supported source types are `csv`, `excel`, `json`, `parquet`, `tsv`, `txt`, `sql
 
 The `http_json` source (alias `rest_json`) loads record arrays from an HTTPS
 JSON API. Provide `url`, an optional dotted `records_path`, and optionally
-`token_env` naming an environment variable that contains a bearer token.
-Configure `DATA_SOURCE_HTTP_ALLOWED_HOSTS` as a comma-separated allowlist of
-hostnames before using this connector. Redirects are disabled. Source files and
-HTTP responses are limited to 50 MiB; all source loaders reject data exceeding
-100,000 rows or 1,000 columns. SQL results are read in bounded chunks.
+`token_env` for a bearer token or `api_key_env` with `api_key_header` for an API
+key. Secrets are read from server environment variables and are not accepted
+in query parameters. Configure `DATA_SOURCE_HTTP_ALLOWED_HOSTS` as a
+comma-separated allowlist of hostnames before using this connector. Redirects
+are disabled. Optional `pagination` supports `page`, `offset`, or `cursor`
+strategies with configurable parameter names, page size, and a bounded
+`max_pages`; cursor pagination also requires `next_cursor_path`. For example:
+`{"strategy":"page","page_size":100,"page_size_parameter":"per_page","max_pages":20}`.
+Source files and HTTP responses are limited to 50 MiB; all source loaders
+reject data exceeding 100,000 rows or 1,000 columns. SQL results are read in
+bounded chunks.
+
+Use `POST /api/sources/join` to combine two to ten saved datasets or configured
+sources. Each entry supplies a unique `name`, a `source` or `dataset_id`, and a
+`join_key` (one column or an equally sized list of columns). Select `how` as
+`inner`, `left`, or `outer` (default `outer`). Non-key fields are prefixed with
+their source name; the response and persisted monitoring result include
+unmatched-record counts and samples, conflicting values, and the saved joined
+dataset ID.
 
 Use `GET /api/sources/capabilities` to check supported providers, missing SDKs, and required credential configuration before submitting a multi-source analysis. Provider SDK imports remain optional at startup; install the relevant entries from `requirements.txt` when needed. AWS credentials are resolved through the normal SDK chain, including environment variables, profiles, and execution roles.
 
