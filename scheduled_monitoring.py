@@ -11,13 +11,20 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
+import pandas as pd
+
 from agents.monitoring_agent import run_monitoring
-from data_sources import DataSourceError, load_source
+from data_sources import (
+    DataSourceError,
+    filter_incremental_records,
+    load_source,
+)
 from monitoring_store import (
     claim_due_monitoring_schedules,
     create_monitoring_schedule_dataset_version,
     create_monitoring_report,
     finish_monitoring_schedule,
+    get_dataset,
     record_lineage_event,
     record_pipeline_run,
 )
@@ -44,10 +51,78 @@ def _execute_schedule(item: dict[str, Any]) -> None:
     source = config.get("source")
     if isinstance(source, dict):
         try:
-            frame = load_source(source)
-            if frame.empty:
+            incremental = config.get("incremental")
+            source_for_load = source
+            fetch_parameter = (
+                incremental.get("fetch_parameter")
+                if isinstance(incremental, dict)
+                else None
+            )
+            if fetch_parameter is not None:
+                source_type = str(source.get("type", "")).lower().strip()
+                if source_type not in {
+                    "sql", "postgresql", "mysql", "http_json", "rest_json",
+                }:
+                    raise DataSourceError(
+                        "fetch_parameter is supported only for SQL and HTTP JSON sources"
+                    )
+                params = source.get("params", {})
+                if not isinstance(params, dict):
+                    raise DataSourceError(
+                        "Source params must be an object when fetch_parameter is configured"
+                    )
+                source_for_load = {
+                    **source,
+                    "params": {
+                        **params,
+                        fetch_parameter: config.get("checkpoint_value"),
+                    },
+                }
+            frame = load_source(source_for_load)
+            if frame.empty and not fetch_parameter:
                 raise DataSourceError("Source dataset must not be empty")
-            records_processed = len(frame)
+            checkpoint_value = None
+            if incremental:
+                checkpoint = config.get("checkpoint_value")
+                if checkpoint is None:
+                    raise DataSourceError("Incremental source checkpoint is unavailable")
+                if frame.empty:
+                    new_records = frame
+                    checkpoint_value = checkpoint
+                else:
+                    new_records, checkpoint_value = filter_incremental_records(
+                        frame,
+                        incremental,
+                        checkpoint,
+                    )
+                records_processed = len(new_records.index)
+                latest_dataset_id = config.get(
+                    "latest_dataset_id", item["dataset_id"]
+                )
+                if new_records.empty:
+                    dataset_id = latest_dataset_id
+                else:
+                    latest_dataset = get_dataset(
+                        latest_dataset_id,
+                        owner_id=item["owner_id"],
+                    )
+                    if latest_dataset is None:
+                        raise DataSourceError(
+                            "Latest incremental dataset version was not found"
+                        )
+                    combined = pd.concat(
+                        [
+                            pd.DataFrame(latest_dataset["data"]),
+                            new_records,
+                        ],
+                        ignore_index=True,
+                    ).drop_duplicates(
+                        subset=[incremental["key_column"]],
+                        keep="last",
+                    )
+                    frame = combined
+            else:
+                records_processed = len(frame.index)
             source_metadata = {
                 key: source[key]
                 for key in (
@@ -62,13 +137,15 @@ def _execute_schedule(item: dict[str, Any]) -> None:
                 )
                 if source.get(key) is not None
             }
-            dataset_id = create_monitoring_schedule_dataset_version(
-                item["id"],
-                config.get("dataset_name", "monitoring_dataset"),
-                json.loads(frame.to_json(orient="records", date_format="iso")),
-                source_metadata,
-                "Scheduled source refresh",
-            )
+            if not incremental or records_processed:
+                dataset_id = create_monitoring_schedule_dataset_version(
+                    item["id"],
+                    config.get("dataset_name", "monitoring_dataset"),
+                    json.loads(frame.to_json(orient="records", date_format="iso")),
+                    source_metadata,
+                    "Scheduled source refresh",
+                    checkpoint_value=checkpoint_value,
+                )
         except Exception as error:
             logger.error(
                 "Scheduled source refresh failed for %s (%s)",

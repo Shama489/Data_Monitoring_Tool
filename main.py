@@ -59,6 +59,7 @@ from data_sources import (
     load_source,
     load_uploaded_file,
     summarize_source,
+    validate_incremental_config,
 )
 from monitoring_store import (
     clear_login_failures,
@@ -275,7 +276,7 @@ def _validate_scheduled_source(source: Any) -> dict[str, Any]:
 
     def has_inline_credential(key: Any) -> bool:
         normalized = "".join(character for character in str(key).lower() if character.isalnum())
-        return not normalized.endswith("env") and any(
+        return normalized != "apikeyheader" and not normalized.endswith("env") and any(
             marker in normalized for marker in credential_markers
         )
 
@@ -800,6 +801,277 @@ def analyze_sources_endpoint(payload: dict[str, Any]):
     if not reports and failures:
         _bad_request(failures[0]["error"])
     return {"sources": reports, "failed": failures, "success": not failures}
+
+
+@app.post("/api/sources/join")
+def join_sources_endpoint(payload: dict[str, Any]):
+    sources = payload.get("sources")
+    if not isinstance(sources, list) or not 2 <= len(sources) <= 10:
+        _bad_request("sources must contain between 2 and 10 source definitions")
+    how = payload.get("how", "outer")
+    if how not in {"inner", "left", "outer"}:
+        _bad_request("how must be inner, left, or outer")
+
+    frames: list[pd.DataFrame] = []
+    specifications: list[dict[str, Any]] = []
+    names: set[str] = set()
+    for index, item in enumerate(sources):
+        if not isinstance(item, dict):
+            _bad_request(f"sources[{index}] must be an object")
+        name = item.get("name")
+        join_key = item.get("join_key")
+        keys = [join_key] if isinstance(join_key, str) else join_key
+        if (
+            not isinstance(name, str)
+            or not name.strip()
+            or len(name) > 64
+            or name in names
+        ):
+            _bad_request(f"sources[{index}].name must be a unique non-empty string")
+        if (
+            not isinstance(keys, list)
+            or not keys
+            or not all(isinstance(key, str) and key for key in keys)
+            or len(set(keys)) != len(keys)
+        ):
+            _bad_request(f"sources[{index}].join_key must be a column or list of columns")
+        if ("source" in item) == ("dataset_id" in item):
+            _bad_request(f"sources[{index}] must contain exactly one of source or dataset_id")
+
+        if "dataset_id" in item:
+            dataset_id = item["dataset_id"]
+            if not isinstance(dataset_id, str) or not dataset_id:
+                _bad_request(f"sources[{index}].dataset_id must be a non-empty string")
+            dataset = get_dataset(dataset_id, owner_id=current_user_scope())
+            if dataset is None:
+                raise HTTPException(status_code=404, detail="Dataset was not found")
+            frame = pd.DataFrame(dataset["data"])
+            source_metadata = {"type": "dataset", "dataset_id": dataset_id}
+        else:
+            source_config = item["source"]
+            if not isinstance(source_config, dict):
+                _bad_request(f"sources[{index}].source must be an object")
+            try:
+                frame = load_source(source_config)
+            except (DataSourceError, TypeError, ValueError) as error:
+                _bad_request(f"Could not load source {name}: {error}")
+            source_metadata = _dataset_source({"source": source_config})
+
+        if frame.empty:
+            _bad_request(f"Source {name} must not be empty")
+        if not frame.columns.is_unique:
+            _bad_request(f"Source {name} must have unique column names")
+        if any(key not in frame.columns for key in keys):
+            _bad_request(f"Join keys for source {name} must exist in its dataset")
+        if frame[keys].isna().any().any():
+            _bad_request(f"Join keys for source {name} must not contain missing values")
+        if frame[keys].apply(
+            lambda column: column.map(
+                lambda value: isinstance(value, (dict, list, set))
+            ).any()
+        ).any():
+            _bad_request(f"Join keys for source {name} must contain scalar values")
+        names.add(name)
+        frames.append(frame)
+        specifications.append({
+            "name": name,
+            "keys": keys,
+            "source": source_metadata,
+        })
+
+    key_count = len(specifications[0]["keys"])
+    if any(len(spec["keys"]) != key_count for spec in specifications):
+        _bad_request("Each source must provide the same number of join key columns")
+    canonical_keys = [f"__join_key_{index}" for index in range(key_count)]
+    renamed_frames: list[pd.DataFrame] = []
+    original_columns: dict[str, list[tuple[int, str]]] = {}
+    for source_index, (frame, spec) in enumerate(zip(frames, specifications)):
+        rename = dict(zip(spec["keys"], canonical_keys))
+        value_columns = []
+        for column in frame.columns:
+            column_name = str(column)
+            if column in spec["keys"]:
+                continue
+            output_column = f"{spec['name']}.{column_name}"
+            if output_column in value_columns:
+                _bad_request(f"Source {spec['name']} has duplicate column names")
+            value_columns.append(output_column)
+            original_columns.setdefault(column_name, []).append(
+                (source_index, output_column)
+            )
+            rename[column] = output_column
+        normalized_frame = frame.rename(columns=rename)
+        if normalized_frame.columns.duplicated().any():
+            _bad_request(f"Source {spec['name']} has duplicate column names")
+        renamed_frames.append(normalized_frame)
+
+    projected_columns = key_count + sum(
+        len(frame.columns) - len(spec["keys"])
+        for frame, spec in zip(frames, specifications)
+    )
+    if projected_columns > MAX_DATASET_COLUMNS:
+        _bad_request(
+            f"Joined dataset must not exceed {MAX_DATASET_COLUMNS:,} columns"
+        )
+
+    joined = renamed_frames[0]
+    for next_frame in renamed_frames[1:]:
+        left_counts = joined.groupby(canonical_keys, dropna=False).size()
+        right_counts = next_frame.groupby(canonical_keys, dropna=False).size()
+        matched_rows = sum(
+            int(left_count) * int(right_counts.get(key, 0))
+            for key, left_count in left_counts.items()
+        )
+        if how == "outer":
+            estimated_rows = (
+                matched_rows
+                + sum(
+                    int(count)
+                    for key, count in left_counts.items()
+                    if key not in right_counts
+                )
+                + sum(
+                    int(count)
+                    for key, count in right_counts.items()
+                    if key not in left_counts
+                )
+            )
+        elif how == "left":
+            estimated_rows = matched_rows + sum(
+                int(count)
+                for key, count in left_counts.items()
+                if key not in right_counts
+            )
+        else:
+            estimated_rows = matched_rows
+        if estimated_rows > MAX_DATASET_ROWS:
+            _bad_request(
+                f"Joined dataset must not exceed {MAX_DATASET_ROWS:,} rows"
+            )
+        try:
+            merged = joined.merge(
+                next_frame,
+                on=canonical_keys,
+                how=how,
+                sort=False,
+            )
+        except (ValueError, TypeError) as error:
+            _bad_request(f"Source join failed because join keys are incompatible: {error}")
+        if len(merged.index) > MAX_DATASET_ROWS:
+            _bad_request(f"Joined dataset must not exceed {MAX_DATASET_ROWS:,} rows")
+        if len(merged.columns) > MAX_DATASET_COLUMNS:
+            _bad_request(
+                f"Joined dataset must not exceed {MAX_DATASET_COLUMNS:,} columns"
+            )
+        joined = merged
+
+    key_sets = []
+    for frame, spec in zip(frames, specifications):
+        key_sets.append(
+            set(map(tuple, frame[spec["keys"]].itertuples(index=False, name=None)))
+        )
+
+    def json_value(value: Any) -> Any:
+        return json.loads(
+            pd.Series([value]).to_json(orient="values", date_format="iso")
+        )[0]
+
+    unmatched = {}
+    for index, spec in enumerate(specifications):
+        other_keys = set().union(*(values for other, values in enumerate(key_sets) if other != index))
+        rows = list(
+            frames[index][spec["keys"]].itertuples(index=False, name=None)
+        )
+        unmatched_rows = [tuple(key) for key in rows if tuple(key) not in other_keys]
+        missing_keys = list(dict.fromkeys(unmatched_rows))
+        unmatched[spec["name"]] = {
+            "records": len(unmatched_rows),
+            "sample_keys": [
+                [json_value(value) for value in key]
+                for key in missing_keys[:20]
+            ],
+        }
+
+    conflicts = []
+    conflict_count = 0
+    for column, fields in original_columns.items():
+        if len(fields) < 2:
+            continue
+        field_names = [field for _, field in fields]
+        comparison = joined[field_names].copy()
+        for field in field_names:
+            comparison[field] = comparison[field].map(
+                lambda value: (
+                    json.dumps(value, sort_keys=True, default=str)
+                    if isinstance(value, (dict, list, set))
+                    else value
+                )
+            )
+        differing = comparison.nunique(axis=1, dropna=True) > 1
+        conflict_count += int(differing.sum())
+        for row_index in joined.index[differing][:100]:
+            if len(conflicts) >= 100:
+                break
+            conflicts.append({
+                "column": column,
+                "join_key": [
+                    json_value(joined.at[row_index, key])
+                    for key in canonical_keys
+                ],
+                "values": {
+                    specifications[source_index]["name"]: json_value(
+                        joined.at[row_index, field]
+                    )
+                    for source_index, field in fields
+                    if pd.notna(joined.at[row_index, field])
+                },
+            })
+
+    joined = joined.rename(
+        columns=dict(zip(canonical_keys, specifications[0]["keys"]))
+    )
+    persisted_data = _frame_records(joined)
+    dataset_name = payload.get("dataset_name", "reconciled_sources")
+    if (
+        not isinstance(dataset_name, str)
+        or not dataset_name.strip()
+        or len(dataset_name) > 255
+    ):
+        _bad_request("dataset_name must contain 1 to 255 characters")
+    dataset_id = save_dataset(
+        dataset_name.strip(),
+        persisted_data,
+        {
+            "type": "source_reconciliation",
+            "how": how,
+            "sources": [
+                {
+                    "name": spec["name"],
+                    "join_key": spec["keys"],
+                    "source": spec["source"],
+                }
+                for spec in specifications
+            ],
+        },
+        owner_id=current_user_id(),
+    )
+    report = {
+        "analysis": "source_reconciliation",
+        "how": how,
+        "sources": [spec["name"] for spec in specifications],
+        "rows": len(joined.index),
+        "columns": len(joined.columns),
+        "unmatched_records": unmatched,
+        "conflict_count": conflict_count,
+        "conflicts": conflicts,
+    }
+    _, result_id = persist_monitoring_run(
+        [{"key": "joined", "id": dataset_id, "name": dataset_name.strip()}],
+        "source_reconciliation",
+        report,
+        owner_id=current_user_id(),
+    )
+    return {"dataset_id": dataset_id, "result_id": result_id, **report}
 
 
 @app.post("/api/notifications/send")
@@ -1629,11 +1901,13 @@ def list_monitoring_schedules_endpoint():
 def create_monitoring_schedule_endpoint(payload: dict[str, Any]):
     dataset_id = payload.get("dataset_id")
     source_config = None
+    incremental_config = None
+    incremental_checkpoint = None
     if dataset_id is not None:
         if not isinstance(dataset_id, str) or not dataset_id.strip():
             _bad_request("dataset_id must be a non-empty string")
-        if payload.get("source") is not None:
-            _bad_request("Provide either dataset_id or source, not both")
+        if payload.get("source") is not None or payload.get("incremental") is not None:
+            _bad_request("Provide either dataset_id or source ingestion settings, not both")
         dataset = get_dataset(dataset_id, owner_id=current_user_scope())
         if dataset is None:
             raise HTTPException(status_code=404, detail="Dataset was not found")
@@ -1645,6 +1919,45 @@ def create_monitoring_schedule_endpoint(payload: dict[str, Any]):
             _bad_request(str(error))
         if initial_frame.empty:
             _bad_request("Source dataset must not be empty")
+        if payload.get("incremental") is not None:
+            try:
+                incremental_config, incremental_checkpoint = (
+                    validate_incremental_config(
+                        initial_frame,
+                        payload.get("incremental"),
+                    )
+                )
+            except DataSourceError as error:
+                _bad_request(str(error))
+            fetch_parameter = incremental_config.get("fetch_parameter")
+            source_type = str(source_config.get("type", "")).lower().strip()
+            if fetch_parameter is not None:
+                if source_type not in {
+                    "sql", "postgresql", "mysql", "http_json", "rest_json",
+                }:
+                    _bad_request(
+                        "fetch_parameter is supported only for SQL and HTTP JSON sources"
+                    )
+                if source_type in {"sql", "postgresql", "mysql"}:
+                    source_params = source_config.get("params")
+                    if (
+                        not isinstance(source_params, dict)
+                        or fetch_parameter not in source_params
+                    ):
+                        _bad_request(
+                            "SQL source params must provide an initial value for fetch_parameter"
+                        )
+                pagination = source_config.get("pagination")
+                if isinstance(pagination, dict) and fetch_parameter in {
+                    pagination.get("parameter", "page"),
+                    pagination.get(
+                        "page_size_parameter",
+                        "limit" if pagination.get("strategy") == "offset" else "page_size",
+                    ),
+                }:
+                    _bad_request(
+                        "incremental fetch_parameter must differ from pagination parameters"
+                    )
         dataset = {
             "name": _dataset_name(payload, default="scheduled_source"),
             "data": _frame_records(initial_frame),
@@ -1709,6 +2022,9 @@ def create_monitoring_schedule_endpoint(payload: dict[str, Any]):
         "run_owner_id": dataset.get("owner_id"),
         "dataset_name": dataset["name"],
     }
+    if incremental_config is not None:
+        schedule["incremental"] = incremental_config
+        schedule["checkpoint_value"] = incremental_checkpoint
     report_formats = payload.get("report_formats", [])
     if (
         not isinstance(report_formats, list)

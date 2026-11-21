@@ -12,8 +12,10 @@ from data_sources import (
     load_source,
     load_uploaded_file,
     load_sql_query,
+    filter_incremental_records,
     source_capabilities,
     _validate_read_only_sql,
+    validate_incremental_config,
 )
 from main import app
 from notifications import ALERT_HISTORY, reset_alert_state
@@ -49,6 +51,12 @@ def test_source_capabilities_report_provider_setup():
     assert providers["http_json"]["aliases"] == ["rest_json"]
     assert providers["http_json"]["credential_env"] == [
         "DATA_SOURCE_HTTP_ALLOWED_HOSTS"
+    ]
+    assert providers["http_json"]["auth_methods"] == ["bearer", "api_key"]
+    assert providers["http_json"]["pagination_strategies"] == [
+        "page",
+        "offset",
+        "cursor",
     ]
 
 
@@ -225,6 +233,277 @@ def test_http_json_source_uses_environment_token_and_extracts_records(monkeypatc
     assert frame.to_dict(orient="records") == [{"value": 1}, {"value": 2}]
     assert calls[0][1]["headers"]["Authorization"] == "Bearer test-only-token"
     assert calls[0][1]["allow_redirects"] is False
+
+
+def test_http_json_source_supports_api_key_and_page_pagination(monkeypatch):
+    calls = []
+
+    class FakeResponse:
+        status_code = 200
+        is_redirect = False
+
+        def __init__(self, records):
+            self.records = records
+
+        def raise_for_status(self):
+            return None
+
+        def iter_content(self, chunk_size):
+            yield json.dumps({"data": self.records}).encode()
+
+        def close(self):
+            return None
+
+    def fake_get(url, **kwargs):
+        calls.append(kwargs)
+        page = kwargs["params"]["page"]
+        rows = [{"value": page * 2 - 1}, {"value": page * 2}]
+        if page == 2:
+            rows = rows[:1]
+        return FakeResponse(rows)
+
+    monkeypatch.setenv("DATA_SOURCE_HTTP_ALLOWED_HOSTS", "api.example.test")
+    monkeypatch.setenv("TEST_API_KEY", "api-key-for-test")
+    monkeypatch.setattr("data_sources.requests.get", fake_get)
+
+    frame = load_source({
+        "type": "http_json",
+        "url": "https://api.example.test/records",
+        "api_key_env": "TEST_API_KEY",
+        "api_key_header": "X-Account-Key",
+        "pagination": {
+            "strategy": "page",
+            "page_size": 2,
+            "page_size_parameter": "per_page",
+        },
+    })
+
+    assert frame.to_dict(orient="records") == [
+        {"value": 1},
+        {"value": 2},
+        {"value": 3},
+    ]
+    assert [call["params"]["page"] for call in calls] == [1, 2]
+    assert all(call["params"]["per_page"] == 2 for call in calls)
+    assert calls[0]["headers"]["X-Account-Key"] == "api-key-for-test"
+
+
+def test_http_json_source_supports_cursor_pagination(monkeypatch):
+    calls = []
+
+    class FakeResponse:
+        status_code = 200
+        is_redirect = False
+
+        def __init__(self, payload):
+            self.payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def iter_content(self, chunk_size):
+            yield json.dumps(self.payload).encode()
+
+        def close(self):
+            return None
+
+    def fake_get(_url, **kwargs):
+        calls.append(kwargs["params"])
+        if "cursor" not in kwargs["params"]:
+            return FakeResponse({
+                "data": [{"value": 1}],
+                "next": {"cursor": "next-page"},
+            })
+        return FakeResponse({"data": [{"value": 2}], "next": {"cursor": None}})
+
+    monkeypatch.setenv("DATA_SOURCE_HTTP_ALLOWED_HOSTS", "api.example.test")
+    monkeypatch.setattr("data_sources.requests.get", fake_get)
+
+    frame = load_http_json(
+        "https://api.example.test/records",
+        pagination={
+            "strategy": "cursor",
+            "parameter": "cursor",
+            "next_cursor_path": "next.cursor",
+        },
+    )
+
+    assert frame["value"].tolist() == [1, 2]
+    assert calls == [
+        {"page_size": 100},
+        {"page_size": 100, "cursor": "next-page"},
+    ]
+
+
+def test_http_json_source_supports_offset_pagination(monkeypatch):
+    offsets = []
+
+    class FakeResponse:
+        status_code = 200
+        is_redirect = False
+
+        def __init__(self, records):
+            self.records = records
+
+        def raise_for_status(self):
+            return None
+
+        def iter_content(self, chunk_size):
+            yield json.dumps({"data": self.records}).encode()
+
+        def close(self):
+            return None
+
+    def fake_get(_url, **kwargs):
+        offset = kwargs["params"]["offset"]
+        offsets.append(offset)
+        records = [{"value": offset + 1}, {"value": offset + 2}]
+        return FakeResponse(records if offset == 0 else records[:1])
+
+    monkeypatch.setenv("DATA_SOURCE_HTTP_ALLOWED_HOSTS", "api.example.test")
+    monkeypatch.setattr("data_sources.requests.get", fake_get)
+
+    frame = load_http_json(
+        "https://api.example.test/records",
+        pagination={
+            "strategy": "offset",
+            "parameter": "offset",
+            "page_size_parameter": "limit",
+            "page_size": 2,
+        },
+    )
+
+    assert frame["value"].tolist() == [1, 2, 3]
+    assert offsets == [0, 2]
+
+
+def test_http_json_source_fails_if_pagination_limit_truncates_results(monkeypatch):
+    class FakeResponse:
+        status_code = 200
+        is_redirect = False
+
+        def raise_for_status(self):
+            return None
+
+        def iter_content(self, chunk_size):
+            yield b'{"data":[{"value":1}]}'
+
+        def close(self):
+            return None
+
+    monkeypatch.setenv("DATA_SOURCE_HTTP_ALLOWED_HOSTS", "api.example.test")
+    monkeypatch.setattr(
+        "data_sources.requests.get",
+        lambda *_args, **_kwargs: FakeResponse(),
+    )
+
+    with pytest.raises(DataSourceError, match="exceeded the configured max_pages"):
+        load_http_json(
+            "https://api.example.test/records",
+            pagination={
+                "strategy": "page",
+                "page_size": 1,
+                "max_pages": 1,
+            },
+        )
+
+
+def test_incremental_source_validation_and_filtering():
+    initial = pd.DataFrame({
+        "id": [1, 2],
+        "updated_at": ["2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z"],
+        "value": ["old", "stale"],
+    })
+    config, checkpoint = validate_incremental_config(
+        initial,
+        {"column": "updated_at", "strategy": "timestamp", "key_column": "id"},
+    )
+    refreshed = pd.DataFrame({
+        "id": [1, 2, 3],
+        "updated_at": [
+            "2026-01-01T00:00:00Z",
+            "2026-01-03T00:00:00Z",
+            "2026-01-04T00:00:00Z",
+        ],
+        "value": ["old", "updated", "new"],
+    })
+
+    delta, next_checkpoint = filter_incremental_records(
+        refreshed,
+        config,
+        checkpoint,
+    )
+
+    assert delta["id"].tolist() == [2, 3]
+    assert next_checkpoint == "2026-01-04T00:00:00+00:00"
+    id_config, id_checkpoint = validate_incremental_config(
+        pd.DataFrame({"id": [10, 20], "value": ["a", "b"]}),
+        {"column": "id", "strategy": "id", "key_column": "id"},
+    )
+    id_delta, id_next_checkpoint = filter_incremental_records(
+        pd.DataFrame({"id": [20, 30], "value": ["b", "c"]}),
+        id_config,
+        id_checkpoint,
+    )
+    assert id_delta["id"].tolist() == [30]
+    assert id_next_checkpoint == 30
+    with pytest.raises(DataSourceError, match="non-null and unique"):
+        validate_incremental_config(
+            pd.DataFrame({"id": [1, 1], "updated_at": [1, 2]}),
+            {"column": "updated_at", "strategy": "id", "key_column": "id"},
+        )
+
+
+def test_sources_join_persists_reconciliation_report(tmp_path, monkeypatch):
+    monkeypatch.setenv("DATASET_ALLOWED_DIRS", str(tmp_path))
+    left = tmp_path / "left.csv"
+    right = tmp_path / "right.csv"
+    left.write_text(
+        "id,status\n1,active\n2,pending\n3,left-only\n",
+        encoding="utf-8",
+    )
+    right.write_text(
+        "customer_id,status\n1,suspended\n2,pending\n4,right-only\n",
+        encoding="utf-8",
+    )
+
+    response = client.post(
+        "/api/sources/join",
+        json={
+            "dataset_name": "account-reconciliation",
+            "how": "outer",
+            "sources": [
+                {
+                    "name": "accounts",
+                    "source": {"type": "csv", "path": str(left)},
+                    "join_key": "id",
+                },
+                {
+                    "name": "customers",
+                    "source": {"type": "csv", "path": str(right)},
+                    "join_key": "customer_id",
+                },
+            ],
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["rows"] == 4
+    assert body["unmatched_records"] == {
+        "accounts": {"records": 1, "sample_keys": [[3]]},
+        "customers": {"records": 1, "sample_keys": [[4]]},
+    }
+    assert body["conflict_count"] == 1
+    assert body["conflicts"][0]["column"] == "status"
+    saved = client.get(f"/api/datasets/{body['dataset_id']}")
+    assert saved.status_code == 200
+    assert {row["id"] for row in saved.json()["data"]} == {1, 2, 3, 4}
+    stored_report = client.get(
+        f"/api/monitoring/results/{body['result_id']}"
+    )
+    assert stored_report.status_code == 200
+    assert stored_report.json()["result"]["analysis"] == "source_reconciliation"
 
 
 def test_http_json_source_rejects_unallowlisted_hosts_and_oversized_results(monkeypatch):
