@@ -2,16 +2,7 @@ import json
 from datetime import date, timedelta
 
 import pandas as pd
-import pyteReview issue #46 · Issue #45 · Issue #48
-P2 — Complete source integration and ingestion
-The current source loader supports several provider types, but the REST API connector, incremental loading, automated ingestion and multi-source reconciliation are still important gaps.
-Fix: Implement these as separate, tested modules with credential handling, retries, pagination/checkpoints and clear failure reporting.
-Issue #106 · Issue #108 · Issue #109 · Issue #110
-3. GitHub issues to prioritize
-I also checked the repository's issue tracker. These are currently open issues in the tracker; some features may already have partial code, so verify the acceptance criteria before starting duplicate work.
-Recommended next tasks
-First: Fix and validate CI/CD
-st
+import pytest
 from fastapi.testclient import TestClient
 
 from data_sources import (
