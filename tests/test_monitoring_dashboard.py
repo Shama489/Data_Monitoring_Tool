@@ -155,6 +155,71 @@ def test_voice_component_explains_unsupported_browser_and_denied_microphone():
     assert "error.name === \"NotAllowedError\"" in component
 
 
+def test_voice_transcript_is_sent_with_the_selected_dataset_data(monkeypatch):
+    session_state = {}
+    selected_dataset = {
+        "id": "dataset-a",
+        "name": "Events",
+        "data": [{"temperature": 12}, {"temperature": None}],
+    }
+    submitted = {}
+
+    monkeypatch.setattr(monitoring_dashboard.st, "session_state", session_state)
+    monkeypatch.setattr(
+        monitoring_dashboard.st,
+        "selectbox",
+        lambda _label, options, **kwargs: (
+            "English"
+            if kwargs.get("key") == "assistant_language"
+            else options[0]
+        ),
+    )
+    monkeypatch.setattr(
+        monitoring_dashboard.st,
+        "date_input",
+        lambda _label, **_kwargs: pd.Timestamp("2026-11-24").date(),
+    )
+    monkeypatch.setattr(
+        monitoring_dashboard,
+        "_voice_command_component",
+        lambda **_kwargs: {"transcript": "Show anomaly report", "nonce": "voice-1"},
+    )
+    monkeypatch.setattr(
+        monitoring_dashboard.st,
+        "text_input",
+        lambda _label, **kwargs: session_state.get(kwargs["key"], ""),
+    )
+    monkeypatch.setattr(monitoring_dashboard.st, "button", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(monitoring_dashboard.st, "rerun", lambda: None)
+    monkeypatch.setattr(
+        monitoring_dashboard,
+        "_get",
+        lambda _api, _headers, path: (
+            submitted.update(dataset_path=path) or selected_dataset
+        ),
+    )
+    monkeypatch.setattr(
+        monitoring_dashboard,
+        "_post",
+        lambda _api, _headers, path, payload: (
+            submitted.update(assistant_path=path, payload=payload)
+            or {"answer": "One anomaly was found."}
+        ),
+    )
+
+    monitoring_dashboard._render_voice_assistant(
+        "http://api",
+        {"Authorization": "Bearer token"},
+        [selected_dataset],
+    )
+
+    assert submitted["dataset_path"] == "/api/datasets/dataset-a"
+    assert submitted["assistant_path"] == "/api/assistant/ask"
+    assert submitted["payload"]["question"] == "Show anomaly report"
+    assert submitted["payload"]["data"] == selected_dataset["data"]
+    assert submitted["payload"]["dataset_id"] == "dataset-a"
+
+
 def test_quality_summary_method_label_distinguishes_generated_and_fallback_summaries():
     assert _quality_summary_method_label({
         "method": "openai",

@@ -653,14 +653,14 @@ def answer_monitoring_question(
             "score": "The overall data quality score is {score:.1f}/100 ({profile} quality profile).",
             "score_unavailable": "The data quality score is not available from the provided monitoring context.",
             "anomalies": "I found {total} anomalies, which is {percent:.1f}% of the rows in the dataset.",
-            "anomalies_unavailable": "No anomaly summary was provided for the current dataset.",
+            "anomalies_unavailable": "An anomaly report is unavailable for the current dataset.",
             "drift_yes": "Yes—drift was detected. The overall drift score is {score:.1f} ({severity} severity).",
             "drift_no": "No material drift was detected. The overall drift score is {score:.1f} ({severity} severity).",
             "drift_unavailable": "No drift report is available for the current monitoring context.",
             "duplicate_yes": "I found {total} duplicate rows ({percent:.1f}% of total rows) in the dataset.",
             "duplicate_no": "No duplicate rows were found in the current dataset.",
             "summary": "Overall quality is {quality:.1f}/100, drift is {drift:.1f}, and there are {anomalies} anomalies in the current monitoring snapshot.",
-            "help": "I can answer questions about quality scores, missing values, duplicates, anomalies, drift, and monitoring status.",
+            "help": "I couldn't match that request to a supported monitoring question. Ask about quality scores, missing values, duplicates, anomalies, drift, or monitoring status.",
         },
         "es": {
             "missing_values": "Hay {total} valores faltantes en {count} columnas.",
@@ -669,14 +669,14 @@ def answer_monitoring_question(
             "score": "La puntuación general de calidad de los datos es {score:.1f}/100 (calidad {profile}).",
             "score_unavailable": "La puntuación de calidad no está disponible en el contexto de supervisión proporcionado.",
             "anomalies": "Se encontraron {total} anomalías, que representan el {percent:.1f}% de las filas.",
-            "anomalies_unavailable": "No se proporcionó un informe de anomalías para el conjunto de datos actual.",
+            "anomalies_unavailable": "El informe de anomalías no está disponible para el conjunto de datos actual.",
             "drift_yes": "Sí, se detectó deriva. La puntuación general es {score:.1f} (severidad {severity}).",
             "drift_no": "No se detectó deriva significativa. La puntuación es {score:.1f} (severidad {severity}).",
             "drift_unavailable": "No hay un informe de deriva disponible en el contexto actual.",
             "duplicate_yes": "Se encontraron {total} filas duplicadas ({percent:.1f}% del total) en el conjunto de datos.",
             "duplicate_no": "No se encontraron filas duplicadas en el conjunto de datos actual.",
             "summary": "La calidad general es {quality:.1f}/100, la deriva es {drift:.1f} y hay {anomalies} anomalías en la supervisión actual.",
-            "help": "Puedo responder sobre calidad, valores faltantes, duplicados, anomalías, deriva y estado de supervisión.",
+            "help": "No pude relacionar esa solicitud con una pregunta de supervisión compatible. Pregunta por puntuaciones de calidad, valores faltantes, duplicados, anomalías, deriva o estado de supervisión.",
         },
         "fr": {
             "missing_values": "Il y a {total} valeurs manquantes dans {count} colonnes.",
@@ -685,14 +685,14 @@ def answer_monitoring_question(
             "score": "Le score global de qualité des données est de {score:.1f}/100 (qualité {profile}).",
             "score_unavailable": "Le score de qualité n’est pas disponible dans le contexte de surveillance fourni.",
             "anomalies": "{total} anomalies ont été détectées, soit {percent:.1f}% des lignes.",
-            "anomalies_unavailable": "Aucun rapport d’anomalies n’a été fourni pour le jeu de données actuel.",
+            "anomalies_unavailable": "Aucun rapport d’anomalies n’est disponible pour le jeu de données actuel.",
             "drift_yes": "Oui, une dérive a été détectée. Le score global est de {score:.1f} (gravité {severity}).",
             "drift_no": "Aucune dérive significative n’a été détectée. Le score est de {score:.1f} (gravité {severity}).",
             "drift_unavailable": "Aucun rapport de dérive n’est disponible dans le contexte actuel.",
             "duplicate_yes": "{total} lignes en double ont été détectées ({percent:.1f}% des lignes) dans le jeu de données.",
             "duplicate_no": "Aucun doublon n'a été détecté dans le jeu de données actuel.",
             "summary": "La qualité globale est de {quality:.1f}/100, la dérive est de {drift:.1f} et il y a {anomalies} anomalies dans la surveillance actuelle.",
-            "help": "Je peux répondre sur la qualité, les valeurs manquantes, les doublons, les anomalies, la dérive et l’état de surveillance.",
+            "help": "Je n’ai pas pu associer cette demande à une question de surveillance prise en charge. Posez une question sur les scores de qualité, les valeurs manquantes, les doublons, les anomalies, la dérive ou l’état de surveillance.",
         },
         "hi": {
             "missing_values": "{count} कॉलम में {total} मान अनुपलब्ध हैं।",
@@ -708,13 +708,16 @@ def answer_monitoring_question(
             "duplicate_yes": "डेटासेट में {total} डुप्लिकेट पंक्तियां ({percent:.1f}%) पाई गईं।",
             "duplicate_no": "वर्तमान डेटासेट में कोई डुप्लिकेट पंक्ति नहीं मिली।",
             "summary": "कुल गुणवत्ता {quality:.1f}/100 है, ड्रिफ्ट {drift:.1f} है और वर्तमान निगरानी में {anomalies} विसंगतियां हैं।",
-            "help": "मैं गुणवत्ता स्कोर, अनुपलब्ध मान, डुप्लिकेट, विसंगतियों, ड्रिफ्ट और निगरानी स्थिति के बारे में उत्तर दे सकता हूं।",
+            "help": "मैं इस अनुरोध को किसी समर्थित निगरानी प्रश्न से नहीं जोड़ पाया। गुणवत्ता स्कोर, अनुपलब्ध मान, डुप्लिकेट, विसंगतियों, ड्रिफ्ट या निगरानी स्थिति के बारे में पूछें।",
         },
     }[language]
     intent_phrases = phrases[language]
 
     def has_intent(intent):
-        return any(token in normalized_question for token in intent_phrases[intent])
+        return any(
+            re.search(rf"(?<!\w){re.escape(token)}(?!\w)", normalized_question)
+            for token in intent_phrases[intent]
+        )
 
     if monitoring_results is None:
         monitoring_results = {}
@@ -725,8 +728,20 @@ def answer_monitoring_question(
         drift_report = monitoring_results.get("drift")
     if anomaly_report is None and isinstance(monitoring_results, dict):
         anomaly_report = monitoring_results.get("anomalies")
-    if anomaly_report is None and df is not None:
+    if (
+        anomaly_report is None
+        and df is not None
+        and (has_intent("anomaly") or has_intent("summary"))
+    ):
         anomaly_report = detect_anomalies_isolation_forest(df)
+        if anomaly_report is None:
+            numeric_rows = df.select_dtypes(include=np.number).dropna()
+            reason = (
+                "At least one numeric column is required."
+                if numeric_rows.shape[1] == 0
+                else "At least 10 complete numeric rows are required."
+            )
+            anomaly_report = {"available": False, "reason": reason}
 
     quality_score = None
     if isinstance(monitoring_results, dict) and "quality_score" in monitoring_results:
@@ -813,7 +828,11 @@ def answer_monitoring_question(
         }
 
     if has_intent("anomaly"):
-        if isinstance(anomaly_report, dict) and anomaly_report.get("total_anomalies") is not None:
+        if (
+            isinstance(anomaly_report, dict)
+            and anomaly_report.get("available") is not False
+            and anomaly_report.get("total_anomalies") is not None
+        ):
             total = int(anomaly_report.get("total_anomalies", 0))
             pct = float(anomaly_report.get("anomaly_percentage", 0.0))
             answer = localized["anomalies"].format(total=total, percent=pct)
@@ -822,7 +841,7 @@ def answer_monitoring_question(
         return {
             "category": "anomaly",
             "answer": answer,
-            "confidence": "medium",
+            "confidence": "high" if anomaly_report else "low",
             "context": {"anomaly_report": anomaly_report},
         }
 
