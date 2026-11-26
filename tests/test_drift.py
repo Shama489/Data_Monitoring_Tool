@@ -138,6 +138,67 @@ def test_monitoring_assistant_answers_quality_and_drift_questions():
     assert "yes" in drift_answer["answer"].lower() or "drift detected" in drift_answer["answer"].lower()
 
 
+def test_monitoring_assistant_uses_dataset_values_for_voice_query_results():
+    df = pd.DataFrame({
+        "temperature": [float(value) for value in range(10)] + [1000.0],
+        "status": ["ok", None] + ["ok"] * 9,
+    })
+
+    missing_answer = answer_monitoring_question(
+        "Which columns have missing values?",
+        df=df,
+    )
+    expected_anomalies = detect_anomalies_isolation_forest(df)
+    anomaly_answer = answer_monitoring_question(
+        "Show the anomaly report",
+        df=df,
+    )
+
+    assert missing_answer["context"]["total_missing_values"] == 1
+    assert missing_answer["context"]["columns_with_missing_values"] == ["status"]
+    assert anomaly_answer["context"]["anomaly_report"] == expected_anomalies
+    assert str(expected_anomalies["total_anomalies"]) in anomaly_answer["answer"]
+
+
+@pytest.mark.parametrize(
+    ("data", "reason"),
+    [
+        (
+            {"category": ["A", "B"]},
+            "At least one numeric column is required.",
+        ),
+        (
+            {"value": [1, 2]},
+            "At least 10 complete numeric rows are required.",
+        ),
+    ],
+)
+def test_monitoring_assistant_explains_when_anomaly_analysis_is_unavailable(
+    data, reason
+):
+    result = answer_monitoring_question(
+        "Show the anomaly report",
+        df=pd.DataFrame(data),
+    )
+
+    assert result["category"] == "anomaly"
+    assert "unavailable" in result["answer"]
+    assert result["context"]["anomaly_report"] == {
+        "available": False,
+        "reason": reason,
+    }
+
+
+def test_monitoring_assistant_does_not_match_keywords_inside_other_words():
+    result = answer_monitoring_question(
+        "What is in this database?",
+        df=pd.DataFrame({"value": [1, 2]}),
+    )
+
+    assert result["category"] == "general"
+    assert "couldn't match" in result["answer"]
+
+
 @pytest.mark.parametrize(
     ("language", "question", "intent", "expected"),
     [

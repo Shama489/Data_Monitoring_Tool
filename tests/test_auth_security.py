@@ -14,6 +14,10 @@ def test_api_requires_authentication_except_health_and_login():
 
     assert client.get("/api/health").status_code == 200
     assert client.get("/api/datasets").status_code == 401
+    assert client.post(
+        "/api/assistant/ask",
+        json={"question": "show missing values"},
+    ).status_code == 401
     response = client.post(
         "/api/auth/login",
         json={"username": "test-admin", "password": "test-password-123"},
@@ -108,6 +112,10 @@ def test_users_have_role_permissions_and_isolated_encrypted_datasets():
         headers={"Authorization": f"Bearer {viewer_login.json()['access_token']}"},
     )
     assert viewer.get(f"/api/datasets/{dataset_id}").status_code == 404
+    assert viewer.post(
+        "/api/assistant/ask",
+        json={"question": "show missing values", "dataset_id": dataset_id},
+    ).status_code == 404
     assert viewer.post(
         "/api/datasets", json={"name": "denied", "data": [{"x": 1}]}
     ).status_code == 403

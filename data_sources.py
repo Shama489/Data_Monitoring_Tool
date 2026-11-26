@@ -1037,10 +1037,10 @@ def source_capabilities() -> dict[str, Any]:
         ]
         provider["missing_dependencies"] = missing_dependencies
         provider["missing_configuration"] = missing_configuration
-        if missing_dependencies:
-            provider["status"] = "missing_dependency"
-        elif missing_configuration:
+        if missing_configuration:
             provider["status"] = "configuration_required"
+        elif missing_dependencies:
+            provider["status"] = "missing_dependency"
         else:
             provider["status"] = "ready"
 
